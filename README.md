@@ -1,7 +1,7 @@
 # Plasma Firefox NixOS Module
 
-This flake exports a reusable Plasma Wayland + Firefox NixOS module and a QEMU
-VM/check that exercise the same module.
+This flake exports reusable NixOS desktop modules and a QEMU VM/check that
+exercise the composed desktop module.
 
 ## Laptop Import
 
@@ -19,7 +19,7 @@ evaluate against competing nixpkgs revisions:
     nixosConfigurations.laptop = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
       modules = [
-        common.nixosModules.plasma-firefox
+        common.nixosModules.common-desktop
         ./configuration.nix
       ];
     };
@@ -27,9 +27,42 @@ evaluate against competing nixpkgs revisions:
 }
 ```
 
-The reusable module contains Plasma 6 Wayland, SDDM, hardware graphics, Firefox,
-and Konsole. VM-only users, autologin, and test tools live in
+`common.nixosModules.common-desktop` is the recommended laptop starting point.
+It composes these reusable modules:
+
+```text
+common.nixosModules.nix-settings
+common.nixosModules.laptop-base
+common.nixosModules.audio
+common.nixosModules.fonts
+common.nixosModules.development-base
+common.nixosModules.plasma-firefox
+```
+
+Use the individual modules instead if a host needs a smaller or different
+composition. Host-specific users, hostnames, disks, bootloaders, passwords, and
+hardware quirks should stay in the laptop config.
+
+VM-only users, autologin, and test tools live in
 `common.nixosModules.qemu-demo-user`.
+
+## Module Contents
+
+`common.nixosModules.plasma-firefox` contains Plasma 6 Wayland, SDDM, hardware
+graphics, Firefox, and Konsole.
+
+`common.nixosModules.laptop-base` contains NetworkManager, Bluetooth, firmware
+updates, power profiles, printing, and UPower.
+
+`common.nixosModules.audio` contains PipeWire and realtime audio support.
+
+`common.nixosModules.fonts` contains common desktop fonts.
+
+`common.nixosModules.development-base` contains common CLI tools and direnv with
+nix-direnv.
+
+`common.nixosModules.nix-settings` enables flakes, nix-command, store
+optimisation, and automatic garbage collection.
 
 ## QEMU VM
 
@@ -103,6 +136,14 @@ Run only the automated VM check:
 
 ```bash
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.plasma-firefox
+```
+
+Additional checks cover the reusable common modules:
+
+```bash
+nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.common-desktop
+nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.fonts
+nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.audio
 ```
 
 Build the interactive test driver:

@@ -1,6 +1,6 @@
 {
   imports = [
-    ./plasma-firefox.nix
+    ./common-desktop.nix
     ./qemu-demo-user.nix
   ];
 }
