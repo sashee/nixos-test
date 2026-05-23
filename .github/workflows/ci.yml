@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  full-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Enable KVM access
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+          fi
+
+      - name: Build checked QEMU result
+        run: nix build -L .#qemu-plasma-result
+
+      - name: Upload VM artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qemu-plasma-result
+          path: |
+            result/qemu-command
+            result/plasma-desktop.png
+            result/firefox-page.png
+          if-no-files-found: warn
