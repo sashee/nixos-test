@@ -1,8 +1,6 @@
-{ pkgs, ... }:
+{ pkgs, lib, ... }:
 
 {
-  system.stateVersion = "25.11";
-
   networking.networkmanager.enable = true;
 
   users.users.demo = {
@@ -13,6 +11,11 @@
 
   services.displayManager.autoLogin.enable = true;
   services.displayManager.autoLogin.user = "demo";
+
+  virtualisation = {
+    cores = lib.mkDefault 2;
+    memorySize = lib.mkDefault 4096;
+  };
 
   environment.systemPackages = with pkgs; [
     curl

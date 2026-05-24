@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, commonDesktopModule, qemuDemoUserModule }:
+{ nixpkgs, pkgs, commonDesktopModule, qemuDemoUserModule, stateVersion }:
 
 nixpkgs.lib.nixos.runTest {
   name = "common-desktop";
@@ -12,11 +12,7 @@ nixpkgs.lib.nixos.runTest {
     ];
 
     networking.hostName = "common-desktop-test";
-
-    virtualisation = {
-      cores = 2;
-      memorySize = 4096;
-    };
+    system.stateVersion = stateVersion;
   };
 
   testScript = ''

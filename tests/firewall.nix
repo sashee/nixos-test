@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, commonDesktopModule }:
+{ nixpkgs, pkgs, commonDesktopModule, stateVersion }:
 
 nixpkgs.lib.nixos.runTest {
   name = "firewall";
@@ -9,13 +9,7 @@ nixpkgs.lib.nixos.runTest {
     imports = [ commonDesktopModule ];
 
     networking.hostName = "firewall-test";
-    system.stateVersion = "25.11";
-
-    environment.systemPackages = [
-      pkgs.curl
-      pkgs.iputils
-      pkgs.python3
-    ];
+    system.stateVersion = stateVersion;
   };
 
   nodes.unfiltered = { pkgs, ... }: {
@@ -26,13 +20,7 @@ nixpkgs.lib.nixos.runTest {
       firewall.enable = false;
       hostName = "firewall-disabled";
     };
-    system.stateVersion = "25.11";
-
-    environment.systemPackages = [
-      pkgs.curl
-      pkgs.iputils
-      pkgs.python3
-    ];
+    system.stateVersion = stateVersion;
   };
 
   testScript = ''
@@ -53,7 +41,11 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("systemctl is-active nftables.service")
     machine.succeed("${pkgs.nftables}/bin/nft list table inet nixos-fw")
     machine.succeed("${pkgs.nftables}/bin/nft list table inet common-firewall-pre")
-    unfiltered.fail("systemctl is-active nftables.service")
+    machine.succeed("${pkgs.nftables}/bin/nft list table inet common-doh-egress")
+    unfiltered.succeed("systemctl is-active nftables.service")
+    unfiltered.succeed("${pkgs.nftables}/bin/nft list table inet common-doh-egress")
+    unfiltered.fail("${pkgs.nftables}/bin/nft list table inet nixos-fw")
+    unfiltered.fail("${pkgs.nftables}/bin/nft list table inet common-firewall-pre")
 
     machine.succeed("systemd-run --unit blocked-http-server ${pkgs.python3}/bin/python3 -m http.server 18080 --bind 0.0.0.0 --directory /tmp")
     machine.wait_for_unit("blocked-http-server.service")

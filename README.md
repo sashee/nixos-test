@@ -35,6 +35,7 @@ modules/nix-settings.nix
 modules/laptop-base.nix
 modules/audio.nix
 modules/firewall.nix
+modules/doh.nix
 modules/fonts.nix
 modules/development-base.nix
 modules/plasma-firefox.nix
@@ -62,6 +63,16 @@ default in `common-desktop` and can be disabled with:
 
 ```nix
 common.firewall.enable = false;
+```
+
+`modules/doh.nix` enables system-wide DNS over HTTPS through `dnscrypt-proxy`
+with static IPv4 and IPv6 DoH resolver stamps for Cloudflare, Mullvad, Quad9,
+and Google. It points local resolver configuration at localhost and blocks
+direct outbound TCP and UDP port 53 except to localhost. It is enabled by
+default in `common-desktop` and can be disabled with:
+
+```nix
+common.doh.enable = false;
 ```
 
 `modules/fonts.nix` contains common desktop fonts.
@@ -131,6 +142,8 @@ screenshots:
 result/bin/run-nixos-qemu-vm
 result/qemu-command
 result/common-desktop-check
+result/doh-check
+result/doh-upstream-check
 result/firewall-check
 result/plasma-desktop.png
 result/firefox-page.png
@@ -147,8 +160,14 @@ Tests live under `tests/`. Run one test during development by building its check
 ```bash
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.plasma-firefox
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.common-desktop
+nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.doh
+nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.doh-upstream
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.firewall
 ```
+
+`doh-upstream` is hermetic: it routes `doh-test` default IPv4 traffic through
+`dns-peer`, redirects outbound HTTPS there, and verifies that a local DNS query
+becomes an HTTPS `/dns-query` request to one of the configured DoH hostnames.
 
 Run all checks directly:
 

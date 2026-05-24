@@ -6,9 +6,11 @@
   outputs = { nixpkgs, ... }:
     let
       system = "x86_64-linux";
+      stateVersion = nixpkgs.lib.trivial.release;
       pkgs = nixpkgs.legacyPackages.${system};
       commonDesktopModule = ./modules/common-desktop.nix;
       qemuDemoUserModule = ./modules/qemu-demo-user.nix;
+      dohStamps = import ./lib/doh-stamps.nix;
       qemuGraphical = nixpkgs.lib.nixosSystem {
         inherit system;
 
@@ -18,6 +20,8 @@
           qemuDemoUserModule
 
           {
+            system.stateVersion = stateVersion;
+
             networking.hostName = "nixos-qemu";
 
             virtualisation = {
@@ -30,18 +34,26 @@
       };
       qemuVm = qemuGraphical.config.system.build.vm;
       plasmaFirefoxTest = import ./tests/plasma-firefox.nix {
-        inherit nixpkgs pkgs commonDesktopModule qemuDemoUserModule;
+        inherit nixpkgs pkgs commonDesktopModule qemuDemoUserModule stateVersion;
       };
       commonDesktopTest = import ./tests/common-desktop.nix {
-        inherit nixpkgs pkgs commonDesktopModule qemuDemoUserModule;
+        inherit nixpkgs pkgs commonDesktopModule qemuDemoUserModule stateVersion;
       };
       firewallTest = import ./tests/firewall.nix {
-        inherit nixpkgs pkgs commonDesktopModule;
+        inherit nixpkgs pkgs commonDesktopModule stateVersion;
+      };
+      dohTest = import ./tests/doh.nix {
+        inherit nixpkgs pkgs commonDesktopModule stateVersion;
+      };
+      dohUpstreamTest = import ./tests/doh-upstream.nix {
+        inherit nixpkgs pkgs commonDesktopModule stateVersion dohStamps;
       };
       qemuPlasmaResult = pkgs.runCommand "qemu-plasma-result" { } ''
         mkdir -p $out/bin
         ln -s ${qemuVm}/bin/run-nixos-qemu-vm $out/bin/run-nixos-qemu-vm
         ln -s ${commonDesktopTest} $out/common-desktop-check
+        ln -s ${dohTest} $out/doh-check
+        ln -s ${dohUpstreamTest} $out/doh-upstream-check
         ln -s ${firewallTest} $out/firewall-check
         cp ${plasmaFirefoxTest}/plasma-desktop.png $out/plasma-desktop.png
         cp ${plasmaFirefoxTest}/firefox-page.png $out/firefox-page.png
@@ -70,6 +82,8 @@
 
       checks.${system} = {
         common-desktop = commonDesktopTest;
+        doh = dohTest;
+        doh-upstream = dohUpstreamTest;
         firewall = firewallTest;
         plasma-firefox = plasmaFirefoxTest;
       };
@@ -78,6 +92,10 @@
         default = qemuPlasmaResult;
         common-desktop-driver = commonDesktopTest.driver;
         common-desktop-driver-interactive = commonDesktopTest.driverInteractive;
+        doh-driver = dohTest.driver;
+        doh-driver-interactive = dohTest.driverInteractive;
+        doh-upstream-driver = dohUpstreamTest.driver;
+        doh-upstream-driver-interactive = dohUpstreamTest.driverInteractive;
         firewall-driver = firewallTest.driver;
         firewall-driver-interactive = firewallTest.driverInteractive;
         qemu-vm = qemuVm;

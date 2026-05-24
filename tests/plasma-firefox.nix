@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, commonDesktopModule, qemuDemoUserModule }:
+{ nixpkgs, pkgs, commonDesktopModule, qemuDemoUserModule, stateVersion }:
 
 nixpkgs.lib.nixos.runTest {
   name = "plasma-firefox";
@@ -12,13 +12,9 @@ nixpkgs.lib.nixos.runTest {
     ];
 
     networking.hostName = "plasma-firefox-test";
+    system.stateVersion = stateVersion;
 
     services.displayManager.defaultSession = "plasma";
-
-    virtualisation = {
-      cores = 2;
-      memorySize = 4096;
-    };
   };
 
   testScript = ''
