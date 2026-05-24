@@ -1,7 +1,7 @@
 # Plasma Firefox NixOS Module
 
-This flake exports reusable NixOS desktop modules and a QEMU VM/check that
-exercise the composed desktop module.
+This flake exports one composed NixOS desktop module and a QEMU VM/check that
+exercise that same common configuration.
 
 ## Laptop Import
 
@@ -27,41 +27,49 @@ evaluate against competing nixpkgs revisions:
 }
 ```
 
-`common.nixosModules.common-desktop` is the recommended laptop starting point.
-It composes these reusable modules:
+`common.nixosModules.common-desktop` is the public laptop module. It composes
+these internal modules:
 
 ```text
-common.nixosModules.nix-settings
-common.nixosModules.laptop-base
-common.nixosModules.audio
-common.nixosModules.fonts
-common.nixosModules.development-base
-common.nixosModules.plasma-firefox
+modules/nix-settings.nix
+modules/laptop-base.nix
+modules/audio.nix
+modules/firewall.nix
+modules/fonts.nix
+modules/development-base.nix
+modules/plasma-firefox.nix
 ```
 
-Use the individual modules instead if a host needs a smaller or different
-composition. Host-specific users, hostnames, disks, bootloaders, passwords, and
-hardware quirks should stay in the laptop config.
+Host-specific users, hostnames, disks, bootloaders, passwords, and hardware
+quirks should stay in the laptop config.
 
-VM-only users, autologin, and test tools live in
-`common.nixosModules.qemu-demo-user`.
+VM-only users, autologin, and test tools are internal to this flake and are only
+used by the QEMU VM/tests.
 
 ## Module Contents
 
-`common.nixosModules.plasma-firefox` contains Plasma 6 Wayland, SDDM, hardware
-graphics, Firefox, and Konsole.
+`modules/plasma-firefox.nix` contains Plasma 6 Wayland, SDDM, hardware graphics,
+Firefox, and Konsole.
 
-`common.nixosModules.laptop-base` contains NetworkManager, Bluetooth, firmware
-updates, power profiles, printing, and UPower.
+`modules/laptop-base.nix` contains NetworkManager, Bluetooth, firmware updates,
+power profiles, printing, and UPower.
 
-`common.nixosModules.audio` contains PipeWire and realtime audio support.
+`modules/audio.nix` contains PipeWire and realtime audio support.
 
-`common.nixosModules.fonts` contains common desktop fonts.
+`modules/firewall.nix` blocks unsolicited inbound TCP, UDP, and ping while
+allowing outbound traffic and established return traffic. It is enabled by
+default in `common-desktop` and can be disabled with:
 
-`common.nixosModules.development-base` contains common CLI tools and direnv with
+```nix
+common.firewall.enable = false;
+```
+
+`modules/fonts.nix` contains common desktop fonts.
+
+`modules/development-base.nix` contains common CLI tools and direnv with
 nix-direnv.
 
-`common.nixosModules.nix-settings` enables flakes, nix-command, store
+`modules/nix-settings.nix` enables flakes, nix-command, store
 optimisation, and automatic garbage collection.
 
 ## QEMU VM
@@ -116,12 +124,14 @@ Build the combined result with live logs:
 nix --extra-experimental-features 'nix-command flakes' build -L .#qemu-plasma-result
 ```
 
-This runs the VM check and produces the QEMU runner, launch commands, and
+This runs all VM checks and produces the QEMU runner, launch commands, and
 screenshots:
 
 ```text
 result/bin/run-nixos-qemu-vm
 result/qemu-command
+result/common-desktop-check
+result/firewall-check
 result/plasma-desktop.png
 result/firefox-page.png
 ```
@@ -132,18 +142,18 @@ The default package is the same verified result:
 nix --extra-experimental-features 'nix-command flakes' build -L
 ```
 
-Run only the automated VM check:
+Tests live under `tests/`. Run one test during development by building its check:
 
 ```bash
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.plasma-firefox
+nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.common-desktop
+nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.firewall
 ```
 
-Additional checks cover the reusable common modules:
+Run all checks directly:
 
 ```bash
-nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.common-desktop
-nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.fonts
-nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.audio
+nix --extra-experimental-features 'nix-command flakes' flake check -L
 ```
 
 Build the interactive test driver:
