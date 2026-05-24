@@ -83,7 +83,7 @@ print(json.dumps(result))
     subjectKeyIdentifier = hash
     EOF
 
-    openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    openssl req -x509 -newkey rsa:2048 -nodes -days 36500 \
       -keyout $out/ca-key.pem \
       -out $out/ca.pem \
       -config openssl.cnf \
@@ -119,7 +119,7 @@ print(json.dumps(result))
       -CAkey $out/ca-key.pem \
       -CAcreateserial \
       -out $out/server.pem \
-      -days 1 \
+      -days 36500 \
       -extensions v3_req \
       -extfile server.cnf \
       -sha256
@@ -291,6 +291,7 @@ nixpkgs.lib.nixos.runTest {
 
   testScript = ''
     import json
+    import time
 
     doh_ipv4 = json.loads("""${dohIpv4Json}""")
     doh_ipv6 = json.loads("""${dohIpv6Json}""")
@@ -333,9 +334,9 @@ nixpkgs.lib.nixos.runTest {
     ipv6_client.succeed("${pkgs.iproute2}/bin/ip -6 route del default || true")
     ipv6_client.succeed(f"${pkgs.iproute2}/bin/ip -6 route add default via {peer_ipv6} dev eth1 metric 42")
     for address in doh_ipv6:
-        ipv4_client.succeed(f"${pkgs.iproute2}/bin/ip -6 route replace blackhole {address}/128")
+        ipv4_client.succeed(f"${pkgs.iproute2}/bin/ip -6 route replace unreachable {address}/128")
     for address in doh_ipv4:
-        ipv6_client.succeed(f"${pkgs.iproute2}/bin/ip route replace blackhole {address}/32")
+        ipv6_client.succeed(f"${pkgs.iproute2}/bin/ip route replace unreachable {address}/32")
 
     def check_request(path, family, question, qtype):
         request = json.loads(dns_peer.succeed(f"cat {path}"))
@@ -346,13 +347,60 @@ nixpkgs.lib.nixos.runTest {
         assert request["qclass"] == 1, request
         assert request["host"] in doh_domains, request
 
+    def print_command(node, label, command):
+        print(f"\n### {label}: {command}")
+        status, output = node.execute(command)
+        print(f"exit status: {status}")
+        print(output)
+
+    def print_route_diagnostics(node, label):
+        print_command(node, label, "hostname")
+        print_command(node, label, "${pkgs.iproute2}/bin/ip -br addr")
+        print_command(node, label, "${pkgs.iproute2}/bin/ip route")
+        print_command(node, label, "${pkgs.iproute2}/bin/ip -6 route")
+        for address in doh_ipv4:
+            print_command(node, label, f"${pkgs.iproute2}/bin/ip route get {address}")
+        for address in doh_ipv6:
+            print_command(node, label, f"${pkgs.iproute2}/bin/ip -6 route get {address}")
+
+    def print_client_diagnostics(node, label):
+        print_route_diagnostics(node, label)
+        print_command(node, label, "${pkgs.nftables}/bin/nft list ruleset")
+        print_command(node, label, "${pkgs.systemd}/bin/systemctl status dnscrypt-proxy.service --no-pager")
+        print_command(node, label, "${pkgs.systemd}/bin/journalctl -u dnscrypt-proxy.service -b --no-pager")
+        print_command(node, label, "${pkgs.iproute2}/bin/ss -tupn")
+
+    def print_peer_diagnostics():
+        print_route_diagnostics(dns_peer, "doh-upstream-peer")
+        print_command(dns_peer, "doh-upstream-peer", "${pkgs.iproute2}/bin/ss -ltnp")
+        print_command(dns_peer, "doh-upstream-peer", "find /tmp/fake-doh-requests -maxdepth 1 -type f -print -exec cat {} \\\;")
+        print_command(dns_peer, "doh-upstream-peer", "cat /tmp/fake-doh-last-probe.json")
+        print_command(dns_peer, "doh-upstream-peer", "${pkgs.systemd}/bin/systemctl status fake-doh-server.service --no-pager")
+        print_command(dns_peer, "doh-upstream-peer", "${pkgs.systemd}/bin/journalctl -u fake-doh-server.service -b --no-pager")
+
+    def wait_for_answer(node, label, server, question, qtype, expected):
+        command = "${pkgs.dig}/bin/dig @{} {} {} +short +time=5 +tries=1 2>&1".format(server, question, qtype)
+        last_status = None
+        last_output = ""
+        for attempt in range(60):
+            last_status, last_output = node.execute(command)
+            if expected in last_output:
+                return
+            time.sleep(1)
+        print(f"\n### {label}: dig did not return {expected}")
+        print(f"last status: {last_status}")
+        print(f"last output:\n{last_output}")
+        print_client_diagnostics(node, label)
+        print_peer_diagnostics()
+        raise Exception(f"{label} did not resolve {question} to {expected}")
+
     ipv4_client.succeed("systemctl restart dnscrypt-proxy.service")
-    ipv4_client.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until ${pkgs.dig}/bin/dig @127.0.0.1 ipv4.upstream-test.example A +short +time=5 +tries=1 2>/dev/null | ${pkgs.gnugrep}/bin/grep -q -F \"203.0.113.5\"; do sleep 1; done'")
+    wait_for_answer(ipv4_client, "doh-upstream-ipv4", "127.0.0.1", "ipv4.upstream-test.example", "A", "203.0.113.5")
     dns_peer.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-requests/ipv4_upstream-test_example-1.json; do sleep 0.2; done'")
     check_request("/tmp/fake-doh-requests/ipv4_upstream-test_example-1.json", "ipv4", "ipv4.upstream-test.example", 1)
 
     ipv6_client.succeed("systemctl restart dnscrypt-proxy.service")
-    ipv6_client.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until ${pkgs.dig}/bin/dig @::1 ipv6.upstream-test.example AAAA +short +time=5 +tries=1 2>/dev/null | ${pkgs.gnugrep}/bin/grep -q -F \"2001:db8::5\"; do sleep 1; done'")
+    wait_for_answer(ipv6_client, "doh-upstream-ipv6", "::1", "ipv6.upstream-test.example", "AAAA", "2001:db8::5")
     dns_peer.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-requests/ipv6_upstream-test_example-28.json; do sleep 0.2; done'")
     check_request("/tmp/fake-doh-requests/ipv6_upstream-test_example-28.json", "ipv6", "ipv6.upstream-test.example", 28)
   '';
