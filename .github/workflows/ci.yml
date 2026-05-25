@@ -12,26 +12,21 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.2
 
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
+          enable_kvm: true
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
 
-      - name: Enable KVM access
-        run: |
-          if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm
-          fi
-
       - name: Build checked QEMU result
-        run: nix build -L .#qemu-plasma-result
+        run: nix build -L --max-jobs 2 .#qemu-plasma-result
 
       - name: Upload VM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         if: always()
         with:
           name: qemu-plasma-result
