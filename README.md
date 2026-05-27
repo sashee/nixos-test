@@ -38,6 +38,7 @@ modules/firewall.nix
 modules/doh.nix
 modules/fonts.nix
 modules/development-base.nix
+modules/locale.nix
 modules/plasma-firefox.nix
 ```
 
@@ -132,11 +133,11 @@ QEMU_OPTS="-accel tcg" ./result/bin/run-nixos-qemu-vm
 Build the combined result with live logs:
 
 ```bash
-nix --extra-experimental-features 'nix-command flakes' build -L .#qemu-plasma-result
+make qemu-result
 ```
 
-This runs all VM checks and produces the QEMU runner, launch commands, and
-screenshots:
+This runs all VM checks and produces the QEMU runner, launch commands, test
+outputs, and selected screenshots:
 
 ```text
 result/bin/run-nixos-qemu-vm
@@ -145,6 +146,14 @@ result/common-desktop-check
 result/doh-check
 result/doh-upstream-check
 result/firewall-check
+result/locale-firefox-check
+result/plasma-firefox-check
+result/test-results/common-desktop
+result/test-results/doh
+result/test-results/doh-upstream
+result/test-results/firewall
+result/test-results/locale-firefox
+result/test-results/plasma-firefox
 result/plasma-desktop.png
 result/firefox-page.png
 ```
@@ -163,6 +172,31 @@ nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.doh
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.doh-upstream
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.firewall
+nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.locale-firefox
+```
+
+Run all tests and collect every test output under one result tree:
+
+```bash
+make test-results
+```
+
+The aggregate result is organized by test name:
+
+```text
+result/common-desktop
+result/doh
+result/doh-upstream
+result/firewall
+result/locale-firefox
+result/plasma-firefox
+```
+
+The Makefile uses `--max-jobs 2` so Nix runs at most two test derivations at a
+time. To override that locally:
+
+```bash
+make test-results MAX_JOBS=1
 ```
 
 `doh-upstream` is hermetic: it routes `doh-test` default IPv4 traffic through
@@ -174,6 +208,9 @@ Run all checks directly:
 ```bash
 nix --extra-experimental-features 'nix-command flakes' flake check -L
 ```
+
+`flake check` does not create a convenient `./result` symlink. Use
+`.#all-test-results` when you want the collected outputs and screenshots.
 
 Build the interactive test driver:
 

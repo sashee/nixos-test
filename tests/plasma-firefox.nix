@@ -1,5 +1,42 @@
 { nixpkgs, pkgs, commonDesktopModule, qemuDemoUserModule, stateVersion }:
 
+let
+  testHttpServer = pkgs.writeText "plasma-firefox-http-server.py" ''
+    import http.server
+    import pathlib
+    import socketserver
+
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            markers = {
+                "/firefox.html": "/tmp/request-firefox",
+                "/lo-real.html": "/tmp/request-lo-real",
+                "/lo-wrapped.html": "/tmp/request-lo-wrapped",
+            }
+            if self.path in markers:
+                pathlib.Path(markers[self.path]).touch()
+
+            body = b"<!doctype html><title>NixOS VM test</title><h1>HTTP request received</h1>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+
+    class Server(socketserver.TCPServer):
+        allow_reuse_address = True
+
+
+    with Server(("127.0.0.1", 8000), Handler) as server:
+        pathlib.Path("/tmp/test-http-ready").touch()
+        server.serve_forever()
+  '';
+in
 nixpkgs.lib.nixos.runTest {
   name = "plasma-firefox";
   hostPkgs = pkgs;
@@ -24,14 +61,23 @@ nixpkgs.lib.nixos.runTest {
     machine.wait_until_succeeds("pgrep -u demo kwin_wayland")
     machine.screenshot("plasma-desktop")
 
-    machine.succeed("mkdir -p /tmp/site")
-    machine.succeed("printf '%s\n' '<!doctype html><title>NixOS VM test</title><h1>Firefox started</h1>' > /tmp/site/index.html")
-    machine.succeed("systemd-run --unit test-http-server --property WorkingDirectory=/tmp/site ${pkgs.python3}/bin/python3 -m http.server 8000")
+    machine.succeed("rm -f /tmp/test-http-ready /tmp/request-firefox /tmp/request-lo-real /tmp/request-lo-wrapped")
+    machine.succeed("systemd-run --unit test-http-server ${pkgs.python3}/bin/python3 ${testHttpServer}")
     machine.wait_for_unit("test-http-server.service")
-    machine.wait_until_succeeds("curl --fail --head http://127.0.0.1:8000/")
+    machine.wait_until_succeeds("test -e /tmp/test-http-ready")
+    machine.succeed("curl --fail http://127.0.0.1:8000/firefox.html")
 
-    machine.succeed("su - demo -c 'firefox --headless --screenshot /tmp/firefox-page.png http://127.0.0.1:8000/ >/tmp/firefox.log 2>&1'")
+    machine.succeed("su - demo -c 'firefox --headless --screenshot /tmp/firefox-page.png http://127.0.0.1:8000/firefox.html >/tmp/firefox.log 2>&1'")
     machine.succeed("test -s /tmp/firefox-page.png")
     machine.copy_from_vm("/tmp/firefox-page.png")
+
+    machine.succeed("rm -rf /tmp/lo-real-profile /tmp/lo-wrapped-profile /tmp/lo-real-out /tmp/lo-wrapped-out")
+    machine.succeed("mkdir -p /tmp/lo-real-out /tmp/lo-wrapped-out")
+    machine.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.libreoffice-qt6-still}/bin/libreoffice --headless -env:UserInstallation=file:///tmp/lo-real-profile --convert-to pdf --outdir /tmp/lo-real-out http://127.0.0.1:8000/lo-real.html || true")
+    machine.wait_until_succeeds("test -e /tmp/request-lo-real")
+
+    machine.succeed("${pkgs.coreutils}/bin/timeout 30 /run/current-system/sw/bin/libreoffice --headless -env:UserInstallation=file:///tmp/lo-wrapped-profile --convert-to pdf --outdir /tmp/lo-wrapped-out http://127.0.0.1:8000/lo-wrapped.html || true")
+    machine.succeed("sleep 2")
+    machine.fail("test -e /tmp/request-lo-wrapped")
   '';
 }

@@ -1,6 +1,7 @@
 {
   imports = [
     ./nix-settings.nix
+    ./locale.nix
     ./laptop-base.nix
     ./audio.nix
     ./firewall.nix

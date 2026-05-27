@@ -24,6 +24,8 @@
 
             networking.hostName = "nixos-qemu";
 
+            common.locale.default = "hu_HU.UTF-8";
+
             virtualisation = {
               cores = 6;
               graphics = true;
@@ -39,6 +41,9 @@
       commonDesktopTest = import ./tests/common-desktop.nix {
         inherit nixpkgs pkgs commonDesktopModule qemuDemoUserModule stateVersion;
       };
+      localeFirefoxTest = import ./tests/locale-firefox.nix {
+        inherit nixpkgs pkgs commonDesktopModule qemuDemoUserModule stateVersion;
+      };
       firewallTest = import ./tests/firewall.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
@@ -48,15 +53,35 @@
       dohUpstreamTest = import ./tests/doh-upstream.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion dohStamps;
       };
+      testResults = {
+        common-desktop = commonDesktopTest;
+        doh = dohTest;
+        doh-upstream = dohUpstreamTest;
+        firewall = firewallTest;
+        locale-firefox = localeFirefoxTest;
+        plasma-firefox = plasmaFirefoxTest;
+      };
+      testResultLinks = nixpkgs.lib.concatStringsSep "\n" (
+        nixpkgs.lib.mapAttrsToList
+          (name: test: "ln -s ${test} $out/${nixpkgs.lib.escapeShellArg name}")
+          testResults
+      );
+      qemuCheckLinks = nixpkgs.lib.concatStringsSep "\n" (
+        nixpkgs.lib.mapAttrsToList
+          (name: _: "ln -s ${allTestResults}/${nixpkgs.lib.escapeShellArg name} $out/${nixpkgs.lib.escapeShellArg "${name}-check"}")
+          testResults
+      );
+      allTestResults = pkgs.runCommand "all-test-results" { } ''
+        mkdir -p $out
+        ${testResultLinks}
+      '';
       qemuPlasmaResult = pkgs.runCommand "qemu-plasma-result" { } ''
         mkdir -p $out/bin
         ln -s ${qemuVm}/bin/run-nixos-qemu-vm $out/bin/run-nixos-qemu-vm
-        ln -s ${commonDesktopTest} $out/common-desktop-check
-        ln -s ${dohTest} $out/doh-check
-        ln -s ${dohUpstreamTest} $out/doh-upstream-check
-        ln -s ${firewallTest} $out/firewall-check
-        cp ${plasmaFirefoxTest}/plasma-desktop.png $out/plasma-desktop.png
-        cp ${plasmaFirefoxTest}/firefox-page.png $out/firefox-page.png
+        ln -s ${allTestResults} $out/test-results
+        ${qemuCheckLinks}
+        cp ${allTestResults}/plasma-firefox/plasma-desktop.png $out/plasma-desktop.png
+        cp ${allTestResults}/plasma-firefox/firefox-page.png $out/firefox-page.png
 
         cat > $out/qemu-command <<'EOF'
         ./result/bin/run-nixos-qemu-vm
@@ -80,16 +105,11 @@
 
       nixosConfigurations.qemu-graphical = qemuGraphical;
 
-      checks.${system} = {
-        common-desktop = commonDesktopTest;
-        doh = dohTest;
-        doh-upstream = dohUpstreamTest;
-        firewall = firewallTest;
-        plasma-firefox = plasmaFirefoxTest;
-      };
+      checks.${system} = testResults;
 
       packages.${system} = {
         default = qemuPlasmaResult;
+        all-test-results = allTestResults;
         common-desktop-driver = commonDesktopTest.driver;
         common-desktop-driver-interactive = commonDesktopTest.driverInteractive;
         doh-driver = dohTest.driver;
@@ -98,6 +118,8 @@
         doh-upstream-driver-interactive = dohUpstreamTest.driverInteractive;
         firewall-driver = firewallTest.driver;
         firewall-driver-interactive = firewallTest.driverInteractive;
+        locale-firefox-driver = localeFirefoxTest.driver;
+        locale-firefox-driver-interactive = localeFirefoxTest.driverInteractive;
         qemu-vm = qemuVm;
         qemu-plasma-result = qemuPlasmaResult;
         plasma-firefox-driver = plasmaFirefoxTest.driver;
