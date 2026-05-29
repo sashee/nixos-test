@@ -11,6 +11,7 @@
       commonDesktopModule = ./modules/common-desktop.nix;
       qemuDemoUserModule = ./modules/qemu-demo-user.nix;
       dohStamps = import ./lib/doh-stamps.nix;
+      resticLib = import ./lib/restic.nix { lib = nixpkgs.lib; };
       qemuGraphical = nixpkgs.lib.nixosSystem {
         inherit system;
 
@@ -53,6 +54,9 @@
       dohUpstreamTest = import ./tests/doh-upstream.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion dohStamps;
       };
+      resticTest = import ./tests/restic.nix {
+        inherit nixpkgs pkgs commonDesktopModule stateVersion;
+      };
       testResults = {
         common-desktop = commonDesktopTest;
         doh = dohTest;
@@ -60,6 +64,7 @@
         firewall = firewallTest;
         locale-firefox = localeFirefoxTest;
         plasma-firefox = plasmaFirefoxTest;
+        restic = resticTest;
       };
       testResultLinks = nixpkgs.lib.concatStringsSep "\n" (
         nixpkgs.lib.mapAttrsToList
@@ -101,6 +106,8 @@
         common-desktop = commonDesktopModule;
       };
 
+      lib.restic = resticLib;
+
       legacyPackages.${system} = pkgs;
 
       nixosConfigurations.qemu-graphical = qemuGraphical;
@@ -124,6 +131,8 @@
         qemu-plasma-result = qemuPlasmaResult;
         plasma-firefox-driver = plasmaFirefoxTest.driver;
         plasma-firefox-driver-interactive = plasmaFirefoxTest.driverInteractive;
+        restic-driver = resticTest.driver;
+        restic-driver-interactive = resticTest.driverInteractive;
       };
     };
 }

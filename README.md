@@ -36,6 +36,7 @@ modules/laptop-base.nix
 modules/audio.nix
 modules/firewall.nix
 modules/doh.nix
+modules/restic.nix
 modules/fonts.nix
 modules/development-base.nix
 modules/locale.nix
@@ -75,6 +76,53 @@ default in `common-desktop` and can be disabled with:
 ```nix
 common.doh.enable = false;
 ```
+
+`modules/restic.nix` configures named restic backups using systemd credentials.
+Each backup must specify the user that runs the service. Backup paths are bound
+read-only into the hardened unit while `/home` is otherwise protected with a
+temporary filesystem view.
+Each backup expects a credential directory with raw secret files:
+
+```text
+/etc/credentials/restic/home/repository-password
+/etc/credentials/restic/home/backend-password
+```
+
+Use the flake helper functions from a host configuration to keep backend shape
+separate from the common module:
+
+```nix
+common.restic.backups.home = common.lib.restic.rest {
+  user = "sashee";
+  credentialDirectory = "/etc/credentials/restic/home";
+  url = "https://backup.example.com";
+  repository = "home";
+  username = "sashee";
+  paths = [ "/home/sashee" ];
+  prune.ignoreErrors = false;
+};
+
+common.restic.backups.photos = common.lib.restic.s3 {
+  user = "sashee";
+  credentialDirectory = "/etc/credentials/restic/photos";
+  endpoint = "s3.example.com";
+  bucket = "restic-backups";
+  paths = [ "/home/sashee/Pictures" ];
+  prune.ignoreErrors = true;
+};
+```
+
+For S3 backups, use AWS credential files instead of `backend-password`:
+
+```text
+/etc/credentials/restic/photos/repository-password
+/etc/credentials/restic/photos/aws-access-key-id
+/etc/credentials/restic/photos/aws-secret-access-key
+```
+
+Missing credential files skip the generated backup unit instead of failing it.
+When `prune.ignoreErrors = true`, backup success is preserved even if `restic
+forget --prune` fails on an append-only repository.
 
 `modules/fonts.nix` contains common desktop fonts.
 
@@ -148,12 +196,14 @@ result/doh-upstream-check
 result/firewall-check
 result/locale-firefox-check
 result/plasma-firefox-check
+result/restic-check
 result/test-results/common-desktop
 result/test-results/doh
 result/test-results/doh-upstream
 result/test-results/firewall
 result/test-results/locale-firefox
 result/test-results/plasma-firefox
+result/test-results/restic
 result/plasma-desktop.png
 result/firefox-page.png
 ```
@@ -173,6 +223,7 @@ nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.doh-upstream
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.firewall
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.locale-firefox
+nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.restic
 ```
 
 Run all tests and collect every test output under one result tree:
@@ -190,6 +241,7 @@ result/doh-upstream
 result/firewall
 result/locale-firefox
 result/plasma-firefox
+result/restic
 ```
 
 The Makefile uses `--max-jobs 2` so Nix runs at most two test derivations at a
