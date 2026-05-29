@@ -21,6 +21,29 @@ nixpkgs.lib.nixos.runTest {
       home = "/home/backup-user";
     };
 
+    system.activationScripts.resticTimerTestCredentials = ''
+      install -d -m 0700 /etc/credentials/restic/timer-rest
+      install -d -m 0755 -o backup-user -g users /home/backup-user/timer-rest
+
+      printf '%s' 'repo-secret' > /etc/credentials/restic/timer-rest/repository-password
+      printf '%s' 'test-user' > /etc/credentials/restic/timer-rest/backend-username
+      printf '%s' 'backend-secret' > /etc/credentials/restic/timer-rest/backend-password
+      printf '%s\n' 'timer-rest payload' > /home/backup-user/timer-rest/payload.txt
+
+      chmod 0600 \
+        /etc/credentials/restic/timer-rest/repository-password \
+        /etc/credentials/restic/timer-rest/backend-username \
+        /etc/credentials/restic/timer-rest/backend-password
+      chown backup-user:users /home/backup-user/timer-rest/payload.txt
+    '';
+
+    virtualisation.qemu.options = [
+      "-rtc"
+      "base=2026-01-01T23:00:00,clock=vm"
+      "-cpu"
+      "host,kvmclock=off"
+    ];
+
     common.restic.backups.append-ignored = resticLib.rest {
       user = "backup-user";
       credentialDirectory = "/etc/credentials/restic/append-ignored";
@@ -68,6 +91,20 @@ nixpkgs.lib.nixos.runTest {
       paths = [ "/home/backup-user/check-damaged" ];
       prune.opts = [ "--keep-last 99" ];
       timerConfig = null;
+    };
+
+    common.restic.backups.timer-rest = resticLib.rest {
+      user = "backup-user";
+      credentialDirectory = "/etc/credentials/restic/timer-rest";
+      url = "http://restic-backend:8002";
+      repository = "timer-rest";
+      paths = [ "/home/backup-user/timer-rest" ];
+      prune.opts = [ "--keep-last 99" ];
+      timerConfig = {
+        OnCalendar = "daily";
+        Persistent = true;
+        RandomizedDelaySec = "1h";
+      };
     };
 
     common.restic.backups.s3 = resticLib.s3 {
@@ -140,6 +177,12 @@ nixpkgs.lib.nixos.runTest {
     ];
 
     virtualisation.diskSize = 3 * 1024;
+    virtualisation.qemu.options = [
+      "-rtc"
+      "base=2026-01-01T23:00:00,clock=vm"
+      "-cpu"
+      "host,kvmclock=off"
+    ];
     system.stateVersion = stateVersion;
   };
 
@@ -222,6 +265,14 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("systemctl cat restic-backups-s3.service | grep -F 'LoadCredential=aws-access-key-id:/etc/credentials/restic/s3/aws-access-key-id'")
     client.succeed("systemctl cat restic-backups-s3.service | grep -F 'LoadCredential=aws-secret-access-key:/etc/credentials/restic/s3/aws-secret-access-key'")
     client.succeed("systemctl cat restic-backups-s3.service | grep -F -- '--exclude-file='")
+    client.succeed("systemctl show restic-backups-timer-rest.timer -p TimersCalendar --value | grep -F '*-*-* 00:00:00'")
+    client.succeed("systemctl show restic-backups-timer-rest.timer -p Persistent --value | grep -F yes")
+    client.succeed("systemctl show restic-backups-timer-rest.timer -p RandomizedDelayUSec --value | grep -F '1h'")
+    client.succeed("systemctl is-active --quiet restic-backups-timer-rest.timer")
+    client.succeed("test -f /etc/credentials/restic/timer-rest/repository-password")
+    client.succeed("test -f /etc/credentials/restic/timer-rest/backend-username")
+    client.succeed("test -f /etc/credentials/restic/timer-rest/backend-password")
+    client.succeed("test -f /home/backup-user/timer-rest/payload.txt")
 
     client.succeed("systemctl start restic-backups-append-ignored.service || true")
     client.fail("systemctl is-failed --quiet restic-backups-append-ignored.service")
@@ -229,6 +280,16 @@ nixpkgs.lib.nixos.runTest {
     for name in ["append-ignored", "append-strict", "normal-strict", "check-damaged"]:
         write_rest_credentials(name)
         write_payload(name, f"{name} payload")
+
+    client.succeed("systemctl reset-failed restic-backups-timer-rest.service")
+    client.succeed("date -s '2026-01-02 00:01:00'")
+    backend.succeed("date -s '2026-01-02 00:01:00'")
+    client.succeed("date -s '2026-01-02 01:05:00'")
+    backend.succeed("date -s '2026-01-02 01:05:00'")
+    client.wait_until_succeeds("systemctl show restic-backups-timer-rest.service -p ActiveState --value | grep -F inactive && systemctl show restic-backups-timer-rest.service -p Result --value | grep -F success && journalctl -u restic-backups-timer-rest.service | grep -F 'snapshot '", timeout=120)
+    assert service_result("timer-rest") == "success"
+    client.succeed("RESTIC_REST_USERNAME=$(cat /etc/credentials/restic/timer-rest/backend-username) RESTIC_REST_PASSWORD=$(cat /etc/credentials/restic/timer-rest/backend-password) RESTIC_PASSWORD_FILE=/etc/credentials/restic/timer-rest/repository-password RESTIC_REPOSITORY=rest:http://restic-backend:8002/timer-rest ${pkgs.restic}/bin/restic snapshots | grep -F timer-rest")
+    client.succeed("systemctl stop restic-backups-timer-rest.timer")
 
     write_rest_credentials("normal-strict", "wrong-backend-secret")
     client.fail("systemctl start restic-backups-normal-strict.service")
