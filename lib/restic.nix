@@ -15,14 +15,16 @@ in
 {
   rest = args:
     let
-      normalized = builtins.removeAttrs (withPrune args) [ "url" "repository" "username" ];
+      normalized = builtins.removeAttrs (withPrune args) [ "url" "repository" ];
     in
     normalized // {
       repository = "rest:${args.url}/${args.repository}";
       backend = {
         type = "rest";
-        username = args.username;
-        credentials = [ "backend-password" ];
+        credentials = [
+          "backend-username"
+          "backend-password"
+        ];
       };
     };
 

@@ -85,6 +85,7 @@ Each backup expects a credential directory with raw secret files:
 
 ```text
 /etc/credentials/restic/home/repository-password
+/etc/credentials/restic/home/backend-username
 /etc/credentials/restic/home/backend-password
 ```
 
@@ -97,8 +98,8 @@ common.restic.backups.home = common.lib.restic.rest {
   credentialDirectory = "/etc/credentials/restic/home";
   url = "https://backup.example.com";
   repository = "home";
-  username = "sashee";
   paths = [ "/home/sashee" ];
+  exclude = [ ".stversions" ];
   prune.ignoreErrors = false;
 };
 
@@ -121,6 +122,8 @@ For S3 backups, use AWS credential files instead of `backend-password`:
 ```
 
 Missing credential files skip the generated backup unit instead of failing it.
+Backups run `restic unlock` before `backup`, use `--group-by=` for backup and
+retention, and run `restic check` after backup/retention.
 When `prune.ignoreErrors = true`, backup success is preserved even if `restic
 forget --prune` fails on an append-only repository.
 

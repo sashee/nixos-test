@@ -21,8 +21,9 @@ let
 
         ${
           if backup.backend.type == "rest" then ''
+            RESTIC_REST_USERNAME="$(cat "$CREDENTIALS_DIRECTORY/backend-username")"
             RESTIC_REST_PASSWORD="$(cat "$CREDENTIALS_DIRECTORY/backend-password")"
-            export RESTIC_REST_PASSWORD
+            export RESTIC_REST_USERNAME RESTIC_REST_PASSWORD
           '' else if backup.backend.type == "s3" then ''
             AWS_ACCESS_KEY_ID="$(cat "$CREDENTIALS_DIRECTORY/aws-access-key-id")"
             AWS_SECRET_ACCESS_KEY="$(cat "$CREDENTIALS_DIRECTORY/aws-secret-access-key")"
@@ -33,6 +34,10 @@ let
           ''
         }
 
+        if [ "''${1:-}" = "backup" ]; then
+          ${lib.getExe pkgs.restic} unlock
+        fi
+
         exec ${lib.getExe pkgs.restic} "$@"
       '';
     };
@@ -40,9 +45,7 @@ let
   backendEnvironment = backup:
     {
       RESTIC_CACHE_DIR = "/var/cache/restic-backups-${backup.name}";
-    } // (if backup.backend.type == "rest" then {
-      RESTIC_REST_USERNAME = backup.backend.username;
-    } else { });
+    };
 
   backupToResticConfig = name: rawBackup:
     let
@@ -51,11 +54,15 @@ let
     in
     {
       inherit (backup) paths;
+      exclude = backup.exclude;
+      extraBackupArgs = [ "--group-by=" ];
       initialize = true;
       package = wrapperFor name backup;
       passwordFile = "$CREDENTIALS_DIRECTORY/repository-password";
       repository = backup.repository;
-      pruneOpts = lib.optionals requiredPrune backup.prune.opts;
+      pruneOpts = lib.optionals requiredPrune ([ "--group-by=" ] ++ backup.prune.opts);
+      runCheck = true;
+      checkOpts = [ ];
       timerConfig = backup.timerConfig;
       user = backup.user;
     };
@@ -64,7 +71,7 @@ let
     let
       restic = lib.getExe (wrapperFor name backup);
     in
-    "-${restic} forget --prune ${lib.concatStringsSep " " backup.prune.opts}";
+    "-${restic} forget --prune --group-by= ${lib.concatStringsSep " " backup.prune.opts}";
 
   serviceConfigFor = name: rawBackup:
     let
@@ -137,12 +144,6 @@ in
                 type = lib.types.enum [ "rest" "s3" ];
               };
 
-              username = lib.mkOption {
-                type = lib.types.nullOr lib.types.str;
-                default = null;
-                description = "REST backend username.";
-              };
-
               credentials = lib.mkOption {
                 type = lib.types.listOf lib.types.str;
                 description = "Backend credential filenames in credentialDirectory.";
@@ -155,6 +156,13 @@ in
           type = lib.types.listOf lib.types.str;
           example = [ "/home/sashee" ];
           description = "Directories to back up.";
+        };
+
+        exclude = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          example = [ ".stversions" "/home/*/.cache" ];
+          description = "Patterns to exclude from backups.";
         };
 
         prune = {
