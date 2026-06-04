@@ -13,6 +13,7 @@ let
                 "/firefox.html": "/tmp/request-firefox",
                 "/lo-real.html": "/tmp/request-lo-real",
                 "/lo-wrapped.html": "/tmp/request-lo-wrapped",
+                "/lo-desktop.html": "/tmp/request-lo-desktop",
             }
             if self.path in markers:
                 pathlib.Path(markers[self.path]).touch()
@@ -61,7 +62,7 @@ nixpkgs.lib.nixos.runTest {
     machine.wait_until_succeeds("pgrep -u demo kwin_wayland")
     machine.screenshot("plasma-desktop")
 
-    machine.succeed("rm -f /tmp/test-http-ready /tmp/request-firefox /tmp/request-lo-real /tmp/request-lo-wrapped")
+    machine.succeed("rm -f /tmp/test-http-ready /tmp/request-firefox /tmp/request-lo-real /tmp/request-lo-wrapped /tmp/request-lo-desktop")
     machine.succeed("systemd-run --unit test-http-server ${pkgs.python3}/bin/python3 ${testHttpServer}")
     machine.wait_for_unit("test-http-server.service")
     machine.wait_until_succeeds("test -e /tmp/test-http-ready")
@@ -79,5 +80,12 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("su - demo -c 'XDG_RUNTIME_DIR=/run/user/1000 ${pkgs.coreutils}/bin/timeout 30 /run/current-system/sw/bin/libreoffice --headless -env:UserInstallation=file:///tmp/lo-wrapped-profile --convert-to pdf --outdir /tmp/lo-wrapped-out http://127.0.0.1:8000/lo-wrapped.html || true'")
     machine.succeed("sleep 2")
     machine.fail("test -e /tmp/request-lo-wrapped")
+
+    machine.succeed("pkill -u demo -f libreoffice || true")
+    machine.succeed("rm -f /tmp/lo-desktop.log")
+    machine.succeed("su - demo -c '(${pkgs.coreutils}/bin/env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus XDG_DATA_DIRS=/run/current-system/sw/share WAYLAND_DISPLAY=wayland-0 ${pkgs.coreutils}/bin/timeout 45 ${pkgs.gtk3}/bin/gtk-launch writer http://127.0.0.1:8000/lo-desktop.html >/tmp/lo-desktop.log 2>&1 || true) &'")
+    machine.wait_until_succeeds("grep -F 'lo-desktop.html' /tmp/lo-desktop.log")
+    machine.fail("test -e /tmp/request-lo-desktop")
+    machine.succeed("pkill -u demo -f libreoffice || true")
   '';
 }

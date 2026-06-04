@@ -33,5 +33,31 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("command -v zsh")
     machine.succeed("command -v tmux")
     machine.succeed("command -v all-info-json")
+
+    machine.succeed("test -e /run/current-system/sw/share/applications/writer.desktop")
+    machine.succeed("test -e /run/current-system/sw/share/applications/calc.desktop")
+    machine.succeed("test -e /run/current-system/sw/share/applications/impress.desktop")
+    machine.succeed("test -e /run/current-system/sw/share/applications/chromium-browser.desktop")
+    machine.succeed("test -e /run/current-system/sw/share/applications/org.keepassxc.KeePassXC.desktop")
+    machine.succeed("test -e /run/current-system/sw/share/applications/vlc.desktop")
+    machine.succeed("test -e /run/current-system/sw/share/applications/org.flameshot.Flameshot.desktop")
+
+    machine.succeed("grep -E '^Exec=/nix/store/.*/bin/libreoffice --writer %U$' /run/current-system/sw/share/applications/writer.desktop")
+    machine.succeed("grep -E '^Exec=/nix/store/.*/bin/libreoffice --calc %U$' /run/current-system/sw/share/applications/calc.desktop")
+    machine.succeed("grep -E '^Exec=/nix/store/.*/bin/libreoffice --impress %U$' /run/current-system/sw/share/applications/impress.desktop")
+    machine.succeed("grep -E '^Exec=/nix/store/.*/bin/chromium %U$' /run/current-system/sw/share/applications/chromium-browser.desktop")
+    machine.succeed("grep -E '^Exec=/nix/store/.*/bin/chromium --incognito$' /run/current-system/sw/share/applications/chromium-browser.desktop")
+    machine.succeed("grep -E '^Exec=/nix/store/.*/bin/keepassxc %f$' /run/current-system/sw/share/applications/org.keepassxc.KeePassXC.desktop")
+    machine.succeed("grep -E '^TryExec=/nix/store/.*/bin/keepassxc$' /run/current-system/sw/share/applications/org.keepassxc.KeePassXC.desktop")
+    machine.succeed("grep -E '^Exec=/nix/store/.*/bin/vlc ' /run/current-system/sw/share/applications/vlc.desktop")
+    machine.succeed("grep -E '^Exec=/nix/store/.*/bin/flameshot' /run/current-system/sw/share/applications/org.flameshot.Flameshot.desktop")
+
+    machine.succeed("test -e /run/current-system/sw/share/icons/hicolor/256x256/apps/chromium.png")
+    machine.succeed("test -e /run/current-system/sw/share/icons/hicolor/scalable/apps/keepassxc.svg")
+    machine.succeed("test -e /run/current-system/sw/share/icons/hicolor/128x128/apps/vlc.png")
+    machine.succeed("test -e /run/current-system/sw/share/icons/hicolor/scalable/apps/org.flameshot.Flameshot.svg")
+    machine.succeed("test -e /run/current-system/sw/share/icons/hicolor/scalable/apps/libreoffice-writer.svg")
+
+    machine.succeed("${pkgs.desktop-file-utils}/bin/desktop-file-validate /run/current-system/sw/share/applications/writer.desktop /run/current-system/sw/share/applications/calc.desktop /run/current-system/sw/share/applications/impress.desktop /run/current-system/sw/share/applications/chromium-browser.desktop /run/current-system/sw/share/applications/org.keepassxc.KeePassXC.desktop /run/current-system/sw/share/applications/vlc.desktop /run/current-system/sw/share/applications/org.flameshot.Flameshot.desktop")
   '';
 }
