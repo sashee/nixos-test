@@ -1,14 +1,23 @@
 {
   description = "Small graphical NixOS VM for QEMU";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    dotfiles = {
+      url = "github:sashee/dotfiles/bwrap";
+      flake = false;
+    };
+  };
 
-  outputs = { nixpkgs, ... }:
+  outputs = { nixpkgs, dotfiles, ... }:
     let
       system = "x86_64-linux";
       stateVersion = nixpkgs.lib.trivial.release;
       pkgs = nixpkgs.legacyPackages.${system};
-      commonDesktopModule = ./modules/common-desktop.nix;
+      commonDesktopModule = { ... }: {
+        imports = [ ./modules/common-desktop.nix ];
+        _module.args.commonDotfiles = dotfiles;
+      };
       qemuDemoUserModule = ./modules/qemu-demo-user.nix;
       dohStamps = import ./lib/doh-stamps.nix;
       resticLib = import ./lib/restic.nix { lib = nixpkgs.lib; };

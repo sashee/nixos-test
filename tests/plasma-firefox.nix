@@ -76,7 +76,7 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.libreoffice-qt6-still}/bin/libreoffice --headless -env:UserInstallation=file:///tmp/lo-real-profile --convert-to pdf --outdir /tmp/lo-real-out http://127.0.0.1:8000/lo-real.html || true")
     machine.wait_until_succeeds("test -e /tmp/request-lo-real")
 
-    machine.succeed("${pkgs.coreutils}/bin/timeout 30 /run/current-system/sw/bin/libreoffice --headless -env:UserInstallation=file:///tmp/lo-wrapped-profile --convert-to pdf --outdir /tmp/lo-wrapped-out http://127.0.0.1:8000/lo-wrapped.html || true")
+    machine.succeed("su - demo -c 'XDG_RUNTIME_DIR=/run/user/1000 ${pkgs.coreutils}/bin/timeout 30 /run/current-system/sw/bin/libreoffice --headless -env:UserInstallation=file:///tmp/lo-wrapped-profile --convert-to pdf --outdir /tmp/lo-wrapped-out http://127.0.0.1:8000/lo-wrapped.html || true'")
     machine.succeed("sleep 2")
     machine.fail("test -e /tmp/request-lo-wrapped")
   '';

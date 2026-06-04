@@ -39,6 +39,7 @@ modules/doh.nix
 modules/restic.nix
 modules/fonts.nix
 modules/development-base.nix
+modules/nix-utils.nix
 modules/locale.nix
 modules/plasma-firefox.nix
 ```
@@ -131,6 +132,11 @@ forget --prune` fails on an append-only repository.
 
 `modules/development-base.nix` contains common CLI tools and direnv with
 nix-direnv.
+
+`modules/nix-utils.nix` installs the full sandboxed utility environment from
+the `github:sashee/dotfiles/bwrap` flake input's `nix-utils` directory with
+this flake's `pkgs`, `unstable = pkgs`, and `nixgl = null` for native NixOS
+graphics.
 
 `modules/nix-settings.nix` enables flakes, nix-command, store
 optimisation, and automatic garbage collection.

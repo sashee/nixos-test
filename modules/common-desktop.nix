@@ -9,6 +9,7 @@
     ./restic.nix
     ./fonts.nix
     ./development-base.nix
+    ./nix-utils.nix
     ./plasma-firefox.nix
   ];
 }

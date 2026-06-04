@@ -26,5 +26,12 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("systemctl is-active cups.socket")
     machine.wait_until_succeeds("systemctl is-active upower.service")
     machine.succeed("(systemctl is-enabled power-profiles-daemon.service || true) | grep -E '^(enabled|linked)$'")
+
+    machine.succeed("command -v keepassxc")
+    machine.succeed("command -v libreoffice")
+    machine.succeed("command -v nvim")
+    machine.succeed("command -v zsh")
+    machine.succeed("command -v tmux")
+    machine.succeed("command -v all-info-json")
   '';
 }
