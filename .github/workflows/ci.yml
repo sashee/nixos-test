@@ -22,8 +22,17 @@ jobs:
             experimental-features = nix-command flakes
             accept-flake-config = true
 
+      - name: Add swap
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h
+
       - name: Build checked QEMU result
-        run: nix build -L --max-jobs 1 .#qemu-plasma-result
+        run: nix build -L --max-jobs 2 .#qemu-plasma-result
 
       - name: Upload VM artifacts
         uses: actions/upload-artifact@v7.0.1
