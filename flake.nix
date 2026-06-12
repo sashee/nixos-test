@@ -67,6 +67,9 @@
       resticTest = import ./tests/restic.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
+      nixSettingsTest = import ./tests/nix-settings.nix {
+        inherit nixpkgs pkgs stateVersion;
+      };
       autoUpgradeMockedServiceTest = import ./tests/auto-upgrade-mocked-service.nix {
         autoUpgradeModule = ./modules/auto-upgrade.nix;
         inherit nixpkgs pkgs stateVersion;
@@ -78,6 +81,7 @@
         doh-upstream = dohUpstreamTest;
         firewall = firewallTest;
         locale-firefox = localeFirefoxTest;
+        nix-settings = nixSettingsTest;
         plasma-firefox = plasmaFirefoxTest;
         restic = resticTest;
       };
@@ -147,6 +151,8 @@
         firewall-driver-interactive = firewallTest.driverInteractive;
         locale-firefox-driver = localeFirefoxTest.driver;
         locale-firefox-driver-interactive = localeFirefoxTest.driverInteractive;
+        nix-settings-driver = nixSettingsTest.driver;
+        nix-settings-driver-interactive = nixSettingsTest.driverInteractive;
         qemu-vm = qemuVm;
         qemu-plasma-result = qemuPlasmaResult;
         plasma-firefox-driver = plasmaFirefoxTest.driver;
