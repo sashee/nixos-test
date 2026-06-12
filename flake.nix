@@ -67,6 +67,12 @@
       resticTest = import ./tests/restic.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
+      monitoringReportingTest = import ./tests/monitoring/reporting.nix {
+        inherit nixpkgs pkgs stateVersion;
+      };
+      monitoringResticTest = import ./tests/monitoring/restic.nix {
+        inherit nixpkgs pkgs commonDesktopModule stateVersion;
+      };
       nixSettingsTest = import ./tests/nix-settings.nix {
         inherit nixpkgs pkgs stateVersion;
       };
@@ -81,6 +87,8 @@
         doh-upstream = dohUpstreamTest;
         firewall = firewallTest;
         locale-firefox = localeFirefoxTest;
+        monitoring-reporting = monitoringReportingTest;
+        monitoring-restic = monitoringResticTest;
         nix-settings = nixSettingsTest;
         plasma-firefox = plasmaFirefoxTest;
         restic = resticTest;
@@ -151,6 +159,10 @@
         firewall-driver-interactive = firewallTest.driverInteractive;
         locale-firefox-driver = localeFirefoxTest.driver;
         locale-firefox-driver-interactive = localeFirefoxTest.driverInteractive;
+        monitoring-reporting-driver = monitoringReportingTest.driver;
+        monitoring-reporting-driver-interactive = monitoringReportingTest.driverInteractive;
+        monitoring-restic-driver = monitoringResticTest.driver;
+        monitoring-restic-driver-interactive = monitoringResticTest.driverInteractive;
         nix-settings-driver = nixSettingsTest.driver;
         nix-settings-driver-interactive = nixSettingsTest.driverInteractive;
         qemu-vm = qemuVm;
