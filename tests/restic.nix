@@ -2,6 +2,9 @@
 
 let
   resticLib = import ../lib/restic.nix { lib = nixpkgs.lib; };
+  nixpkgsDate = nixpkgs.lastModifiedDate;
+  testClockDate = "${builtins.substring 0 4 nixpkgsDate}-${builtins.substring 4 2 nixpkgsDate}-${builtins.substring 6 2 nixpkgsDate}";
+  testClockBase = "${testClockDate}T23:00:00";
 
   pruneOpts = [ "--keep-last 1" ];
 in
@@ -40,7 +43,7 @@ nixpkgs.lib.nixos.runTest {
 
     virtualisation.qemu.options = [
       "-rtc"
-      "base=2026-01-01T23:00:00,clock=vm"
+      "base=${testClockBase},clock=vm"
       "-cpu"
       "host,kvmclock=off"
     ];
@@ -180,7 +183,7 @@ nixpkgs.lib.nixos.runTest {
     virtualisation.diskSize = 3 * 1024;
     virtualisation.qemu.options = [
       "-rtc"
-      "base=2026-01-01T23:00:00,clock=vm"
+      "base=${testClockBase},clock=vm"
       "-cpu"
       "host,kvmclock=off"
     ];
@@ -188,6 +191,8 @@ nixpkgs.lib.nixos.runTest {
   };
 
   testScript = ''
+    from datetime import datetime, timedelta
+
     start_all()
 
     for node in machines:
@@ -216,6 +221,15 @@ nixpkgs.lib.nixos.runTest {
 
     client = by_hostname("restic-client")
     backend = by_hostname("restic-backend")
+
+    test_clock_day = datetime.strptime("${testClockDate}", "%Y-%m-%d").date()
+
+    def test_timestamp(days, time):
+        return f"{test_clock_day + timedelta(days=days)} {time}"
+
+    def set_time(timestamp, nodes=None):
+        for node in (nodes or [client, backend]):
+            node.succeed(f"date -s '{timestamp}'")
 
     backend.wait_for_unit("restic-rest-server.socket")
     backend.wait_for_unit("restic-rest-normal.socket")
@@ -283,10 +297,8 @@ nixpkgs.lib.nixos.runTest {
         write_payload(name, f"{name} payload")
 
     client.succeed("systemctl reset-failed restic-backups-timer-rest.service")
-    client.succeed("date -s '2026-01-02 00:01:00'")
-    backend.succeed("date -s '2026-01-02 00:01:00'")
-    client.succeed("date -s '2026-01-02 01:05:00'")
-    backend.succeed("date -s '2026-01-02 01:05:00'")
+    set_time(test_timestamp(1, "00:01:00"))
+    set_time(test_timestamp(1, "01:05:00"))
     client.wait_until_succeeds("systemctl show restic-backups-timer-rest.service -p ActiveState --value | grep -F inactive && systemctl show restic-backups-timer-rest.service -p Result --value | grep -F success && journalctl -u restic-backups-timer-rest.service | grep -F 'snapshot '", timeout=120)
     assert service_result("timer-rest") == "success"
     client.succeed("RESTIC_REST_USERNAME=$(cat /etc/credentials/restic/timer-rest/backend-username) RESTIC_REST_PASSWORD=$(cat /etc/credentials/restic/timer-rest/backend-password) RESTIC_PASSWORD_FILE=/etc/credentials/restic/timer-rest/repository-password RESTIC_REPOSITORY=rest:http://restic-backend:8002/timer-rest ${pkgs.restic}/bin/restic snapshots | grep -F timer-rest")
