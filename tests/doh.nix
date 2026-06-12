@@ -9,6 +9,7 @@ nixpkgs.lib.nixos.runTest {
     imports = [ commonDesktopModule ];
 
     networking.hostName = "doh-test";
+    common.autoUpgrade.enable = false;
     system.stateVersion = stateVersion;
   };
 
@@ -16,6 +17,7 @@ nixpkgs.lib.nixos.runTest {
     imports = [ commonDesktopModule ];
 
     common = {
+      autoUpgrade.enable = false;
       doh.enable = false;
       firewall.enable = false;
     };

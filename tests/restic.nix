@@ -14,6 +14,7 @@ nixpkgs.lib.nixos.runTest {
     imports = [ commonDesktopModule ];
 
     networking.hostName = "restic-client";
+    common.autoUpgrade.enable = false;
     system.stateVersion = stateVersion;
 
     users.users.backup-user = {

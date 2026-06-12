@@ -9,13 +9,17 @@ nixpkgs.lib.nixos.runTest {
     imports = [ commonDesktopModule ];
 
     networking.hostName = "firewall-test";
+    common.autoUpgrade.enable = false;
     system.stateVersion = stateVersion;
   };
 
   nodes.unfiltered = { pkgs, ... }: {
     imports = [ commonDesktopModule ];
 
-    common.firewall.enable = false;
+    common = {
+      autoUpgrade.enable = false;
+      firewall.enable = false;
+    };
     networking = {
       firewall.enable = false;
       hostName = "firewall-disabled";

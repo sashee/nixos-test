@@ -263,6 +263,7 @@ nixpkgs.lib.nixos.runTest {
     imports = [ commonDesktopModule ];
 
     networking.hostName = "doh-upstream-ipv4";
+    common.autoUpgrade.enable = false;
     security.pki.certificateFiles = [ "${dohTestCerts}/ca.pem" ];
     system.stateVersion = stateVersion;
   };
@@ -271,6 +272,7 @@ nixpkgs.lib.nixos.runTest {
     imports = [ commonDesktopModule ];
 
     networking.hostName = "doh-upstream-ipv6";
+    common.autoUpgrade.enable = false;
     security.pki.certificateFiles = [ "${dohTestCerts}/ca.pem" ];
     system.stateVersion = stateVersion;
   };
@@ -279,6 +281,7 @@ nixpkgs.lib.nixos.runTest {
     imports = [ commonDesktopModule ];
 
     common = {
+      autoUpgrade.enable = false;
       doh.enable = false;
       firewall.enable = false;
     };

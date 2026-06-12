@@ -35,6 +35,7 @@
             networking.hostName = "nixos-qemu";
 
             common.locale.default = "hu_HU.UTF-8";
+            common.autoUpgrade.enable = false;
 
             virtualisation = {
               cores = 6;
@@ -66,7 +67,12 @@
       resticTest = import ./tests/restic.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
+      autoUpgradeMockedServiceTest = import ./tests/auto-upgrade-mocked-service.nix {
+        autoUpgradeModule = ./modules/auto-upgrade.nix;
+        inherit nixpkgs pkgs stateVersion;
+      };
       testResults = {
+        auto-upgrade-mocked-service = autoUpgradeMockedServiceTest;
         common-desktop = commonDesktopTest;
         doh = dohTest;
         doh-upstream = dohUpstreamTest;
@@ -112,6 +118,7 @@
     in
     {
       nixosModules = {
+        auto-upgrade = ./modules/auto-upgrade.nix;
         common-desktop = commonDesktopModule;
       };
 
@@ -119,13 +126,17 @@
 
       legacyPackages.${system} = pkgs;
 
-      nixosConfigurations.qemu-graphical = qemuGraphical;
+      nixosConfigurations = {
+        qemu-graphical = qemuGraphical;
+      };
 
       checks.${system} = testResults;
 
       packages.${system} = {
         default = qemuPlasmaResult;
         all-test-results = allTestResults;
+        auto-upgrade-mocked-service-driver = autoUpgradeMockedServiceTest.driver;
+        auto-upgrade-mocked-service-driver-interactive = autoUpgradeMockedServiceTest.driverInteractive;
         common-desktop-driver = commonDesktopTest.driver;
         common-desktop-driver-interactive = commonDesktopTest.driverInteractive;
         doh-driver = dohTest.driver;

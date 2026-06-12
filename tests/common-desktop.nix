@@ -12,6 +12,7 @@ nixpkgs.lib.nixos.runTest {
     ];
 
     networking.hostName = "common-desktop-test";
+    common.autoUpgrade.enable = false;
     system.stateVersion = stateVersion;
   };
 

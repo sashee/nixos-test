@@ -37,6 +37,7 @@ modules/audio.nix
 modules/firewall.nix
 modules/doh.nix
 modules/restic.nix
+modules/auto-upgrade.nix
 modules/fonts.nix
 modules/development-base.nix
 modules/nix-utils.nix
@@ -46,6 +47,46 @@ modules/plasma-firefox.nix
 
 Host-specific users, hostnames, disks, bootloaders, passwords, and hardware
 quirks should stay in the laptop config.
+
+`modules/auto-upgrade.nix` enables automatic laptop updates by default as part
+of `common-desktop`. Each host config must point it at the local flake output
+that should be rebuilt:
+
+```nix
+{
+  common.autoUpgrade = {
+    flake = "/etc/nixos#my-laptop";
+  };
+}
+```
+
+The module runs daily with `system.autoUpgrade.operation = "boot"`, so the timer
+builds the new generation and makes it the next boot target without switching
+the running system. The new system is activated after reboot.
+
+For laptop-local flakes, the timer runs `nix flake update common --flake
+/etc/nixos --commit-lock-file` before rebuilding. This keeps the exact central
+`github:sashee/nixos-test` revision recorded in the laptop's local
+`/etc/nixos/flake.lock`. The root user must be able to commit in that
+repository; if `/etc/nixos` is not owned by root, configure Git's
+`safe.directory` for it. Disable the timer on non-laptop systems with:
+
+Laptop flakes must name this repository input `common`:
+
+```nix
+inputs.common.url = "github:sashee/nixos-test";
+```
+
+Disable the timer on non-laptop systems with:
+
+```nix
+common.autoUpgrade.enable = false;
+```
+
+`.github/workflows/update-flake.yml` updates `flake.lock` daily, builds
+`.#qemu-plasma-result`, and commits the lock file only when the build succeeds.
+Hosts that point a local input at this repository can advance to those validated
+commits when their local upgrade timer updates `/etc/nixos/flake.lock`.
 
 VM-only users, autologin, and test tools are internal to this flake and are only
 used by the QEMU VM/tests.
