@@ -42,8 +42,11 @@ jobs:
       - name: Update lock file
         run: nix flake update
 
-      - name: Build checked QEMU result
-        run: nix build -L --max-jobs 2 .#qemu-plasma-result
+      - name: Build VM image + shared closure (parallel)
+        run: nix build -L --max-jobs auto .#qemu-vm
+
+      - name: Build checked QEMU result (VM tests one at a time)
+        run: nix build -L --max-jobs 1 .#qemu-plasma-result
 
       - name: Commit updated lock file
         run: |
