@@ -67,6 +67,15 @@
       resticTest = import ./tests/restic.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
+      monitoringAutoUpgradeTest = import ./tests/monitoring/auto-upgrade.nix {
+        inherit nixpkgs pkgs stateVersion;
+      };
+      monitoringDiskSpaceTest = import ./tests/monitoring/disk-space.nix {
+        inherit nixpkgs pkgs stateVersion;
+      };
+      monitoringGenerationsTest = import ./tests/monitoring/generations.nix {
+        inherit nixpkgs pkgs stateVersion;
+      };
       monitoringReportingTest = import ./tests/monitoring/reporting.nix {
         inherit nixpkgs pkgs stateVersion;
       };
@@ -87,6 +96,9 @@
         doh-upstream = dohUpstreamTest;
         firewall = firewallTest;
         locale-firefox = localeFirefoxTest;
+        monitoring-auto-upgrade = monitoringAutoUpgradeTest;
+        monitoring-disk-space = monitoringDiskSpaceTest;
+        monitoring-generations = monitoringGenerationsTest;
         monitoring-reporting = monitoringReportingTest;
         monitoring-restic = monitoringResticTest;
         nix-settings = nixSettingsTest;
@@ -159,6 +171,12 @@
         firewall-driver-interactive = firewallTest.driverInteractive;
         locale-firefox-driver = localeFirefoxTest.driver;
         locale-firefox-driver-interactive = localeFirefoxTest.driverInteractive;
+        monitoring-auto-upgrade-driver = monitoringAutoUpgradeTest.driver;
+        monitoring-auto-upgrade-driver-interactive = monitoringAutoUpgradeTest.driverInteractive;
+        monitoring-disk-space-driver = monitoringDiskSpaceTest.driver;
+        monitoring-disk-space-driver-interactive = monitoringDiskSpaceTest.driverInteractive;
+        monitoring-generations-driver = monitoringGenerationsTest.driver;
+        monitoring-generations-driver-interactive = monitoringGenerationsTest.driverInteractive;
         monitoring-reporting-driver = monitoringReportingTest.driver;
         monitoring-reporting-driver-interactive = monitoringReportingTest.driverInteractive;
         monitoring-restic-driver = monitoringResticTest.driver;

@@ -1,37 +1,10 @@
 { nixpkgs, pkgs, stateVersion }:
 
 let
-  fakeSmartmontools = pkgs.writeShellScriptBin "smartctl" ''
-    set -eu
-
-    case "$*" in
-      "--scan-open --json")
-        cat <<'JSON'
-    {"devices":[{"name":"/dev/testdisk","type":"sat"}]}
-    JSON
-        ;;
-      "--json --health --all -d sat /dev/testdisk")
-        if [ "$(cat /run/smart-status 2>/dev/null || printf healthy)" = healthy ]; then
-          cat <<'JSON'
-    {"smart_status":{"passed":true}}
-    JSON
-        else
-          cat <<'JSON'
-    {"smart_status":{"passed":false}}
-    JSON
-        fi
-        ;;
-      *)
-        printf 'unexpected smartctl arguments: %s\n' "$*" >&2
-        exit 2
-        ;;
-    esac
-  '';
-
   monitoringPlatform = import ./platform.nix { inherit pkgs; };
 in
 nixpkgs.lib.nixos.runTest {
-  name = "monitoring-reporting";
+  name = "monitoring-disk-space";
   hostPkgs = pkgs;
   globalTimeout = 180;
 
@@ -44,20 +17,18 @@ nixpkgs.lib.nixos.runTest {
 
     networking.hostName = "monitoring-client";
     common.autoUpgrade.enable = false;
+    boot.kernelModules = [ "loop" ];
+    environment.systemPackages = [ pkgs.e2fsprogs ];
 
     common.monitoring = {
       enable = true;
-      tools.smartmontools = fakeSmartmontools;
+      smart.enable = false;
       restic.enable = false;
       autoUpgrade.enable = false;
-      diskSpace.maxUsedPercent = 99;
       generations.maxCount = 999;
+      diskSpace.enable = true;
+      diskSpace.maxUsedPercent = 90;
       report.credentialDirectory = "/etc/credentials/monitoring";
-      timerConfig = {
-        OnCalendar = "hourly";
-        Persistent = true;
-        RandomizedDelaySec = "10m";
-      };
     };
 
     system.activationScripts.monitoringCredentials = ''
@@ -96,13 +67,6 @@ nixpkgs.lib.nixos.runTest {
     platform.wait_for_unit("monitoring-platform.service")
     platform.wait_for_open_port(8080)
 
-    client.succeed("systemctl show common-monitoring.timer -p TimersCalendar --value | grep -F '*-*-* *:00:00'")
-    client.succeed("systemctl show common-monitoring.timer -p Persistent --value | grep -F yes")
-    client.succeed("systemctl show common-monitoring.timer -p RandomizedDelayUSec --value | grep -F '10min'")
-    client.succeed("systemctl is-active --quiet common-monitoring.timer")
-    client.succeed("systemctl cat common-monitoring.service | grep -F 'LoadCredential=healthchecks-url:/etc/credentials/monitoring/healthchecks-url'")
-    client.fail("systemctl cat common-monitoring.service | grep -F 'http://monitoring-platform:8080/health'")
-
     def reset_platform():
         platform.succeed("rm -f /var/lib/monitoring-platform/events.log /var/lib/monitoring-platform/bodies.log")
 
@@ -111,27 +75,41 @@ nixpkgs.lib.nixos.runTest {
         events = platform.succeed("cat /var/lib/monitoring-platform/events.log").strip().splitlines()
         assert events == expected, f"unexpected events: {events}"
 
+    # Controlled, non-excluded local filesystem whose fill level drives the check result.
+    client.succeed("truncate -s 20M /test.img")
+    client.succeed("mkfs.ext4 -q -m 0 /test.img")
+    client.succeed("mkdir -p /mnt/testfs")
+    client.succeed("mount -o loop /test.img /mnt/testfs")
+
+    # Near-full tmpfs to prove the excludeFsTypes skip path (tmpfs is excluded).
+    client.succeed("mkdir -p /mnt/excluded")
+    client.succeed("mount -t tmpfs -o size=2M tmpfs /mnt/excluded")
+    client.succeed("dd if=/dev/zero of=/mnt/excluded/fill bs=1M count=2 || true")
+
+    # Run A: controlled fs under threshold -> OK, and excluded tmpfs is skipped.
     reset_platform()
-    client.succeed("printf '%s' healthy > /run/smart-status")
     client.succeed("systemctl start common-monitoring.service")
     assert_paths([
         "POST /health/start",
         "POST /health/log",
         "POST /health",
     ])
-    platform.succeed("grep -F '[OK] smart: /dev/testdisk reports healthy' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed("grep -F '[OK] disk-space: /mnt/testfs is' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F 'status=ok' /var/lib/monitoring-platform/bodies.log")
     platform.fail("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
+    platform.fail("grep -F 'disk-space: /mnt/excluded' /var/lib/monitoring-platform/bodies.log")
 
+    # Run B: controlled fs over threshold -> FAIL. Fill it to capacity; dd hitting
+    # ENOSPC (non-zero exit) is the intended ~100%-full state, so tolerate it.
+    client.succeed("dd if=/dev/zero of=/mnt/testfs/fill bs=1M count=19 || true")
     reset_platform()
-    client.succeed("printf '%s' failing > /run/smart-status")
     client.fail("systemctl start common-monitoring.service")
     assert_paths([
         "POST /health/start",
         "POST /health/log",
         "POST /health/fail",
     ])
-    platform.succeed("grep -F '[FAIL] smart: /dev/testdisk does not report healthy SMART status' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed("grep -F '[FAIL] disk-space: /mnt/testfs is' /var/lib/monitoring-platform/bodies.log | grep -F 'above 90%'")
     platform.succeed("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
   '';
 }

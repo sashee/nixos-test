@@ -1,37 +1,10 @@
 { nixpkgs, pkgs, stateVersion }:
 
 let
-  fakeSmartmontools = pkgs.writeShellScriptBin "smartctl" ''
-    set -eu
-
-    case "$*" in
-      "--scan-open --json")
-        cat <<'JSON'
-    {"devices":[{"name":"/dev/testdisk","type":"sat"}]}
-    JSON
-        ;;
-      "--json --health --all -d sat /dev/testdisk")
-        if [ "$(cat /run/smart-status 2>/dev/null || printf healthy)" = healthy ]; then
-          cat <<'JSON'
-    {"smart_status":{"passed":true}}
-    JSON
-        else
-          cat <<'JSON'
-    {"smart_status":{"passed":false}}
-    JSON
-        fi
-        ;;
-      *)
-        printf 'unexpected smartctl arguments: %s\n' "$*" >&2
-        exit 2
-        ;;
-    esac
-  '';
-
   monitoringPlatform = import ./platform.nix { inherit pkgs; };
 in
 nixpkgs.lib.nixos.runTest {
-  name = "monitoring-reporting";
+  name = "monitoring-generations";
   hostPkgs = pkgs;
   globalTimeout = 180;
 
@@ -47,17 +20,13 @@ nixpkgs.lib.nixos.runTest {
 
     common.monitoring = {
       enable = true;
-      tools.smartmontools = fakeSmartmontools;
+      smart.enable = false;
       restic.enable = false;
       autoUpgrade.enable = false;
-      diskSpace.maxUsedPercent = 99;
-      generations.maxCount = 999;
+      diskSpace.enable = false;
+      generations.enable = true;
+      generations.maxCount = 3;
       report.credentialDirectory = "/etc/credentials/monitoring";
-      timerConfig = {
-        OnCalendar = "hourly";
-        Persistent = true;
-        RandomizedDelaySec = "10m";
-      };
     };
 
     system.activationScripts.monitoringCredentials = ''
@@ -96,13 +65,6 @@ nixpkgs.lib.nixos.runTest {
     platform.wait_for_unit("monitoring-platform.service")
     platform.wait_for_open_port(8080)
 
-    client.succeed("systemctl show common-monitoring.timer -p TimersCalendar --value | grep -F '*-*-* *:00:00'")
-    client.succeed("systemctl show common-monitoring.timer -p Persistent --value | grep -F yes")
-    client.succeed("systemctl show common-monitoring.timer -p RandomizedDelayUSec --value | grep -F '10min'")
-    client.succeed("systemctl is-active --quiet common-monitoring.timer")
-    client.succeed("systemctl cat common-monitoring.service | grep -F 'LoadCredential=healthchecks-url:/etc/credentials/monitoring/healthchecks-url'")
-    client.fail("systemctl cat common-monitoring.service | grep -F 'http://monitoring-platform:8080/health'")
-
     def reset_platform():
         platform.succeed("rm -f /var/lib/monitoring-platform/events.log /var/lib/monitoring-platform/bodies.log")
 
@@ -111,27 +73,45 @@ nixpkgs.lib.nixos.runTest {
         events = platform.succeed("cat /var/lib/monitoring-platform/events.log").strip().splitlines()
         assert events == expected, f"unexpected events: {events}"
 
+    def generation_count():
+        return client.succeed("find /nix/var/nix/profiles -maxdepth 1 -name 'system-*-link' | wc -l").strip()
+
+    def make_generations(indices):
+        # Real generations via the same `nix-env --set` mechanism nixos-rebuild uses.
+        # Each generation points at a distinct store path so --set creates a new
+        # generation (setting the same path repeatedly is deduplicated to one).
+        for i in indices:
+            path = client.succeed(f"mkdir -p /tmp/gen{i} && echo {i} > /tmp/gen{i}/marker && nix-store --add /tmp/gen{i}").strip()
+            client.succeed(f"nix-env -p /nix/var/nix/profiles/system --set {path}")
+
+    # Test VMs register no system generations by default.
+    assert generation_count() == "0", f"unexpected baseline generation count: {generation_count()}"
+
+    # Run A: count == maxCount (3) -> OK (check uses -gt).
+    make_generations(range(1, 4))
+    assert generation_count() == "3", f"expected 3 generations, got {generation_count()}"
     reset_platform()
-    client.succeed("printf '%s' healthy > /run/smart-status")
     client.succeed("systemctl start common-monitoring.service")
     assert_paths([
         "POST /health/start",
         "POST /health/log",
         "POST /health",
     ])
-    platform.succeed("grep -F '[OK] smart: /dev/testdisk reports healthy' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed("grep -F '[OK] generations: 3 system generations' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F 'status=ok' /var/lib/monitoring-platform/bodies.log")
     platform.fail("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
 
+    # Run B: count > maxCount -> FAIL.
+    make_generations(range(4, 6))
+    assert generation_count() == "5", f"expected 5 generations, got {generation_count()}"
     reset_platform()
-    client.succeed("printf '%s' failing > /run/smart-status")
     client.fail("systemctl start common-monitoring.service")
     assert_paths([
         "POST /health/start",
         "POST /health/log",
         "POST /health/fail",
     ])
-    platform.succeed("grep -F '[FAIL] smart: /dev/testdisk does not report healthy SMART status' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed("grep -F '[FAIL] generations: 5 system generations, above 3' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
   '';
 }
