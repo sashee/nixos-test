@@ -19,6 +19,8 @@ nixpkgs.lib.nixos.runTest {
     networking.hostName = "restic-client";
     common.autoUpgrade.enable = false;
     common.monitoring.enable = false;
+    # The test advances the clock; keep the Persistent nix-gc.timer from firing mid-test.
+    nix.gc.automatic = nixpkgs.lib.mkForce false;
     system.stateVersion = stateVersion;
 
     users.users.backup-user = {

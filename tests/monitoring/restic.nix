@@ -66,6 +66,10 @@ let
       "host,kvmclock=off"
     ];
 
+    # This test warps the clock past 14 days; the Persistent nix-gc.timer would
+    # otherwise fire a catch-up collect mid-test and starve the monitoring run.
+    nix.gc.automatic = nixpkgs.lib.mkForce false;
+
     system.stateVersion = stateVersion;
   };
 in
@@ -161,77 +165,47 @@ nixpkgs.lib.nixos.runTest {
     def test_timestamp(days, time):
         return f"{test_clock_day + timedelta(days=days)} {time}"
 
-    def restic_completion_timestamp(client):
-        timestamp = client.succeed("systemctl show restic-backups-monitored.service -p ExecMainExitTimestamp --value").strip()
-        if timestamp == "":
-            timestamp = client.succeed("systemctl show restic-backups-monitored.service -p InactiveEnterTimestamp --value").strip()
-        assert timestamp != "", "restic service has no completion timestamp"
-        return timestamp
+    marker = "/var/lib/common-monitoring/restic-backups-monitored.service.last-success"
 
-    def restic_state_timestamp(client):
-        timestamp = client.succeed("systemctl show restic-backups-monitored.service -p StateChangeTimestamp --value").strip()
-        assert timestamp != "", "restic service has no state-change timestamp"
-        return timestamp
+    def reset_platform():
+        platform.succeed("rm -f /var/lib/monitoring-platform/events.log /var/lib/monitoring-platform/bodies.log")
 
-    def wait_for_restic_success(client):
-        client.wait_until_succeeds("systemctl show restic-backups-monitored.service -p ActiveState --value | grep -F inactive && systemctl show restic-backups-monitored.service -p Result --value | grep -F success && journalctl -u restic-backups-monitored.service | grep -F 'snapshot '", timeout=120)
+    def assert_events(prefix, expected):
+        events = platform.succeed("cat /var/lib/monitoring-platform/events.log").strip().splitlines()
+        got = [event for event in events if event.startswith(f"POST /{prefix}")]
+        assert got == expected, f"unexpected {prefix} events: {got}"
 
-    def wait_for_restic_result(client, pattern):
-        client.wait_until_succeeds(f"systemctl show restic-backups-monitored.service -p ActiveState --value | grep -E 'inactive|failed' && systemctl show restic-backups-monitored.service -p Result --value | grep -E '{pattern}'", timeout=120)
-
-    def service_state_timestamp(client, unit):
-        return client.succeed(f"systemctl show {unit} -p StateChangeTimestamp --value").strip()
-
-    def wait_for_monitoring_result_after(client, previous_timestamp, pattern):
-        client.wait_until_succeeds(f"test \"$(systemctl show common-monitoring.service -p StateChangeTimestamp --value)\" != \"{previous_timestamp}\" && systemctl show common-monitoring.service -p ActiveState --value | grep -E 'inactive|failed' && systemctl show common-monitoring.service -p Result --value | grep -E '{pattern}'", timeout=120)
-
+    # Warm up: a jump past the backup timer's 1h randomized-delay window fires the
+    # overdue backup. good-client succeeds and records its last-success marker;
+    # bad-client (wrong backend auth) fails and records nothing. From here the test
+    # only jumps the clock and inspects the recorded reports — it never touches the
+    # clients' units.
     set_time(test_timestamp(1, "01:05:00"))
-    wait_for_restic_success(good_client)
-    wait_for_restic_result(bad_client, "exit-code|timeout|signal")
+    good_client.wait_until_succeeds(f"test -r {marker}", timeout=120)
+    bad_client.fail(f"test -e {marker}")
 
-    good_monitoring_timestamp = service_state_timestamp(good_client, "common-monitoring.service")
-    bad_monitoring_timestamp = service_state_timestamp(bad_client, "common-monitoring.service")
-    set_time(test_timestamp(2, "00:15:00"))
-    wait_for_monitoring_result_after(good_client, good_monitoring_timestamp, "success")
-    wait_for_monitoring_result_after(bad_client, bad_monitoring_timestamp, "exit-code")
-
-    last_good_restic_timestamp = restic_completion_timestamp(good_client)
-    good_client.succeed("systemctl stop restic-backups-monitored.timer")
-    stale_monitoring_timestamp = service_state_timestamp(good_client, "common-monitoring.service")
-    set_time(test_timestamp(16, "00:15:00"), [good_client, platform])
-    wait_for_monitoring_result_after(good_client, stale_monitoring_timestamp, "exit-code")
-    good_client.succeed(f"test \"$(systemctl show restic-backups-monitored.service -p ExecMainExitTimestamp --value)\" = \"{last_good_restic_timestamp}\"")
-
-    platform.wait_until_succeeds("test -f /var/lib/monitoring-platform/events.log && grep -F 'POST /good' /var/lib/monitoring-platform/events.log && grep -F 'POST /bad/fail' /var/lib/monitoring-platform/events.log", timeout=120)
-
-    events = platform.succeed("cat /var/lib/monitoring-platform/events.log").strip().splitlines()
-    good_events = [event for event in events if event.startswith("POST /good")]
-    bad_events = [event for event in events if event.startswith("POST /bad")]
-    expected_good_events = [
-        "POST /good/start",
-        "POST /good/log",
-        "POST /good",
-    ]
-    expected_good_stale_events = [
-        "POST /good/start",
-        "POST /good/log",
-        "POST /good/fail",
-    ]
-    expected_bad_events = [
-        "POST /bad/start",
-        "POST /bad/log",
-        "POST /bad/fail",
-    ]
-    assert len(good_events) >= 3 and len(good_events) % 3 == 0, f"unexpected good monitoring events: {good_events}"
-    assert len(bad_events) >= 3 and len(bad_events) % 3 == 0, f"unexpected bad monitoring events: {bad_events}"
-    assert any(good_events[index:index + 3] == expected_good_events for index in range(0, len(good_events), 3)), f"missing good success monitoring events: {good_events}"
-    assert good_events[-3:] == expected_good_stale_events, f"missing final stale good monitoring events: {good_events}"
-    assert all(bad_events[index:index + 3] == expected_bad_events for index in range(0, len(bad_events), 3)), f"unexpected bad monitoring events: {bad_events}"
-
+    # Recent success: good reports OK (last success within maxAge); bad has never
+    # succeeded, so it reports "no successful run". A bare "POST /good" is the
+    # success ping; "POST /bad/fail" is the failure ping.
+    reset_platform()
+    set_time(test_timestamp(2, "01:05:00"))
+    platform.wait_until_succeeds("grep -Fxq 'POST /good' /var/lib/monitoring-platform/events.log && grep -Fxq 'POST /bad/fail' /var/lib/monitoring-platform/events.log", timeout=120)
+    assert_events("good", ["POST /good/start", "POST /good/log", "POST /good"])
+    assert_events("bad", ["POST /bad/start", "POST /bad/log", "POST /bad/fail"])
     platform.succeed("grep -F '[OK] restic monitored: restic-backups-monitored.service last succeeded' /var/lib/monitoring-platform/bodies.log")
-    platform.succeed("grep -F '[FAIL] restic monitored: restic-backups-monitored.service result is' /var/lib/monitoring-platform/bodies.log")
-    platform.succeed("grep -F '[FAIL] restic monitored: restic-backups-monitored.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")
+    platform.succeed("grep -F '[FAIL] restic monitored: restic-backups-monitored.service has no successful run recorded' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F 'status=ok' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
+
+    # Stale: stop the backend so good can no longer succeed; its last success then
+    # ages past maxAge (14d). Intervening failed backups don't matter — only the
+    # absence of a recent *success* does.
+    platform.succeed("systemctl stop restic-rest-auth.socket restic-rest-auth.service")
+    reset_platform()
+    set_time(test_timestamp(17, "01:05:00"), [good_client, platform])
+    platform.wait_until_succeeds("grep -Fxq 'POST /good/fail' /var/lib/monitoring-platform/events.log", timeout=120)
+    assert_events("good", ["POST /good/start", "POST /good/log", "POST /good/fail"])
+    platform.succeed("grep -F '[FAIL] restic monitored: restic-backups-monitored.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")
     platform.succeed("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
   '';
 }

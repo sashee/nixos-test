@@ -109,15 +109,10 @@ nixpkgs.lib.nixos.runTest {
     platform.wait_for_unit("monitoring-platform.service")
     platform.wait_for_open_port(8080)
 
-    # Drive both services manually; otherwise the Persistent= daily timers fire
-    # spurious catch-up runs when the clock jumps and race the assertions.
-    client.succeed("systemctl stop common-monitoring.timer nixos-upgrade.timer")
-
     def reset_platform():
         platform.succeed("rm -f /var/lib/monitoring-platform/events.log /var/lib/monitoring-platform/bodies.log")
 
     def assert_paths(expected):
-        platform.wait_until_succeeds("test -f /var/lib/monitoring-platform/events.log", timeout=30)
         events = platform.succeed("cat /var/lib/monitoring-platform/events.log").strip().splitlines()
         assert events == expected, f"unexpected events: {events}"
 
@@ -130,43 +125,32 @@ nixpkgs.lib.nixos.runTest {
         for node in (nodes or [client, platform]):
             node.succeed(f"date -s '{timestamp}'")
 
-    # Scenario 1: nixos-upgrade fails -> monitoring reports the bad Result.
-    set_time(test_timestamp(1, "01:00:00"))
-    client.succeed("printf '%s' fail > /run/upgrade-status")
-    client.fail("systemctl start nixos-upgrade.service")
-    reset_platform()
-    client.fail("systemctl start common-monitoring.service")
-    assert_paths([
-        "POST /health/start",
-        "POST /health/log",
-        "POST /health/fail",
-    ])
-    platform.succeed("grep -F '[FAIL] auto-upgrade: nixos-upgrade.service result is' /var/lib/monitoring-platform/bodies.log")
-    platform.succeed("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
+    marker = "/var/lib/common-monitoring/nixos-upgrade.service.last-success"
 
-    # Scenario 2: nixos-upgrade succeeds recently -> monitoring OK.
-    client.succeed("printf '%s' ok > /run/upgrade-status")
-    client.succeed("systemctl start nixos-upgrade.service")
+    # Warm up: a jump past nixos-upgrade.timer's 2h randomized-delay window fires
+    # the overdue upgrade; the mocked rebuild succeeds (default) and records the
+    # last-success marker. From here the test only jumps the clock and inspects —
+    # it never starts/stops the client's units; it only flips the mock's outcome
+    # via /run/upgrade-status (the fixture lever).
+    set_time(test_timestamp(1, "02:05:00"))
+    client.wait_until_succeeds(f"test -r {marker}", timeout=120)
+
+    # Recent success -> monitoring OK.
     reset_platform()
-    client.succeed("systemctl start common-monitoring.service")
-    assert_paths([
-        "POST /health/start",
-        "POST /health/log",
-        "POST /health",
-    ])
+    set_time(test_timestamp(2, "02:05:00"))
+    platform.wait_until_succeeds("grep -Fxq 'POST /health' /var/lib/monitoring-platform/events.log", timeout=120)
+    assert_paths(["POST /health/start", "POST /health/log", "POST /health"])
     platform.succeed("grep -F '[OK] auto-upgrade: nixos-upgrade.service last succeeded' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F 'status=ok' /var/lib/monitoring-platform/bodies.log")
     platform.fail("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
 
-    # Scenario 3: last success ages past maxAge (14d) -> monitoring FAIL.
-    set_time(test_timestamp(16, "00:15:00"))
+    # Stale: make the upgrade start failing so no new success is recorded; its last
+    # success then ages past maxAge (14d). Intervening failed runs don't matter.
+    client.succeed("printf '%s' fail > /run/upgrade-status")
     reset_platform()
-    client.fail("systemctl start common-monitoring.service")
-    assert_paths([
-        "POST /health/start",
-        "POST /health/log",
-        "POST /health/fail",
-    ])
+    set_time(test_timestamp(17, "02:05:00"))
+    platform.wait_until_succeeds("grep -Fxq 'POST /health/fail' /var/lib/monitoring-platform/events.log", timeout=120)
+    assert_paths(["POST /health/start", "POST /health/log", "POST /health/fail"])
     platform.succeed("grep -F '[FAIL] auto-upgrade: nixos-upgrade.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")
     platform.succeed("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
   '';

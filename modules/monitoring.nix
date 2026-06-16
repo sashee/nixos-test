@@ -8,6 +8,32 @@ let
 
   excludeFsTypePattern = lib.concatStringsSep "|" (map lib.escapeShellArg cfg.diskSpace.excludeFsTypes);
 
+  # systemd has no "last successful run" timestamp, so monitored units record one
+  # via OnSuccess into this directory; the checks read the marker's age.
+  successDir = "/var/lib/common-monitoring";
+  markerPath = unit: "${successDir}/${unit}.last-success";
+  recordServiceName = name: "common-monitoring-record-${name}";
+
+  recordSuccess = pkgs.writeShellApplication {
+    name = "common-monitoring-record-success";
+    runtimeInputs = [ cfg.tools.coreutils ];
+    text = ''
+      target="$1"
+      mkdir -p "$(dirname "$target")"
+      tmp="$(mktemp "$target.XXXXXX")"
+      date +%s > "$tmp"
+      mv -f "$tmp" "$target"
+    '';
+  };
+
+  # Units whose last-successful-run age the monitoring checks track. `name` is the
+  # systemd.services.<name> key (no .service); `unit` is the full unit name.
+  monitoredUnits =
+    lib.optionals cfg.restic.enable
+      (map (b: rec { name = "restic-backups-${b}"; unit = "${name}.service"; }) resticBackups)
+    ++ lib.optional (cfg.autoUpgrade.enable && config.system.autoUpgrade.enable)
+      { name = "nixos-upgrade"; unit = "nixos-upgrade.service"; };
+
   monitorScript = pkgs.writeShellApplication {
     name = "common-monitoring-checks";
     runtimeInputs = [
@@ -124,33 +150,18 @@ let
         max_age="$3"
         max_seconds="$(parse_duration_seconds "$max_age")"
 
-        result="$(systemctl show "$unit" -p Result --value 2>/dev/null || true)"
-        if [ "$result" != "success" ]; then
-          fail "$label: $unit result is '$result', expected success"
+        # Alert when there has been no successful run within max_age. The unit
+        # records its last success time (epoch) into this marker via OnSuccess;
+        # failed runs in between never touch it, so they are correctly ignored.
+        marker="${successDir}/$unit.last-success"
+        if [ ! -r "$marker" ]; then
+          fail "$label: $unit has no successful run recorded"
           return 0
         fi
 
-        timestamp="$(systemctl show "$unit" -p ExecMainExitTimestamp --value 2>/dev/null || true)"
-        if [ -z "$timestamp" ]; then
-          timestamp="$(systemctl show "$unit" -p InactiveEnterTimestamp --value 2>/dev/null || true)"
-        fi
-        if [ -z "$timestamp" ]; then
-          fail "$label: $unit has no completion timestamp"
-          return 0
-        fi
-
-        timestamp_seconds="$(date -d "$timestamp" +%s 2>/dev/null || true)"
-        if [ -z "$timestamp_seconds" ]; then
-          fail "$label: cannot parse timestamp '$timestamp' from $unit"
-          return 0
-        fi
-
+        last_seconds="$(cat "$marker")"
         now_seconds="$(date +%s)"
-        age_seconds="$((now_seconds - timestamp_seconds))"
-        if [ "$age_seconds" -lt 0 ]; then
-          fail "$label: $unit completion timestamp is in the future: $timestamp"
-          return 0
-        fi
+        age_seconds="$((now_seconds - last_seconds))"
 
         if [ "$age_seconds" -gt "$max_seconds" ]; then
           fail "$label: $unit last succeeded ''${age_seconds}s ago, older than $max_age"
@@ -441,26 +452,45 @@ in
       }
     ];
 
-    systemd.services.common-monitoring = {
-      description = "Common system health monitoring";
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = lib.getExe monitorScript;
-        LoadCredential = lib.mkIf (cfg.report.enable && cfg.report.credentialDirectory != null) [
-          "${cfg.report.urlCredential}:${cfg.report.credentialDirectory}/${cfg.report.urlCredential}"
-        ];
-        NoNewPrivileges = true;
-        ProtectSystem = "strict";
-        ProtectHome = "read-only";
-        PrivateTmp = true;
-        ProtectKernelTunables = true;
-        ProtectKernelModules = true;
-        ProtectControlGroups = true;
-        RestrictSUIDSGID = true;
-        LockPersonality = true;
-        SystemCallArchitectures = "native";
+    systemd.tmpfiles.rules = [ "d ${successDir} 0755 root root -" ];
+
+    systemd.services = lib.mkMerge ([
+      {
+        common-monitoring = {
+          description = "Common system health monitoring";
+          serviceConfig = {
+            Type = "oneshot";
+            ExecStart = lib.getExe monitorScript;
+            LoadCredential = lib.mkIf (cfg.report.enable && cfg.report.credentialDirectory != null) [
+              "${cfg.report.urlCredential}:${cfg.report.credentialDirectory}/${cfg.report.urlCredential}"
+            ];
+            NoNewPrivileges = true;
+            ProtectSystem = "strict";
+            ProtectHome = "read-only";
+            PrivateTmp = true;
+            ProtectKernelTunables = true;
+            ProtectKernelModules = true;
+            ProtectControlGroups = true;
+            RestrictSUIDSGID = true;
+            LockPersonality = true;
+            SystemCallArchitectures = "native";
+          };
+        };
+      }
+    ] ++ map (m: {
+      # Record the unit's last successful run; started by the unit's OnSuccess.
+      ${recordServiceName m.name} = {
+        description = "Record last successful run of ${m.unit}";
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = "${lib.getExe recordSuccess} ${markerPath m.unit}";
+        };
       };
-    };
+      # Have the monitored unit record success without touching its own ExecStart.
+      ${m.name} = {
+        unitConfig.OnSuccess = "${recordServiceName m.name}.service";
+      };
+    }) monitoredUnits);
 
     systemd.timers.common-monitoring = {
       wantedBy = [ "timers.target" ];
