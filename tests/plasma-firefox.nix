@@ -51,6 +51,7 @@ nixpkgs.lib.nixos.runTest {
 
     networking.hostName = "plasma-firefox-test";
     common.autoUpgrade.enable = false;
+    common.monitoring.enable = false;
     system.stateVersion = stateVersion;
 
     services.displayManager.defaultSession = "plasma";

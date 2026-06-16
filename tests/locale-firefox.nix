@@ -47,6 +47,7 @@ nixpkgs.lib.nixos.runTest {
 
     networking.hostName = "locale-english-test";
     common.autoUpgrade.enable = false;
+    common.monitoring.enable = false;
     system.stateVersion = stateVersion;
   };
 
@@ -58,6 +59,7 @@ nixpkgs.lib.nixos.runTest {
 
     common.locale.default = "hu_HU.UTF-8";
     common.autoUpgrade.enable = false;
+    common.monitoring.enable = false;
     networking.hostName = "locale-hungarian-test";
     system.stateVersion = stateVersion;
   };

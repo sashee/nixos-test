@@ -115,7 +115,15 @@ bootloader, networking.hostName, time.timeZone
 users + passwords
 disk encryption (LUKS), on-disk swap (+ resume for hibernation)
 common.autoUpgrade.flake
+common.monitoring.report.credentialDirectory
 ```
+
+`common.autoUpgrade` and `common.monitoring` are **enabled by default**, and each fails evaluation if
+its required argument is missing — `common.autoUpgrade.flake` for upgrades, and
+`common.monitoring.report.credentialDirectory` for monitoring (when reporting is on). This is
+deliberate: a laptop cannot silently ship with upgrades or monitoring unconfigured. Opt a host out
+with `common.autoUpgrade.enable = false` / `common.monitoring.enable = false`, or disable just the
+ping with `common.monitoring.report.enable = false`.
 
 ### 1. Host flake
 
@@ -279,8 +287,13 @@ forget --prune` fails on an append-only repository.
 
 `modules/monitoring.nix` runs daily health checks — SMART disk status, restic
 backup age, local disk-space usage, NixOS system-generation count, and
-auto-upgrade age — and reports the result to a Healthchecks-compatible URL. See
-the `common.monitoring.*` options to enable reporting and tune each check.
+auto-upgrade age — and reports the result to a Healthchecks-compatible URL. It is
+**enabled by default**; when reporting is enabled (also the default), the host
+must set `common.monitoring.report.credentialDirectory` (the directory holding
+the URL credential) or evaluation fails. Disable the whole check with
+`common.monitoring.enable = false`, or just the reporting with
+`common.monitoring.report.enable = false`. See `common.monitoring.*` to tune each
+check.
 
 `modules/fonts.nix` contains common desktop fonts.
 

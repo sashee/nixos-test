@@ -36,6 +36,7 @@
 
             common.locale.default = "hu_HU.UTF-8";
             common.autoUpgrade.enable = false;
+            common.monitoring.enable = false;
 
             virtualisation = {
               cores = 6;

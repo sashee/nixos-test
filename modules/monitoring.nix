@@ -295,7 +295,7 @@ in
   options.common.monitoring = {
     enable = lib.mkOption {
       type = lib.types.bool;
-      default = false;
+      default = true;
       description = "Whether to run common laptop health monitoring checks.";
     };
 
@@ -317,9 +317,12 @@ in
       };
 
       credentialDirectory = lib.mkOption {
-        type = lib.types.str;
-        default = "/etc/credentials/monitoring";
-        description = "Directory containing the Healthchecks URL credential.";
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Directory containing the Healthchecks URL credential. Required when
+          reporting is enabled; left unset so a host cannot silently forget it.
+        '';
       };
 
       urlCredential = lib.mkOption {
@@ -431,12 +434,19 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !cfg.report.enable || cfg.report.credentialDirectory != null;
+        message = "common.monitoring.report.credentialDirectory must be set when monitoring reporting is enabled (or set common.monitoring.report.enable = false).";
+      }
+    ];
+
     systemd.services.common-monitoring = {
       description = "Common system health monitoring";
       serviceConfig = {
         Type = "oneshot";
         ExecStart = lib.getExe monitorScript;
-        LoadCredential = lib.mkIf cfg.report.enable [
+        LoadCredential = lib.mkIf (cfg.report.enable && cfg.report.credentialDirectory != null) [
           "${cfg.report.urlCredential}:${cfg.report.credentialDirectory}/${cfg.report.urlCredential}"
         ];
         NoNewPrivileges = true;

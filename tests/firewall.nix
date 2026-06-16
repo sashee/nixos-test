@@ -10,6 +10,7 @@ nixpkgs.lib.nixos.runTest {
 
     networking.hostName = "firewall-test";
     common.autoUpgrade.enable = false;
+    common.monitoring.enable = false;
     system.stateVersion = stateVersion;
   };
 
@@ -18,6 +19,7 @@ nixpkgs.lib.nixos.runTest {
 
     common = {
       autoUpgrade.enable = false;
+      monitoring.enable = false;
       firewall.enable = false;
     };
     networking = {

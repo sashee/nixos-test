@@ -264,6 +264,7 @@ nixpkgs.lib.nixos.runTest {
 
     networking.hostName = "doh-upstream-ipv4";
     common.autoUpgrade.enable = false;
+    common.monitoring.enable = false;
     security.pki.certificateFiles = [ "${dohTestCerts}/ca.pem" ];
     system.stateVersion = stateVersion;
   };
@@ -273,6 +274,7 @@ nixpkgs.lib.nixos.runTest {
 
     networking.hostName = "doh-upstream-ipv6";
     common.autoUpgrade.enable = false;
+    common.monitoring.enable = false;
     security.pki.certificateFiles = [ "${dohTestCerts}/ca.pem" ];
     system.stateVersion = stateVersion;
   };
@@ -282,6 +284,7 @@ nixpkgs.lib.nixos.runTest {
 
     common = {
       autoUpgrade.enable = false;
+      monitoring.enable = false;
       doh.enable = false;
       firewall.enable = false;
     };

@@ -18,6 +18,7 @@ nixpkgs.lib.nixos.runTest {
 
     networking.hostName = "restic-client";
     common.autoUpgrade.enable = false;
+    common.monitoring.enable = false;
     system.stateVersion = stateVersion;
 
     users.users.backup-user = {
