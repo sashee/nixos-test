@@ -1,6 +1,12 @@
 {
   networking.networkmanager.enable = true;
 
+  hardware.enableRedistributableFirmware = true;
+  hardware.cpu.intel.updateMicrocode = true;
+  hardware.cpu.amd.updateMicrocode = true;
+
+  zramSwap.enable = true;
+
   hardware.bluetooth.enable = true;
 
   services.blueman.enable = true;

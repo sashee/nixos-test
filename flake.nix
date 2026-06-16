@@ -89,6 +89,9 @@
         autoUpgradeModule = ./modules/auto-upgrade.nix;
         inherit nixpkgs pkgs stateVersion;
       };
+      zramTest = import ./tests/zram.nix {
+        inherit nixpkgs pkgs stateVersion;
+      };
       testResults = {
         auto-upgrade-mocked-service = autoUpgradeMockedServiceTest;
         common-desktop = commonDesktopTest;
@@ -104,6 +107,7 @@
         nix-settings = nixSettingsTest;
         plasma-firefox = plasmaFirefoxTest;
         restic = resticTest;
+        zram = zramTest;
       };
       testResultLinks = nixpkgs.lib.concatStringsSep "\n" (
         nixpkgs.lib.mapAttrsToList
@@ -189,6 +193,8 @@
         plasma-firefox-driver-interactive = plasmaFirefoxTest.driverInteractive;
         restic-driver = resticTest.driver;
         restic-driver-interactive = resticTest.driverInteractive;
+        zram-driver = zramTest.driver;
+        zram-driver-interactive = zramTest.driverInteractive;
       };
     };
 }
