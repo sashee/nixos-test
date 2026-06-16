@@ -11,7 +11,7 @@ evaluate against competing nixpkgs revisions:
 ```nix
 {
   inputs = {
-    common.url = "path:/home/sashee/workspace/nixos-test";
+    common.url = "github:sashee/nixos-test";
     nixpkgs.follows = "common/nixpkgs";
   };
 
@@ -38,6 +38,7 @@ modules/firewall.nix
 modules/doh.nix
 modules/restic.nix
 modules/auto-upgrade.nix
+modules/monitoring.nix
 modules/fonts.nix
 modules/development-base.nix
 modules/nix-utils.nix
@@ -91,13 +92,120 @@ commits when their local upgrade timer updates `/etc/nixos/flake.lock`.
 VM-only users, autologin, and test tools are internal to this flake and are only
 used by the QEMU VM/tests.
 
+## Installing on a laptop
+
+`common-desktop` already provides the parts that are the same on every machine, so
+a host config only needs the hardware-specific pieces.
+
+Provided by `common-desktop` (do not repeat in the host config):
+
+```text
+Plasma 6 + Firefox, SDDM, hardware graphics
+NetworkManager, Bluetooth, DNS over HTTPS, nftables firewall
+PipeWire audio, fonts, CLI/dev tools, direnv
+redistributable firmware, CPU microcode (Intel + AMD), zram swap
+flakes/nix settings + GC, auto-upgrade, monitoring, restic scaffolding
+```
+
+You must add per host:
+
+```text
+hardware-configuration.nix (generated)
+bootloader, networking.hostName, time.timeZone
+users + passwords
+disk encryption (LUKS), on-disk swap (+ resume for hibernation)
+common.autoUpgrade.flake
+```
+
+### 1. Host flake
+
+Name this repository input `common` and follow its `nixpkgs` so the host and
+common config evaluate against one nixpkgs revision:
+
+```nix
+{
+  inputs = {
+    common.url = "github:sashee/nixos-test";
+    nixpkgs.follows = "common/nixpkgs";
+  };
+
+  outputs = { nixpkgs, common, ... }: {
+    nixosConfigurations.laptop = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        common.nixosModules.common-desktop
+        ./configuration.nix
+      ];
+    };
+  };
+}
+```
+
+### 2. Host `configuration.nix`
+
+```nix
+{ ... }: {
+  imports = [ ./hardware-configuration.nix ];
+
+  boot.loader.systemd-boot.enable = true;
+  boot.loader.efi.canTouchEfiVariables = true;
+
+  networking.hostName = "my-laptop";
+  time.timeZone = "Europe/Budapest";
+  common.locale.default = "en_US.UTF-8";       # override per host if needed
+
+  users.users.sashee = {
+    isNormalUser = true;
+    extraGroups = [ "wheel" "networkmanager" ];
+    hashedPassword = "...";                     # generate with: mkpasswd -m sha-512
+  };
+
+  # Point auto-upgrade at this host's flake output (see the auto-upgrade section).
+  common.autoUpgrade.flake = "/etc/nixos#laptop";
+
+  # Per-machine on-disk swap. Merges with the base zram; zram keeps the higher
+  # priority, so disk swap is only used as overflow.
+  swapDevices = [ { device = "/var/lib/swapfile"; size = 8192; } ];
+
+  system.stateVersion = "26.05";               # match the release you install
+}
+```
+
+Hardware-specific extras live in `hardware-configuration.nix`:
+
+- **Disk encryption** — LUKS goes here, e.g. `boot.initrd.luks.devices.<name>.device`.
+- **Swap partition** instead of a swapfile — use
+  `swapDevices = [ { device = "/dev/disk/by-uuid/<uuid>"; } ];`.
+- **Hibernation** — additionally set `boot.resumeDevice` (and a `resume_offset`
+  kernel param when resuming from a swapfile).
+
+### 3. Install
+
+Partitioning and formatting are hardware-specific; follow the
+[NixOS manual](https://nixos.org/manual/nixos/stable/#sec-installation) for that
+step. Once the target is mounted at `/mnt`:
+
+```bash
+nixos-generate-config --root /mnt
+# Put flake.nix + configuration.nix in /mnt/etc/nixos and keep the generated
+# hardware-configuration.nix, then install the flake output:
+nixos-install --flake /mnt/etc/nixos#laptop
+reboot
+```
+
+The installer needs flakes enabled for `--flake`; if they are not on, prepend
+`--option experimental-features 'nix-command flakes'` to `nixos-install`.
+
 ## Module Contents
 
 `modules/plasma-firefox.nix` contains Plasma 6 Wayland, SDDM, hardware graphics,
 Firefox, and Konsole.
 
-`modules/laptop-base.nix` contains NetworkManager, Bluetooth, firmware updates,
-power profiles, printing, and UPower.
+`modules/laptop-base.nix` contains NetworkManager, Bluetooth, redistributable
+firmware, CPU microcode updates (Intel and AMD), firmware updates (fwupd), power
+profiles, printing, UPower, and zram swap. The microcode and firmware settings
+are CPU- and vendor-agnostic, so the base works unchanged on any Intel or AMD
+laptop.
 
 `modules/audio.nix` contains PipeWire and realtime audio support.
 
@@ -169,6 +277,11 @@ retention, and run `restic check` after backup/retention.
 When `prune.ignoreErrors = true`, backup success is preserved even if `restic
 forget --prune` fails on an append-only repository.
 
+`modules/monitoring.nix` runs daily health checks — SMART disk status, restic
+backup age, local disk-space usage, NixOS system-generation count, and
+auto-upgrade age — and reports the result to a Healthchecks-compatible URL. See
+the `common.monitoring.*` options to enable reporting and tune each check.
+
 `modules/fonts.nix` contains common desktop fonts.
 
 `modules/development-base.nix` contains common CLI tools and direnv with
@@ -183,6 +296,17 @@ graphics.
 optimisation, and automatic garbage collection.
 
 ## QEMU VM
+
+The `nix` commands below pass `--extra-experimental-features 'nix-command
+flakes'`, so they work even if flakes are not enabled in your `nix.conf`. To
+avoid repeating the flag, enable them permanently by adding this line to
+`~/.config/nix/nix.conf` (or `/etc/nix/nix.conf`):
+
+```text
+experimental-features = nix-command flakes
+```
+
+The `./result/bin/run-nixos-qemu-vm` runner needs no Nix flags at all.
 
 Build the graphical VM:
 
