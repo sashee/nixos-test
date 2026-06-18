@@ -25,6 +25,25 @@
         _module.args.unstable = unstable;
       };
       qemuDemoUserModule = ./modules/qemu-demo-user.nix;
+      nixUtilsTests = import "${dotfiles}/nix-utils/tests/lib.nix" {
+        inherit pkgs;
+        machineModules = [
+          commonDesktopModule
+          qemuDemoUserModule
+          {
+            system.stateVersion = stateVersion;
+            common.autoUpgrade.enable = false;
+            common.monitoring.enable = false;
+          }
+        ];
+        user = "demo";
+      };
+      nixUtilsTestDrivers = nixpkgs.lib.concatMapAttrs
+        (name: test: {
+          "nix-utils-${name}-driver" = test.driver;
+          "nix-utils-${name}-driver-interactive" = test.driverInteractive;
+        })
+        nixUtilsTests;
       dohStamps = import ./lib/doh-stamps.nix;
       resticLib = import ./lib/restic.nix { lib = nixpkgs.lib; };
       qemuGraphical = nixpkgs.lib.nixosSystem {
@@ -115,7 +134,9 @@
         plasma-firefox = plasmaFirefoxTest;
         restic = resticTest;
         zram = zramTest;
-      };
+      } // (nixpkgs.lib.mapAttrs'
+        (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
+        nixUtilsTests);
       testResultLinks = nixpkgs.lib.concatStringsSep "\n" (
         nixpkgs.lib.mapAttrsToList
           (name: test: "ln -s ${test} $out/${nixpkgs.lib.escapeShellArg name}")
@@ -202,6 +223,6 @@
         restic-driver-interactive = resticTest.driverInteractive;
         zram-driver = zramTest.driver;
         zram-driver-interactive = zramTest.driverInteractive;
-      };
+      } // nixUtilsTestDrivers;
     };
 }
