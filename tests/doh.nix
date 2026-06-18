@@ -15,14 +15,6 @@ nixpkgs.lib.nixos.runTest {
   };
 
   nodes.dnsPeer = { pkgs, ... }: {
-    imports = [ commonDesktopModule ];
-
-    common = {
-      autoUpgrade.enable = false;
-      monitoring.enable = false;
-      doh.enable = false;
-      firewall.enable = false;
-    };
     networking = {
       firewall.enable = false;
       hostName = "dns-peer";

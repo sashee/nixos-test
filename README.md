@@ -228,12 +228,9 @@ common.firewall.enable = false;
 `modules/doh.nix` enables system-wide DNS over HTTPS through `dnscrypt-proxy`
 with static IPv4 and IPv6 DoH resolver stamps for Cloudflare, Mullvad, Quad9,
 and Google. It points local resolver configuration at localhost and blocks
-direct outbound TCP and UDP port 53 except to localhost. It is enabled by
-default in `common-desktop` and can be disabled with:
-
-```nix
-common.doh.enable = false;
-```
+direct outbound TCP and UDP port 53 except to localhost. It is always enabled
+for `common-desktop` hosts and has no opt-out, so plaintext DNS egress can never
+be silently re-enabled.
 
 `modules/restic.nix` configures named restic backups using systemd credentials.
 Each backup must specify the user that runs the service. Backup paths are bound
