@@ -1,0 +1,14 @@
+# Connectivity-check names answered locally by dnscrypt-proxy so captive-portal
+# login pages are reachable when DoH upstreams are blocked. Served at all times,
+# so IPs must be the real current endpoints. Base list from dnscrypt-proxy's
+# example-captive-portals.txt (v2.1.15); detectportal.firefox.com added locally.
+
+captive.apple.com               17.253.109.201, 17.253.113.202
+connectivitycheck.gstatic.com   64.233.162.94, 64.233.164.94, 64.233.165.94, 64.233.177.94, 64.233.185.94, 74.125.132.94, 74.125.136.94, 74.125.20.94, 74.125.21.94, 74.125.28.94
+connectivitycheck.android.com   64.233.162.100, 64.233.162.101, 64.233.162.102, 64.233.162.113, 64.233.162.138, 64.233.162.139
+www.msftncsi.com                2.16.106.89, 2.16.106.91, 23.0.175.137, 23.0.175.146
+dns.msftncsi.com                131.107.255.255, fd3e:4f5a:5b81::1
+www.msftconnecttest.com         13.107.4.52
+ipv6.msftconnecttest.com        2a01:111:2003::52
+ipv4only.arpa                   192.0.0.170, 192.0.0.171
+detectportal.firefox.com        34.107.221.82, 2600:1901:0:38d7::

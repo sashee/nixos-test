@@ -230,7 +230,11 @@ with static IPv4 and IPv6 DoH resolver stamps for Cloudflare, Mullvad, Quad9,
 and Google. It points local resolver configuration at localhost and blocks
 direct outbound TCP and UDP port 53 except to localhost. It is always enabled
 for `common-desktop` hosts and has no opt-out, so plaintext DNS egress can never
-be silently re-enabled.
+be silently re-enabled. To keep captive portals usable behind that lock, the
+connectivity-check names in `lib/captive-portals.txt` are answered locally from a
+static map (so they resolve even when the DoH upstreams are unreachable), and
+NetworkManager connectivity checking is enabled against `captive.apple.com` so
+KDE Plasma detects the portal and offers the login page.
 
 `modules/restic.nix` configures named restic backups using systemd credentials.
 Each backup must specify the user that runs the service. Backup paths are bound
@@ -377,6 +381,7 @@ result/qemu-command
 result/common-desktop-check
 result/doh-check
 result/doh-upstream-check
+result/doh-captive-check
 result/firewall-check
 result/locale-firefox-check
 result/plasma-firefox-check
@@ -384,6 +389,7 @@ result/restic-check
 result/test-results/common-desktop
 result/test-results/doh
 result/test-results/doh-upstream
+result/test-results/doh-captive
 result/test-results/firewall
 result/test-results/locale-firefox
 result/test-results/plasma-firefox
@@ -405,6 +411,7 @@ nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.common-desktop
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.doh
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.doh-upstream
+nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.doh-captive
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.firewall
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.locale-firefox
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.restic
@@ -422,6 +429,7 @@ The aggregate result is organized by test name:
 result/common-desktop
 result/doh
 result/doh-upstream
+result/doh-captive
 result/firewall
 result/locale-firefox
 result/plasma-firefox
