@@ -1,9 +1,8 @@
-{ pkgs, commonDotfiles, ... }:
+{ pkgs, unstable, commonDotfiles, ... }:
 
 let
   nixUtils = import "${commonDotfiles}/nix-utils" {
-    inherit pkgs;
-    unstable = pkgs;
+    inherit pkgs unstable;
     nixgl = null;
   };
 

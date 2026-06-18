@@ -3,20 +3,26 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
     dotfiles = {
       url = "github:sashee/dotfiles/bwrap";
       flake = false;
     };
   };
 
-  outputs = { nixpkgs, dotfiles, ... }:
+  outputs = { nixpkgs, nixpkgs-unstable, dotfiles, ... }:
     let
       system = "x86_64-linux";
       stateVersion = nixpkgs.lib.trivial.release;
       pkgs = nixpkgs.legacyPackages.${system};
+      unstable = import nixpkgs-unstable {
+        inherit system;
+        config.allowUnfree = true;
+      };
       commonDesktopModule = { ... }: {
         imports = [ ./modules/common-desktop.nix ];
         _module.args.commonDotfiles = dotfiles;
+        _module.args.unstable = unstable;
       };
       qemuDemoUserModule = ./modules/qemu-demo-user.nix;
       dohStamps = import ./lib/doh-stamps.nix;
