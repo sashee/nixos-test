@@ -93,6 +93,9 @@
       dohCaptiveTest = import ./tests/doh-captive.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
+      nmCaptivePortalTest = import ./tests/nm-captive-portal.nix {
+        inherit nixpkgs pkgs commonDesktopModule stateVersion;
+      };
       resticTest = import ./tests/restic.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
@@ -127,6 +130,7 @@
         doh = dohTest;
         doh-upstream = dohUpstreamTest;
         doh-captive = dohCaptiveTest;
+        nm-captive-portal = nmCaptivePortalTest;
         firewall = firewallTest;
         locale-firefox = localeFirefoxTest;
         monitoring-auto-upgrade = monitoringAutoUpgradeTest;
@@ -205,6 +209,8 @@
         doh-upstream-driver-interactive = dohUpstreamTest.driverInteractive;
         doh-captive-driver = dohCaptiveTest.driver;
         doh-captive-driver-interactive = dohCaptiveTest.driverInteractive;
+        nm-captive-portal-driver = nmCaptivePortalTest.driver;
+        nm-captive-portal-driver-interactive = nmCaptivePortalTest.driverInteractive;
         firewall-driver = firewallTest.driver;
         firewall-driver-interactive = firewallTest.driverInteractive;
         locale-firefox-driver = localeFirefoxTest.driver;

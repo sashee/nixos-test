@@ -234,7 +234,10 @@ be silently re-enabled. To keep captive portals usable behind that lock, the
 connectivity-check names in `lib/captive-portals.txt` are answered locally from a
 static map (so they resolve even when the DoH upstreams are unreachable), and
 NetworkManager connectivity checking is enabled against `captive.apple.com` so
-KDE Plasma detects the portal and offers the login page.
+KDE Plasma detects the portal and offers the login page. The `nm-captive-portal`
+test drives NetworkManager end-to-end against a fake `captive.apple.com`,
+asserting it reports `full` on an open network and `portal` once the endpoint
+redirects.
 
 `modules/restic.nix` configures named restic backups using systemd credentials.
 Each backup must specify the user that runs the service. Backup paths are bound
@@ -382,6 +385,7 @@ result/common-desktop-check
 result/doh-check
 result/doh-upstream-check
 result/doh-captive-check
+result/nm-captive-portal-check
 result/firewall-check
 result/locale-firefox-check
 result/plasma-firefox-check
@@ -390,6 +394,7 @@ result/test-results/common-desktop
 result/test-results/doh
 result/test-results/doh-upstream
 result/test-results/doh-captive
+result/test-results/nm-captive-portal
 result/test-results/firewall
 result/test-results/locale-firefox
 result/test-results/plasma-firefox
@@ -412,6 +417,7 @@ nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.doh
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.doh-upstream
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.doh-captive
+nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.nm-captive-portal
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.firewall
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.locale-firefox
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.restic
@@ -430,6 +436,7 @@ result/common-desktop
 result/doh
 result/doh-upstream
 result/doh-captive
+result/nm-captive-portal
 result/firewall
 result/locale-firefox
 result/plasma-firefox
