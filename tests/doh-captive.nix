@@ -26,27 +26,33 @@ nixpkgs.lib.nixos.runTest {
     # The map file is wired into the generated dnscrypt-proxy config...
     machine.succeed("${pkgs.gnugrep}/bin/grep -E '^\\s*map_file' /nix/store/*-dnscrypt-proxy.toml")
     # ...and NetworkManager probes a mapped host for connectivity/portal state.
-    machine.succeed("${pkgs.gnugrep}/bin/grep -i 'captive.apple.com' /etc/NetworkManager/NetworkManager.conf")
+    machine.succeed("${pkgs.gnugrep}/bin/grep -i 'detectportal.firefox.com' /etc/NetworkManager/NetworkManager.conf")
 
-    def dig_short(name, qtype):
+    def dig_short(name, qtype, server="127.0.0.1"):
         # 2>/dev/null keeps dig diagnostics out of the captured output; for a
-        # successful answer +short prints just the address(es).
+        # successful answer +short prints just the address(es). `server` lets us
+        # also exercise the IPv6 loopback listener (::1).
         return machine.succeed(
-            "${pkgs.dig}/bin/dig @127.0.0.1 {} {} +short +time=3 +tries=1 2>/dev/null || true".format(name, qtype)
+            "${pkgs.dig}/bin/dig @{} {} {} +short +time=3 +tries=1 2>/dev/null || true".format(server, name, qtype)
         ).strip()
 
-    def wait_mapped(name, qtype, expected):
+    def wait_mapped(name, qtype, expected, server="127.0.0.1"):
         for _ in range(30):
-            if expected in dig_short(name, qtype):
+            if expected in dig_short(name, qtype, server):
                 return
             time.sleep(1)
-        raise Exception(f"{name} {qtype} did not resolve to {expected}")
+        raise Exception(f"{name} {qtype} did not resolve to {expected} via {server}")
 
     # Mapped names resolve to their static IPs despite there being no upstream.
     wait_mapped("captive.apple.com", "A", "17.253.109.201")
     wait_mapped("detectportal.firefox.com", "A", "34.107.221.82")
     wait_mapped("dns.msftncsi.com", "AAAA", "fd3e:4f5a:5b81::1")
     wait_mapped("ipv4only.arpa", "A", "192.0.0.170")
+
+    # The dnscrypt listener answers over the IPv6 loopback too, and AAAA records
+    # from the map resolve there: query ::1 directly.
+    wait_mapped("detectportal.firefox.com", "AAAA", "2600:1901:0:38d7::", server="::1")
+    wait_mapped("ipv6.msftconnecttest.com", "AAAA", "2a01:111:2003::52", server="::1")
 
     # A name that is not in the map gets no successful answer, because no upstream
     # is reachable. This proves the map is the only thing answering: dnscrypt

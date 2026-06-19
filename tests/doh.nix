@@ -68,6 +68,31 @@ nixpkgs.lib.nixos.runTest {
     dns_peer.succeed("sleep 2")
     dns_peer.fail("test -e /tmp/plain-dns-tcp-received")
 
+    # IPv6 plain DNS to a peer is rejected too. Mirror the IPv4 block over IPv6 so
+    # the module's `ip6 daddr != ::1 ... reject` egress rules are actually
+    # exercised, not just present. Give both nodes an on-link ULA on eth1 (the
+    # peer's plain-DNS servers bind :: with IPV6_V6ONLY so they don't collide with
+    # the IPv4 servers still listening on 0.0.0.0:53).
+    machine.succeed("${pkgs.iproute2}/bin/ip -6 addr add fc00::1/64 dev eth1 nodad || true")
+    dns_peer.succeed("${pkgs.iproute2}/bin/ip -6 addr add fc00::2/64 dev eth1 nodad || true")
+
+    dns_peer.succeed("rm -f /tmp/plain-dns6-udp-ready /tmp/plain-dns6-udp-received /tmp/plain-dns6-tcp-ready /tmp/plain-dns6-tcp-received")
+    dns_peer.succeed("systemd-run --unit plain-dns6-udp-server ${pkgs.python3}/bin/python3 -c \"import pathlib,socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1); s.bind(('::', 53)); pathlib.Path('/tmp/plain-dns6-udp-ready').touch(); data, _ = s.recvfrom(4096); pathlib.Path('/tmp/plain-dns6-udp-received').write_bytes(data)\"")
+    dns_peer.wait_for_unit("plain-dns6-udp-server.service")
+    dns_peer.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/plain-dns6-udp-ready; do sleep 0.2; done'")
+
+    machine.fail("${pkgs.dig}/bin/dig @fc00::2 example.test A +time=1 +tries=1")
+    dns_peer.succeed("sleep 2")
+    dns_peer.fail("test -e /tmp/plain-dns6-udp-received")
+
+    dns_peer.succeed("systemd-run --unit plain-dns6-tcp-server ${pkgs.python3}/bin/python3 -c \"import pathlib,socket; s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('::', 53)); s.listen(1); pathlib.Path('/tmp/plain-dns6-tcp-ready').touch(); conn, _ = s.accept(); pathlib.Path('/tmp/plain-dns6-tcp-received').touch(); conn.close()\"")
+    dns_peer.wait_for_unit("plain-dns6-tcp-server.service")
+    dns_peer.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/plain-dns6-tcp-ready; do sleep 0.2; done'")
+
+    machine.fail("${pkgs.python3}/bin/python3 -c \"import socket; s = socket.create_connection(('fc00::2', 53), timeout=2); s.close()\"")
+    dns_peer.succeed("sleep 2")
+    dns_peer.fail("test -e /tmp/plain-dns6-tcp-received")
+
     machine.succeed("${pkgs.python3}/bin/python3 -c \"import socket; s = socket.create_connection(('127.0.0.1', 53), timeout=2); s.close()\"")
     machine.succeed("${pkgs.python3}/bin/python3 -c \"import socket; s = socket.create_connection(('::1', 53), timeout=2); s.close()\"")
   '';

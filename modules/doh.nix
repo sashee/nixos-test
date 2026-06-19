@@ -38,12 +38,14 @@ in
     ];
     networkmanager.dns = lib.mkDefault "none";
     # NixOS configures no connectivity check by default, so KDE Plasma never
-    # detects a portal. Probe captive.apple.com (present in the map above, with
-    # stable Apple IPs); NM does a prefix match on the body, so use Apple's full
-    # success page. A redirect/different body flips NM to the "portal" state.
+    # detects a portal. Probe detectportal.firefox.com (present in the map above):
+    # it is dual-stack (real A and AAAA), so detection works on IPv6-only networks
+    # too — captive.apple.com is IPv4-only and would fail there. Its /success.txt
+    # returns the body "success\n"; NM does a prefix match, so "success" matches.
+    # A redirect/different body flips NM to the "portal" state.
     networkmanager.settings.connectivity = {
-      uri = "http://captive.apple.com/hotspot-detect.html";
-      response = "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>";
+      uri = "http://detectportal.firefox.com/success.txt";
+      response = "success";
       interval = 300;
     };
     nftables = {
