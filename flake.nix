@@ -5,7 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
     dotfiles = {
-      url = "github:sashee/dotfiles/bwrap";
+      url = "github:sashee/dotfiles/master";
       flake = false;
     };
   };
