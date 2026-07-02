@@ -111,4 +111,4 @@ jobs:
           df -h
 
       - name: Build Raspberry Pi 5 checks (aarch64 VM tests, real kernel)
-        run: nix build -L --max-jobs 1 .#checks.aarch64-linux.doh
+        run: nix build -L --max-jobs 1 .#checks.aarch64-linux.doh .#checks.aarch64-linux.auto-upgrade

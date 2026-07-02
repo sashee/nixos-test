@@ -129,6 +129,12 @@
           boot.initrd.kernelModules = [ "pci_host_generic" ];
         };
       };
+      autoUpgradeTestRpi = import ./tests/auto-upgrade-mocked-service.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        autoUpgradeModule = ./modules/auto-upgrade.nix;
+      };
       dohUpstreamTest = import ./tests/doh-upstream.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion dohStamps;
       };
@@ -245,6 +251,7 @@
 
       checks.${system} = testResults;
       checks.aarch64-linux.doh = dohTestRpi;
+      checks.aarch64-linux.auto-upgrade = autoUpgradeTestRpi;
 
       packages.${system} = {
         default = qemuPlasmaResult;

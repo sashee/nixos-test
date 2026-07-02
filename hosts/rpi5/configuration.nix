@@ -16,13 +16,20 @@ in
   imports = [
     ../../modules/doh.nix
     ../../modules/restic.nix
+    ../../modules/auto-upgrade.nix
   ];
+
+  # Daily boot-generation auto-upgrade: pulls the latest `common` from the host
+  # flake and rebuilds. Active once /etc/nixos#rpi5 exists (common on github).
+  common.autoUpgrade.enable = true;
+  common.autoUpgrade.flake = "/etc/nixos#rpi5";
 
   networking.hostName = lib.mkDefault "nixos-rpi5";
 
   users.users.nixos = {
     isNormalUser = true;
     extraGroups = [ "wheel" ];
+    packages = [ nixUtils ];  # sandboxed nix-utils on the user's PATH only
     initialPassword = "nixos";
     openssh.authorizedKeys.keys = [
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMLL9PCVcxgn98HQPQWNR618rPF0uxnGDQaUNeDCxumI sashee@sashee-laptop"
@@ -46,7 +53,9 @@ in
   security.sudo.wheelNeedsPassword = false;
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
   system.stateVersion = lib.mkDefault "24.11";
-  environment.systemPackages = [ nixUtils ];
+  # Real system tools for root/services (flakes, auto-upgrade). The sandboxed
+  # nix-utils tools live on the nixos user PATH only (see users.users.nixos).
+  environment.systemPackages = [ pkgs.git ];
 
   boot.kernelPatches = [{
     name = "headless-trim";

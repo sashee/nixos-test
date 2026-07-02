@@ -1,4 +1,4 @@
-{ config, lib, ... }:
+{ config, lib, pkgs, ... }:
 
 let
   cfg = config.common.autoUpgrade;
@@ -62,5 +62,10 @@ in
     };
 
     systemd.services.nixos-upgrade.preStart = updateCommand;
+
+    # The system `git` may be a sandboxed wrapper (nix-utils) that cannot write
+    # outside the user's home; auto-upgrade commits the lock in the flake dir
+    # (e.g. /etc/nixos), so ensure a real git is first on the service PATH.
+    systemd.services.nixos-upgrade.path = lib.mkBefore [ pkgs.git ];
   };
 }
