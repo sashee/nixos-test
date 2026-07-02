@@ -4,13 +4,14 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixos-raspberrypi.url = "github:nvmd/nixos-raspberrypi";
     dotfiles = {
       url = "github:sashee/dotfiles/master";
       flake = false;
     };
   };
 
-  outputs = { nixpkgs, nixpkgs-unstable, dotfiles, ... }:
+  outputs = { nixpkgs, nixpkgs-unstable, dotfiles, nixos-raspberrypi, ... }:
     let
       system = "x86_64-linux";
       stateVersion = nixpkgs.lib.trivial.release;
@@ -46,6 +47,18 @@
         nixUtilsTests;
       dohStamps = import ./lib/doh-stamps.nix;
       resticLib = import ./lib/restic.nix { lib = nixpkgs.lib; };
+      mkRpi5 = { modules ? [ ] }: nixos-raspberrypi.lib.nixosSystem {
+        trustCaches = false;
+        specialArgs = {
+          inherit dotfiles nixpkgs-unstable;
+          nixpkgs-stable = nixpkgs;
+        };
+        modules = [
+          nixos-raspberrypi.nixosModules.sd-image
+          ({ ... }: { imports = with nixos-raspberrypi.nixosModules; [ raspberry-pi-5.base ]; })
+          ./hosts/rpi5/configuration.nix
+        ] ++ modules;
+      };
       qemuGraphical = nixpkgs.lib.nixosSystem {
         inherit system;
 
@@ -85,7 +98,36 @@
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
       dohTest = import ./tests/doh.nix {
-        inherit nixpkgs pkgs commonDesktopModule stateVersion;
+        inherit nixpkgs pkgs stateVersion;
+        machineModule = { ... }: {
+          imports = [ commonDesktopModule ];
+          common.autoUpgrade.enable = false;
+          common.monitoring.enable = false;
+        };
+      };
+
+      # aarch64 Raspberry Pi 5 check: exercise the doh module on the exact kernel
+      # and nixpkgs the Pi runs, in a KVM-accelerated aarch64 VM.
+      nixrpi = nixos-raspberrypi.inputs.nixpkgs;
+      pkgsRpi = nixrpi.legacyPackages.aarch64-linux;
+      rpi5Base = mkRpi5 { };
+      dohTestRpi = import ./tests/doh.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        # Reuse the EXACT rpi config (baseline + doh + restic + host bits).
+        machineModule = { lib, ... }: {
+          imports = [ ./hosts/rpi5/configuration.nix ];
+          # configuration.nix pulls nix-utils, which needs these args (mkRpi5 passes
+          # them via specialArgs; the test harness must supply them the same way).
+          _module.args = { inherit dotfiles nixpkgs-unstable; nixpkgs-stable = nixpkgs; };
+          # Pin the exact kernel the Pi builds (already patched) and clear kernelPatches
+          # so nothing rebuilds. Force-load the QEMU-virt generic PCIe host bridge (a
+          # DT-bound module initrd udev can't autoload); virtio + 9p then autoload.
+          boot.kernelPackages = lib.mkForce rpi5Base.config.boot.kernelPackages;
+          boot.kernelPatches = lib.mkForce [ ];
+          boot.initrd.kernelModules = [ "pci_host_generic" ];
+        };
       };
       dohUpstreamTest = import ./tests/doh-upstream.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion dohStamps;
@@ -188,9 +230,12 @@
       nixosModules = {
         auto-upgrade = ./modules/auto-upgrade.nix;
         common-desktop = commonDesktopModule;
+        doh = ./modules/doh.nix;
+        restic = ./modules/restic.nix;
       };
 
       lib.restic = resticLib;
+      lib.mkRpi5 = mkRpi5;
 
       legacyPackages.${system} = pkgs;
 
@@ -199,6 +244,7 @@
       };
 
       checks.${system} = testResults;
+      checks.aarch64-linux.doh = dohTestRpi;
 
       packages.${system} = {
         default = qemuPlasmaResult;

@@ -48,3 +48,35 @@ jobs:
             result/plasma-desktop.png
             result/firefox-page.png
           if-no-files-found: warn
+
+  rpi:
+    # aarch64 Raspberry Pi 5 checks on the real rpi kernel. GitHub-hosted arm64
+    # runner (free for public repos). NOTE: the patched rpi kernel is not in any
+    # binary cache, so without a cache this job compiles it from source (~1-2h).
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          enable_kvm: true
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Add swap
+        run: |
+          swapon --show || true
+          sudo fallocate -l 8G /mnt/ci-swapfile
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+          swapon --show
+          free -h
+          df -h
+
+      - name: Build Raspberry Pi 5 checks (aarch64 VM tests, real kernel)
+        run: nix build -L --max-jobs 1 .#checks.aarch64-linux.doh

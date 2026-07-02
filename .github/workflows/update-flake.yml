@@ -14,6 +14,8 @@ concurrency:
 
 jobs:
   update:
+    # Update the lock and verify the x86_64 (laptop/QEMU) tests. Publishes the
+    # updated flake.lock as an artifact for the other jobs; does NOT commit yet.
     runs-on: ubuntu-latest
 
     steps:
@@ -47,6 +49,66 @@ jobs:
 
       - name: Build checked QEMU result (VM tests one at a time)
         run: nix build -L --max-jobs 1 .#qemu-plasma-result
+
+      - name: Upload updated lock
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: flake-lock
+          path: flake.lock
+          if-no-files-found: error
+
+  rpi:
+    # Verify the aarch64 Raspberry Pi 5 checks against the UPDATED lock, on a
+    # GitHub-hosted arm64 runner. Builds the real rpi kernel from source.
+    needs: update
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Use updated lock
+        uses: actions/download-artifact@v7
+        with:
+          name: flake-lock
+          path: .
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          enable_kvm: true
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Add swap
+        run: |
+          swapon --show || true
+          sudo fallocate -l 8G /mnt/ci-swapfile
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+          swapon --show
+          free -h
+          df -h
+
+      - name: Build Raspberry Pi 5 checks (aarch64 VM tests, real kernel)
+        run: nix build -L --max-jobs 1 .#checks.aarch64-linux.doh
+
+  commit:
+    # Only reached if BOTH the x86_64 and aarch64 checks passed.
+    needs: [update, rpi]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Use updated lock
+        uses: actions/download-artifact@v7
+        with:
+          name: flake-lock
+          path: .
 
       - name: Commit updated lock file
         run: |

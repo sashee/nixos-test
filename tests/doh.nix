@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, commonDesktopModule, stateVersion }:
+{ nixpkgs, pkgs, machineModule, stateVersion }:
 
 nixpkgs.lib.nixos.runTest {
   name = "doh";
@@ -6,11 +6,9 @@ nixpkgs.lib.nixos.runTest {
   skipTypeCheck = true;
 
   nodes.machine = { pkgs, ... }: {
-    imports = [ commonDesktopModule ];
+    imports = [ machineModule ];
 
     networking.hostName = "doh-test";
-    common.autoUpgrade.enable = false;
-    common.monitoring.enable = false;
     system.stateVersion = stateVersion;
   };
 
