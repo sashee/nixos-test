@@ -13,6 +13,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.2
 
+      - name: Reclaim disk space
+        run: |
+          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
+          # || true so a path missing on the arm64 image is not fatal.
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache \
+            || true
+          sudo docker image prune --all --force || true
+          df -h
+
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
@@ -58,6 +74,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.2
+
+      - name: Reclaim disk space
+        run: |
+          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
+          # || true so a path missing on the arm64 image is not fatal.
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache \
+            || true
+          sudo docker image prune --all --force || true
+          df -h
 
       - name: Install Nix
         uses: cachix/install-nix-action@v31
