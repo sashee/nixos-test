@@ -143,9 +143,17 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         extraModule = rpiTestKernel;
       };
+      # Nix only exposes /dev/kvm in the sandbox based on the daemon's system-features
+      # (auto-set from the host's /dev/kvm), NOT a derivation's requiredSystemFeatures.
+      # So dropping the kvm *requirement* lets tests schedule on KVM-less builders (the
+      # free aarch64 CI runner) while QEMU's accel=kvm:tcg still uses KVM wherever it
+      # exists (x86 runner) and only falls back to slow TCG when it doesn't (rpi).
+      dropKvm = test: test.overrideTestDerivation (old: {
+        requiredSystemFeatures = builtins.filter (f: f != "kvm") old.requiredSystemFeatures;
+      });
       # All aarch64 (Raspberry Pi 5) checks in one place. Add new rpi tests here;
       # CI builds the aggregate below, so the workflow never needs editing.
-      aarch64TestResults = {
+      aarch64TestResults = builtins.mapAttrs (_: dropKvm) {
         doh = dohTestRpi;
         auto-upgrade = autoUpgradeTestRpi;
         nix-settings = nixSettingsTestRpi;
@@ -194,7 +202,7 @@
       zramTest = import ./tests/zram.nix {
         inherit nixpkgs pkgs stateVersion;
       };
-      testResults = {
+      testResults = builtins.mapAttrs (_: dropKvm) ({
         auto-upgrade-mocked-service = autoUpgradeMockedServiceTest;
         common-desktop = commonDesktopTest;
         doh = dohTest;
@@ -215,7 +223,7 @@
         zram = zramTest;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
-        nixUtilsTests);
+        nixUtilsTests));
       testResultLinks = nixpkgs.lib.concatStringsSep "\n" (
         nixpkgs.lib.mapAttrsToList
           (name: test: "ln -s ${test} $out/${nixpkgs.lib.escapeShellArg name}")

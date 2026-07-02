@@ -3,7 +3,9 @@
 nixpkgs.lib.nixos.runTest {
   name = "nix-settings";
   hostPkgs = pkgs;
-  globalTimeout = 120;
+  # Generous ceiling (not a fixed wait): fine under KVM, but the rpi variant runs
+  # under slow TCG emulation on the KVM-less aarch64 CI runner and needs the room.
+  globalTimeout = 1800;
 
   nodes.machine = {
     imports = [ ../modules/nix-settings.nix extraModule ];
