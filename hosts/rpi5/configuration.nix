@@ -14,6 +14,7 @@ let
 in
 {
   imports = [
+    ../../modules/nix-settings.nix
     ../../modules/doh.nix
     ../../modules/restic.nix
     ../../modules/auto-upgrade.nix
@@ -51,7 +52,6 @@ in
   programs.ssh.systemd-ssh-proxy.enable = false;
   services.openssh.settings.PasswordAuthentication = false;
   security.sudo.wheelNeedsPassword = false;
-  nix.settings.experimental-features = [ "nix-command" "flakes" ];
   system.stateVersion = lib.mkDefault "24.11";
   # Real system tools for root/services (flakes, auto-upgrade). The sandboxed
   # nix-utils tools live on the nixos user PATH only (see users.users.nixos).

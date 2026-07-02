@@ -2,6 +2,7 @@
 , pkgs
 , autoUpgradeModule
 , stateVersion
+, nodeModule ? { }
 }:
 
 let
@@ -28,7 +29,7 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
 
   nodes.machine = { lib, ... }: {
-    imports = [ autoUpgradeModule ];
+    imports = [ autoUpgradeModule nodeModule ];
 
     common.autoUpgrade.flake = "/etc/nixos#laptop";
 
@@ -48,13 +49,32 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("systemctl show nixos-upgrade.timer -p RandomizedDelayUSec --value | grep -F '2h'")
     machine.succeed("systemctl is-active --quiet nixos-upgrade.timer")
 
+    def calls():
+        return int(machine.succeed("cat /run/auto-upgrade-calls.log 2>/dev/null | wc -l").strip())
+
+    def wait_idle():
+        machine.wait_until_succeeds("systemctl show nixos-upgrade.service -p ActiveState --value | grep -F inactive")
+
+    # First trigger absorbs any boot-time Persistent catch-up firing (a variable
+    # baseline), so the test does not depend on how many times it fired at boot.
     machine.succeed("date -s '2027-01-02 00:01:00'")
     machine.succeed("date -s '2027-01-02 02:05:00'")
-    machine.wait_until_succeeds("test -f /run/auto-upgrade-calls.log && systemctl show nixos-upgrade.service -p ActiveState --value | grep -F inactive && systemctl show nixos-upgrade.service -p Result --value | grep -F success", timeout=120)
-    machine.succeed("cat /run/auto-upgrade-calls.log")
-    machine.succeed("test \"$(sed -n '1p' /run/auto-upgrade-calls.log)\" = 'nix flake update common --flake /etc/nixos --commit-lock-file'")
+    machine.wait_until_succeeds("systemctl show nixos-upgrade.service -p Result --value | grep -F success", timeout=120)
+    wait_idle()
+    baseline = calls()
+
+    # Second, isolated trigger: crossing exactly one more daily occurrence must
+    # add exactly one run == two mocked calls (nix flake update + nixos-rebuild).
+    machine.succeed("date -s '2027-01-03 00:01:00'")
+    machine.succeed("date -s '2027-01-03 02:05:00'")
+    machine.wait_until_succeeds(f"test $(cat /run/auto-upgrade-calls.log | wc -l) -ge {baseline + 2}", timeout=120)
+    wait_idle()
+
+    assert calls() - baseline == 2, f"one upgrade should add 2 calls, got {calls() - baseline}"
+
+    machine.succeed("test \"$(tail -n 2 /run/auto-upgrade-calls.log | sed -n '1p')\" = 'nix flake update common --flake /etc/nixos --commit-lock-file'")
     machine.succeed("""
-      second="$(sed -n '2p' /run/auto-upgrade-calls.log)"
+      second="$(tail -n 2 /run/auto-upgrade-calls.log | sed -n '2p')"
       case "$second" in
         "nixos-rebuild boot "*) ;;
         *) exit 1 ;;
@@ -65,6 +85,5 @@ nixpkgs.lib.nixos.runTest {
       case "$second" in *"--commit-lock-file"*) ;; *) exit 1 ;; esac
       case "$second" in *"--upgrade"*) ;; *) exit 1 ;; esac
     """)
-    machine.succeed("test \"$(wc -l < /run/auto-upgrade-calls.log)\" = 2")
   '';
 }

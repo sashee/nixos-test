@@ -111,22 +111,23 @@
       nixrpi = nixos-raspberrypi.inputs.nixpkgs;
       pkgsRpi = nixrpi.legacyPackages.aarch64-linux;
       rpi5Base = mkRpi5 { };
+      # Boot rpi tests on the EXACT rpi kernel. QEMU's virt machine needs the generic
+      # ECAM PCIe host bridge (a DT-bound module) force-loaded; virtio + 9p then autoload.
+      rpiTestKernel = { lib, ... }: {
+        boot.kernelPackages = lib.mkForce rpi5Base.config.boot.kernelPackages;
+        boot.kernelPatches = lib.mkForce [ ];
+        boot.initrd.kernelModules = [ "pci_host_generic" ];
+      };
       dohTestRpi = import ./tests/doh.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
         # Reuse the EXACT rpi config (baseline + doh + restic + host bits).
-        machineModule = { lib, ... }: {
-          imports = [ ./hosts/rpi5/configuration.nix ];
+        machineModule = { ... }: {
+          imports = [ ./hosts/rpi5/configuration.nix rpiTestKernel ];
           # configuration.nix pulls nix-utils, which needs these args (mkRpi5 passes
           # them via specialArgs; the test harness must supply them the same way).
           _module.args = { inherit dotfiles nixpkgs-unstable; nixpkgs-stable = nixpkgs; };
-          # Pin the exact kernel the Pi builds (already patched) and clear kernelPatches
-          # so nothing rebuilds. Force-load the QEMU-virt generic PCIe host bridge (a
-          # DT-bound module initrd udev can't autoload); virtio + 9p then autoload.
-          boot.kernelPackages = lib.mkForce rpi5Base.config.boot.kernelPackages;
-          boot.kernelPatches = lib.mkForce [ ];
-          boot.initrd.kernelModules = [ "pci_host_generic" ];
         };
       };
       autoUpgradeTestRpi = import ./tests/auto-upgrade-mocked-service.nix {
@@ -134,7 +135,25 @@
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
         autoUpgradeModule = ./modules/auto-upgrade.nix;
+        nodeModule = rpiTestKernel;
       };
+      nixSettingsTestRpi = import ./tests/nix-settings.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        extraModule = rpiTestKernel;
+      };
+      # All aarch64 (Raspberry Pi 5) checks in one place. Add new rpi tests here;
+      # CI builds the aggregate below, so the workflow never needs editing.
+      aarch64TestResults = {
+        doh = dohTestRpi;
+        auto-upgrade = autoUpgradeTestRpi;
+        nix-settings = nixSettingsTestRpi;
+      };
+      rpiAllTests = pkgsRpi.runCommand "rpi-all-tests" { } ''
+        mkdir -p $out
+        ${nixpkgs.lib.concatStringsSep "\n" (nixpkgs.lib.mapAttrsToList (name: test: "ln -s ${test} $out/${nixpkgs.lib.escapeShellArg name}") aarch64TestResults)}
+      '';
       dohUpstreamTest = import ./tests/doh-upstream.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion dohStamps;
       };
@@ -250,8 +269,8 @@
       };
 
       checks.${system} = testResults;
-      checks.aarch64-linux.doh = dohTestRpi;
-      checks.aarch64-linux.auto-upgrade = autoUpgradeTestRpi;
+      checks.aarch64-linux = aarch64TestResults;
+      packages.aarch64-linux.rpi-all-tests = rpiAllTests;
 
       packages.${system} = {
         default = qemuPlasmaResult;

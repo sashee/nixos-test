@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion }:
+{ nixpkgs, pkgs, stateVersion, extraModule ? { } }:
 
 nixpkgs.lib.nixos.runTest {
   name = "nix-settings";
@@ -6,7 +6,7 @@ nixpkgs.lib.nixos.runTest {
   globalTimeout = 120;
 
   nodes.machine = {
-    imports = [ ../modules/nix-settings.nix ];
+    imports = [ ../modules/nix-settings.nix extraModule ];
 
     system.stateVersion = stateVersion;
   };
