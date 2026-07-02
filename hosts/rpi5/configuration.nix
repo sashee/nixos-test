@@ -38,6 +38,10 @@ in
 
   networking.wireless.iwd.enable = true;
   services.openssh.enable = true;
+  # nix-utils runs git/ssh in a bubblewrap userns where root-owned store files
+  # appear as 'nobody', so OpenSSH rejects the Include'd systemd-ssh-proxy config
+  # ("Bad owner or permissions"). We don't use the proxy, so drop the Include.
+  programs.ssh.systemd-ssh-proxy.enable = false;
   services.openssh.settings.PasswordAuthentication = false;
   security.sudo.wheelNeedsPassword = false;
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
