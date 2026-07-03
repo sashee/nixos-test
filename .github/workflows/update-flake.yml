@@ -13,14 +13,47 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  update:
-    # Update the lock and verify the x86_64 (laptop/QEMU) tests. Publishes the
-    # updated flake.lock as an artifact for the other jobs; does NOT commit yet.
+  lock:
+    # Update the lock file and publish it as an artifact. Kept small so the two
+    # long build jobs below can start in parallel as soon as the lock is ready.
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.2
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          enable_kvm: true
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Update lock file
+        run: nix flake update
+
+      - name: Upload updated lock
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: flake-lock
+          path: flake.lock
+          if-no-files-found: error
+
+  x86:
+    # Verify the x86_64 (laptop/QEMU) tests against the UPDATED lock.
+    needs: lock
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Use updated lock
+        uses: actions/download-artifact@v7
+        with:
+          name: flake-lock
+          path: .
 
       - name: Reclaim disk space
         run: |
@@ -57,26 +90,16 @@ jobs:
           free -h
           df -h
 
-      - name: Update lock file
-        run: nix flake update
-
       - name: Build VM image + shared closure (parallel)
         run: nix build -L --max-jobs auto .#qemu-vm
 
       - name: Build checked QEMU result (VM tests one at a time)
         run: nix build -L --max-jobs 1 .#qemu-plasma-result
 
-      - name: Upload updated lock
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: flake-lock
-          path: flake.lock
-          if-no-files-found: error
-
   rpi:
     # Verify the aarch64 Raspberry Pi 5 checks against the UPDATED lock, on a
     # GitHub-hosted arm64 runner. Builds the real rpi kernel from source.
-    needs: update
+    needs: lock
     runs-on: ubuntu-24.04-arm
 
     steps:
@@ -129,7 +152,7 @@ jobs:
 
   commit:
     # Only reached if BOTH the x86_64 and aarch64 checks passed.
-    needs: [update, rpi]
+    needs: [x86, rpi]
     runs-on: ubuntu-latest
 
     steps:
