@@ -100,6 +100,8 @@ nixpkgs.lib.nixos.runTest {
         "POST /health",
     ])
     platform.succeed("grep -F '[OK] disk-space: /mnt/testfs is' /var/lib/monitoring-platform/bodies.log")
+    # The check line now carries absolute used/total sizes, e.g. "(1.0M / 19M)".
+    platform.succeed(r"grep -E '\[OK\] disk-space: /mnt/testfs is .*full \(.* / .*\)' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F 'status=ok' /var/lib/monitoring-platform/bodies.log")
     platform.fail("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
     platform.fail("grep -F 'disk-space: /mnt/excluded' /var/lib/monitoring-platform/bodies.log")

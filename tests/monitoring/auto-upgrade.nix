@@ -145,7 +145,7 @@ nixpkgs.lib.nixos.runTest {
     set_time(test_timestamp(2, "02:05:00"))
     platform.wait_until_succeeds("grep -Fxq 'POST /health' /var/lib/monitoring-platform/events.log", timeout=120)
     assert_paths(["POST /health/start", "POST /health/log", "POST /health"])
-    platform.succeed("grep -F '[OK] auto-upgrade: nixos-upgrade.service last succeeded' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed(r"grep -E '\[OK\] auto-upgrade: nixos-upgrade.service last succeeded at [0-9]{4}-[0-9]{2}-[0-9]{2}T' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F 'status=ok' /var/lib/monitoring-platform/bodies.log")
     platform.fail("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
 

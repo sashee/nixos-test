@@ -58,6 +58,8 @@ let
       system_auto_upgrade_enabled=${lib.escapeShellArg (lib.boolToString config.system.autoUpgrade.enable)}
       generations_enabled=${lib.escapeShellArg (lib.boolToString cfg.generations.enable)}
       restic_backups=(${resticBackupArgs})
+      flake_lock=${lib.escapeShellArg (if cfg.flakeLock.path == null then "" else cfg.flakeLock.path)}
+      flake_lock_input=${lib.escapeShellArg cfg.flakeLock.input}
 
       cleanup() {
         rm -f "$log_file"
@@ -79,6 +81,10 @@ let
 
       skip() {
         log "[SKIP] $*"
+      }
+
+      info() {
+        log "[INFO] $*"
       }
 
       parse_duration_seconds() {
@@ -162,11 +168,12 @@ let
         last_seconds="$(cat "$marker")"
         now_seconds="$(date +%s)"
         age_seconds="$((now_seconds - last_seconds))"
+        last_when="$(date -u -d "@$last_seconds" +%Y-%m-%dT%H:%M:%SZ)"
 
         if [ "$age_seconds" -gt "$max_seconds" ]; then
-          fail "$label: $unit last succeeded ''${age_seconds}s ago, older than $max_age"
+          fail "$label: $unit last succeeded at $last_when, older than $max_age"
         else
-          ok "$label: $unit last succeeded ''${age_seconds}s ago"
+          ok "$label: $unit last succeeded at $last_when"
         fi
       }
 
@@ -223,19 +230,21 @@ let
           return 0
         fi
 
-        while read -r target fstype pcent; do
+        while read -r target fstype pcent used_bytes size_bytes; do
           [ -n "$target" ] || continue
           case "$fstype" in
             ${excludeFsTypePattern}) continue ;;
           esac
 
           used="''${pcent%\%}"
+          used_h="$(numfmt --to=iec "$used_bytes")"
+          size_h="$(numfmt --to=iec "$size_bytes")"
           if [ "$used" -gt "${toString cfg.diskSpace.maxUsedPercent}" ]; then
-            fail "disk-space: $target is $used% full, above ${toString cfg.diskSpace.maxUsedPercent}%"
+            fail "disk-space: $target is $used% full, above ${toString cfg.diskSpace.maxUsedPercent}% ($used_h / $size_h)"
           else
-            ok "disk-space: $target is $used% full"
+            ok "disk-space: $target is $used% full ($used_h / $size_h)"
           fi
-        done < <(df --local --output=target,fstype,pcent | awk 'NR > 1')
+        done < <(df --local -B1 --output=target,fstype,pcent,used,size | awk 'NR > 1')
       }
 
       check_auto_upgrade() {
@@ -268,6 +277,39 @@ let
 
       log "host=${config.networking.hostName}"
       log "started=$(date --iso-8601=seconds)"
+
+      info "kernel: $(uname -r)"
+      info "booted: $(date -u -d "@$(( $(date +%s) - $(cut -d. -f1 /proc/uptime) ))" +%Y-%m-%dT%H:%M:%SZ)"
+
+      # Report the deployed `common` source, read from the host's flake.lock. Purely
+      # informational (never affects status); the file is world-readable on real hosts.
+      # branch appears only when the flake input pins a ref (original.ref).
+      if [ -n "$flake_lock" ] && [ -r "$flake_lock" ]; then
+        c_type="$(jq -r --arg n "$flake_lock_input" '.nodes[$n].locked.type // ""' "$flake_lock")"
+        c_owner="$(jq -r --arg n "$flake_lock_input" '.nodes[$n].locked.owner // ""' "$flake_lock")"
+        c_repo="$(jq -r --arg n "$flake_lock_input" '.nodes[$n].locked.repo // ""' "$flake_lock")"
+        c_url="$(jq -r --arg n "$flake_lock_input" '.nodes[$n].locked.url // ""' "$flake_lock")"
+        c_rev="$(jq -r --arg n "$flake_lock_input" '.nodes[$n].locked.rev // "unknown"' "$flake_lock")"
+        c_ref="$(jq -r --arg n "$flake_lock_input" '.nodes[$n].original.ref // empty' "$flake_lock")"
+        c_modified="$(jq -r --arg n "$flake_lock_input" '.nodes[$n].locked.lastModified // empty' "$flake_lock")"
+        case "$c_type" in
+          github) c_repo_url="https://github.com/$c_owner/$c_repo" ;;
+          gitlab) c_repo_url="https://gitlab.com/$c_owner/$c_repo" ;;
+          sourcehut) c_repo_url="https://git.sr.ht/$c_owner/$c_repo" ;;
+          *) c_repo_url="''${c_url:-$c_type:$c_owner/$c_repo}" ;;
+        esac
+        if [ -n "$c_modified" ]; then
+          c_when="$(date -u -d "@$c_modified" +%Y-%m-%dT%H:%M:%SZ)"
+        else
+          c_when="unknown"
+        fi
+        c_line="common: repo=$c_repo_url"
+        [ -n "$c_ref" ] && c_line="$c_line branch=$c_ref"
+        c_line="$c_line rev=$c_rev lastModified=$c_when"
+        info "$c_line"
+      elif [ -n "$flake_lock" ]; then
+        info "common: $flake_lock not readable"
+      fi
 
       post_healthchecks "/start"
 
@@ -396,6 +438,12 @@ in
           "tracefs"
           "fusectl"
           "configfs"
+          # Read-only / store-transport filesystems, not writable data volumes to alert
+          # on. In VM tests these expose the builder's host store (its real disk usage),
+          # which would otherwise make the check depend on the builder's free space.
+          "9p"
+          "virtiofs"
+          "erofs"
         ];
         description = "Filesystem types ignored by the disk-space check.";
       };
@@ -440,6 +488,24 @@ in
         type = lib.types.ints.positive;
         default = 20;
         description = "Maximum allowed number of NixOS system generations.";
+      };
+    };
+
+    flakeLock = {
+      path = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = "/etc/nixos/flake.lock";
+        description = ''
+          Path to the deployed flake.lock. The report includes the locked input's
+          rev/narHash/lastModified so it records which `common` the host is running.
+          Set to null to omit the line.
+        '';
+      };
+
+      input = lib.mkOption {
+        type = lib.types.str;
+        default = "common";
+        description = "flake.lock node name whose locked revision is reported.";
       };
     };
   };

@@ -43,6 +43,27 @@ nixpkgs.lib.nixos.runTest {
     networking.hostName = "monitoring-client";
     common.autoUpgrade.enable = false;
 
+    # Fabricate the deployed lock the report reads (default flakeLock.path). On real
+    # hosts this is the git-tracked /etc/nixos/flake.lock; here we synthesize one.
+    environment.etc."nixos/flake.lock".text = builtins.toJSON {
+      nodes.common = {
+        locked = {
+          type = "github";
+          owner = "sashee";
+          repo = "nixos-test";
+          rev = "deadbeefcafe1234deadbeefcafe1234deadbeef";
+          narHash = "sha256-TESTHASH";
+          lastModified = 1700000000;
+        };
+        original = {
+          type = "github";
+          owner = "sashee";
+          repo = "nixos-test";
+          ref = "main";
+        };
+      };
+    };
+
     common.monitoring = {
       enable = true;
       tools.smartmontools = fakeSmartmontools;
@@ -127,6 +148,12 @@ nixpkgs.lib.nixos.runTest {
     platform.succeed("grep -F '[OK] smart: /dev/testdisk reports healthy' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F 'status=ok' /var/lib/monitoring-platform/bodies.log")
     platform.fail("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
+    # Informational lines: kernel, boot time, and the locked common source from flake.lock
+    # (repo URL + branch + rev + lastModified; no narHash).
+    platform.succeed("grep -F '[INFO] kernel:' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed("grep -E '\\[INFO\\] booted: [0-9]{4}-[0-9]{2}-[0-9]{2}T' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed("grep -F '[INFO] common: repo=https://github.com/sashee/nixos-test branch=main rev=deadbeefcafe1234deadbeefcafe1234deadbeef lastModified=2023-11-14T22:13:20Z' /var/lib/monitoring-platform/bodies.log")
+    platform.fail("grep -F 'narHash' /var/lib/monitoring-platform/bodies.log")
 
     reset_platform()
     client.succeed("printf '%s' failing > /run/smart-status")

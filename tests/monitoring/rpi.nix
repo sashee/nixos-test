@@ -87,6 +87,28 @@ nixpkgs.lib.nixos.runTest {
     # headroom -- avoids overriding the monitoring config just to make the check pass.
     virtualisation.diskSize = 8192;
 
+    # Fabricate the deployed lock the report reads (default flakeLock.path). A VM test
+    # node has no /etc/nixos deployment flake, so without this the report would show
+    # "not readable". No original.ref -- mirrors the real Pi (github input, no pinned
+    # branch), which exercises the no-branch rendering of the common line.
+    environment.etc."nixos/flake.lock".text = builtins.toJSON {
+      nodes.common = {
+        locked = {
+          type = "github";
+          owner = "sashee";
+          repo = "nixos-test";
+          rev = "cafe1234cafe1234cafe1234cafe1234cafe1234";
+          narHash = "sha256-TESTHASH";
+          lastModified = 1700000000;
+        };
+        original = {
+          type = "github";
+          owner = "sashee";
+          repo = "nixos-test";
+        };
+      };
+    };
+
     # All secrets are systemd-creds-encrypted blobs (LoadCredentialEncrypted); provision
     # them at boot runtime (the host key isn't set up during activation), before the
     # monitoring and restic services run. The payload/home dir need no encryption.
@@ -227,6 +249,14 @@ nixpkgs.lib.nixos.runTest {
     platform.succeed("grep -F '[OK] generations:' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F 'status=ok' /var/lib/monitoring-platform/bodies.log")
     platform.fail("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
+    # Informational lines rendered from the fabricated flake.lock: kernel, boot time, and
+    # the common source (repo + rev + lastModified). No original.ref -> no branch=, and
+    # narHash is intentionally dropped from the report.
+    platform.succeed("grep -F '[INFO] kernel:' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed(r"grep -E '\[INFO\] booted: [0-9]{4}-[0-9]{2}-[0-9]{2}T' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed("grep -F '[INFO] common: repo=https://github.com/sashee/nixos-test rev=cafe1234cafe1234cafe1234cafe1234cafe1234 lastModified=2023-11-14T22:13:20Z' /var/lib/monitoring-platform/bodies.log")
+    platform.fail("grep -F 'branch=' /var/lib/monitoring-platform/bodies.log")
+    platform.fail("grep -F 'narHash' /var/lib/monitoring-platform/bodies.log")
 
     # FAIL run: break both success sources (mock upgrade now fails; REST backend down),
     # then jump 15 days so both markers age past maxAge (14d) with no new success recorded.
