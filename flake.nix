@@ -237,7 +237,7 @@
           imports = [ commonDesktopModule ];
           common.monitoring.enable = false;
         };
-        keptAfterGc = 3;  # --delete-older-than 14d keeps all freshly-staged gens
+        keptAfterGc = 15;  # --delete-older-than 14d: 14 in-window + newest gen past cutoff (base)
       };
       testResults = builtins.mapAttrs (_: dropKvm) ({
         auto-upgrade-mocked-service = autoUpgradeMockedServiceTest;

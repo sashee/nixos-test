@@ -1,14 +1,16 @@
 { nixpkgs, pkgs, stateVersion, machineModule, keptAfterGc }:
 
-# Behavioral test of GC retention: stage several system generations, run the host's
-# automatic GC, and assert how many survive. Uses the real per-host config, so both
-# the rpi (--delete-old -> keptAfterGc = 1) and the laptop (--delete-older-than 14d,
-# which keeps all the freshly-staged gens -> keptAfterGc = 3) are exercised; a change
-# to a host's gc policy makes its variant fail.
+# Behavioral test of GC retention across the 14-day window. It stages 20 system
+# generations, one per simulated day (advancing the clock with *relative* bumps so
+# no hardcoded date is used and we stay above systemd's lower clock bound), then
+# runs the host's automatic GC:
+#   - laptop (--delete-older-than 14d): keeps the generations inside the 14-day
+#     window plus the most recent one just past it (a rollback base) -> keptAfterGc = 15
+#   - rpi (--delete-old): keeps only the current generation           -> keptAfterGc = 1
+# Uses the real per-host config, so changing a host's gc policy makes its variant fail.
 nixpkgs.lib.nixos.runTest {
   name = "nix-gc-retention";
   hostPkgs = pkgs;
-  # rpi variant runs under slow TCG on the KVM-less aarch64 CI runner; give it room.
   globalTimeout = 1800;
 
   nodes.machine = { lib, ... }: {
@@ -29,26 +31,34 @@ nixpkgs.lib.nixos.runTest {
     def generation_count():
         return machine.succeed("find /nix/var/nix/profiles -maxdepth 1 -name 'system-*-link' | wc -l").strip()
 
-    def make_generations(indices):
-        # Real generations via the same `nix-env --set` mechanism nixos-rebuild uses.
-        # Each points at a distinct store path (created + imported in-VM) so --set
-        # makes a new generation rather than deduplicating to one.
-        for i in indices:
-            path = machine.succeed(f"mkdir -p /tmp/gen{i} && echo {i} > /tmp/gen{i}/marker && nix-store --add /tmp/gen{i}").strip()
-            machine.succeed(f"nix-env -p /nix/var/nix/profiles/system --set {path}")
+    def add_generation(i):
+        # A real generation via the same `nix-env --set` mechanism nixos-rebuild uses;
+        # a distinct in-VM store path so --set makes a new generation each time. The
+        # generation's timestamp is the current (faked) wall clock.
+        path = machine.succeed(f"mkdir -p /tmp/gen{i} && echo {i} > /tmp/gen{i}/marker && nix-store --add /tmp/gen{i}").strip()
+        machine.succeed(f"nix-env -p /nix/var/nix/profiles/system --set {path}")
 
-    # Test VMs register no system generations by default.
     assert generation_count() == "0", f"unexpected baseline: {generation_count()}"
 
-    # Stage several generations, as repeated nixos-rebuild boot would.
-    make_generations(range(1, 4))
-    assert generation_count() == "3", f"expected 3 generations, got {generation_count()}"
+    # Stage 20 generations, one per day. Relative bumps only (no hardcoded dates):
+    # each generation's timestamp ends up one day apart.
+    for i in range(1, 21):
+        machine.succeed("date -s '+1 day'")
+        add_generation(i)
+    assert generation_count() == "20", f"expected 20 staged generations, got {generation_count()}"
+
+    # Nudge a half-day so the 14-day cutoff lands mid-gap, not exactly on a
+    # generation's timestamp (which would make the boundary result flaky).
+    machine.succeed("date -s '+12 hours'")
 
     # Run the host's automatic GC, then check how many generations survive.
     machine.succeed("systemctl start nix-gc.service")
     machine.wait_until_succeeds("systemctl show nix-gc.service -p ActiveState --value | grep -Fqx inactive")
     machine.succeed("systemctl show nix-gc.service -p Result --value | grep -Fqx success")
 
-    assert generation_count() == "${toString keptAfterGc}", f"expected ${toString keptAfterGc} generation(s) kept after GC, got {generation_count()}"
+    assert generation_count() == "${toString keptAfterGc}", f"expected ${toString keptAfterGc} generation(s) after GC, got {generation_count()}"
+
+    # Whatever the policy, the current generation must always survive.
+    machine.succeed("nix-env -p /nix/var/nix/profiles/system --list-generations | grep -F '(current)'")
   '';
 }
