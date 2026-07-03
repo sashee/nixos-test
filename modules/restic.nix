@@ -82,7 +82,9 @@ let
       environment = backendEnvironment backup;
       unitConfig.ConditionPathExists = map (credentialPath backup) credentials;
       serviceConfig = {
-        LoadCredential = map (credential: "${credential}:${credentialPath backup credential}") credentials;
+        # Backend/repo secrets are systemd-creds-encrypted blobs on disk, decrypted at
+        # runtime into $CREDENTIALS_DIRECTORY (never plaintext at rest, never in git/store).
+        LoadCredentialEncrypted = map (credential: "${credential}:${credentialPath backup credential}") credentials;
         SystemCallFilter = [ "@system-service" ];
         NoNewPrivileges = true;
         ProtectKernelTunables = true;
