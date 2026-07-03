@@ -118,17 +118,18 @@
         boot.kernelPatches = lib.mkForce [ ];
         boot.initrd.kernelModules = [ "pci_host_generic" ];
       };
+      # The real rpi system config as a test node (hosts/rpi5 on the rpi kernel, with
+      # the nix-utils args mkRpi5 passes via specialArgs). All rpi tests build on this
+      # so they exercise the deployed config.
+      rpiSystemModule = { ... }: {
+        imports = [ ./hosts/rpi5/configuration.nix rpiTestKernel ];
+        _module.args = { inherit dotfiles nixpkgs-unstable; nixpkgs-stable = nixpkgs; };
+      };
       dohTestRpi = import ./tests/doh.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
-        # Reuse the EXACT rpi config (baseline + doh + restic + host bits).
-        machineModule = { ... }: {
-          imports = [ ./hosts/rpi5/configuration.nix rpiTestKernel ];
-          # configuration.nix pulls nix-utils, which needs these args (mkRpi5 passes
-          # them via specialArgs; the test harness must supply them the same way).
-          _module.args = { inherit dotfiles nixpkgs-unstable; nixpkgs-stable = nixpkgs; };
-        };
+        machineModule = rpiSystemModule;
       };
       autoUpgradeTestRpi = import ./tests/auto-upgrade-mocked-service.nix {
         nixpkgs = nixrpi;
@@ -142,6 +143,12 @@
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
         extraModule = rpiTestKernel;
+      };
+      autoUpgradeRebootTestRpi = import ./tests/auto-upgrade-reboot.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
       };
       # Nix only exposes /dev/kvm in the sandbox based on the daemon's system-features
       # (auto-set from the host's /dev/kvm), NOT a derivation's requiredSystemFeatures.
@@ -157,6 +164,7 @@
         doh = dohTestRpi;
         auto-upgrade = autoUpgradeTestRpi;
         nix-settings = nixSettingsTestRpi;
+        auto-upgrade-reboot = autoUpgradeRebootTestRpi;
       };
       rpiAllTests = pkgsRpi.runCommand "rpi-all-tests" { } ''
         mkdir -p $out

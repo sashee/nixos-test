@@ -24,6 +24,9 @@ in
   # flake and rebuilds. Active once /etc/nixos#rpi5 exists (common on github).
   common.autoUpgrade.enable = true;
   common.autoUpgrade.flake = "/etc/nixos#rpi5";
+  # Apply kernel/security updates by rebooting after the nightly auto-upgrade
+  # (only when the kernel/initrd/kernel-modules actually changed).
+  system.autoUpgrade.allowReboot = true;
 
   networking.hostName = lib.mkDefault "nixos-rpi5";
 
