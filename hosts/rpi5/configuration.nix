@@ -18,6 +18,7 @@ in
     ../../modules/doh.nix
     ../../modules/restic.nix
     ../../modules/auto-upgrade.nix
+    ../../modules/monitoring.nix
   ];
 
   # Daily boot-generation auto-upgrade: pulls the latest `common` from the host
@@ -36,6 +37,16 @@ in
   # No interactive boot menu on the Pi + limited SD space: keep only the current
   # generation on GC (laptops keep 14 days to roll back from the boot menu).
   common.nixSettings.gcOptions = "--delete-old";
+
+  # Daily health checks (disk-space, generations, auto-upgrade). smart disabled (SD
+  # card has no SMART); restic auto-skips with no backups. Reporting posts to a
+  # Healthchecks URL read from a systemd-creds-encrypted file (LoadCredentialEncrypted);
+  # provision it out-of-band: `systemd-creds encrypt --name=healthchecks-url - \
+  # /etc/credentials/monitoring/healthchecks-url`.
+  common.monitoring = {
+    report.credentialDirectory = "/etc/credentials/monitoring";
+    smart.enable = false;
+  };
 
   users.users.nixos = {
     isNormalUser = true;

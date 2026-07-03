@@ -60,11 +60,18 @@ nixpkgs.lib.nixos.runTest {
       };
     };
 
-    system.activationScripts.monitoringCredentials = ''
-      install -d -m 0700 /etc/credentials/monitoring
-      printf '%s' 'http://monitoring-platform:8080/health' > /etc/credentials/monitoring/healthchecks-url
-      chmod 0600 /etc/credentials/monitoring/healthchecks-url
-    '';
+    # Provision the report URL as a systemd-creds-encrypted blob at boot runtime
+    # (encryption needs the host key, which isn't set up yet during activation).
+    systemd.services.test-monitoring-credential = {
+      wantedBy = [ "multi-user.target" ];
+      before = [ "common-monitoring.service" ];
+      serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+      script = ''
+        install -d -m 0700 /etc/credentials/monitoring
+        printf '%s' 'http://monitoring-platform:8080/health' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=healthchecks-url - /etc/credentials/monitoring/healthchecks-url
+        chmod 0600 /etc/credentials/monitoring/healthchecks-url
+      '';
+    };
 
     system.stateVersion = stateVersion;
   };
@@ -100,7 +107,7 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("systemctl show common-monitoring.timer -p Persistent --value | grep -F yes")
     client.succeed("systemctl show common-monitoring.timer -p RandomizedDelayUSec --value | grep -F '10min'")
     client.succeed("systemctl is-active --quiet common-monitoring.timer")
-    client.succeed("systemctl cat common-monitoring.service | grep -F 'LoadCredential=healthchecks-url:/etc/credentials/monitoring/healthchecks-url'")
+    client.succeed("systemctl cat common-monitoring.service | grep -F 'LoadCredentialEncrypted=healthchecks-url:/etc/credentials/monitoring/healthchecks-url'")
     client.fail("systemctl cat common-monitoring.service | grep -F 'http://monitoring-platform:8080/health'")
 
     def reset_platform():

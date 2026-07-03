@@ -22,23 +22,35 @@ let
       home = "/home/backup-user";
     };
 
+    # Restic creds stay plaintext (restic uses LoadCredential); fine to write at activation.
     system.activationScripts.monitoringResticCredentials = ''
       install -d -m 0700 /etc/credentials/monitoring /etc/credentials/restic/monitored
       install -d -m 0755 -o backup-user -g users /home/backup-user/monitored
 
-      printf '%s' 'http://monitoring-platform:8080/${healthPath}' > /etc/credentials/monitoring/healthchecks-url
       printf '%s' 'repo-secret' > /etc/credentials/restic/monitored/repository-password
       printf '%s' 'test-user' > /etc/credentials/restic/monitored/backend-username
       printf '%s' '${backendPassword}' > /etc/credentials/restic/monitored/backend-password
       printf '%s\n' '${name} payload' > /home/backup-user/monitored/payload.txt
 
       chmod 0600 \
-        /etc/credentials/monitoring/healthchecks-url \
         /etc/credentials/restic/monitored/repository-password \
         /etc/credentials/restic/monitored/backend-username \
         /etc/credentials/restic/monitored/backend-password
       chown backup-user:users /home/backup-user/monitored/payload.txt
     '';
+
+    # The monitoring report URL must be a systemd-creds-encrypted blob; encrypt it at
+    # boot runtime (the host key isn't available during activation).
+    systemd.services.test-monitoring-credential = {
+      wantedBy = [ "multi-user.target" ];
+      before = [ "common-monitoring.service" ];
+      serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+      script = ''
+        install -d -m 0700 /etc/credentials/monitoring
+        printf '%s' 'http://monitoring-platform:8080/${healthPath}' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=healthchecks-url - /etc/credentials/monitoring/healthchecks-url
+        chmod 0600 /etc/credentials/monitoring/healthchecks-url
+      '';
+    };
 
     common.restic.backups.monitored = resticLib.rest {
       user = "backup-user";

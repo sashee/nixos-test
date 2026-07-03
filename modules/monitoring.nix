@@ -461,7 +461,10 @@ in
           serviceConfig = {
             Type = "oneshot";
             ExecStart = lib.getExe monitorScript;
-            LoadCredential = lib.mkIf (cfg.report.enable && cfg.report.credentialDirectory != null) [
+            # The report URL is a systemd-creds-encrypted blob on disk (create with
+            # `systemd-creds encrypt --name=<urlCredential> …`); systemd decrypts it into
+            # $CREDENTIALS_DIRECTORY at runtime. Encrypted at rest; never in git/the store.
+            LoadCredentialEncrypted = lib.mkIf (cfg.report.enable && cfg.report.credentialDirectory != null) [
               "${cfg.report.urlCredential}:${cfg.report.credentialDirectory}/${cfg.report.urlCredential}"
             ];
             NoNewPrivileges = true;
