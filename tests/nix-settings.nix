@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion, extraModule ? { } }:
+{ nixpkgs, pkgs, stateVersion, extraModule ? { }, gcOptions }:
 
 nixpkgs.lib.nixos.runTest {
   name = "nix-settings";
@@ -20,7 +20,7 @@ nixpkgs.lib.nixos.runTest {
 
     machine.succeed("systemctl is-enabled nix-gc.timer")
     machine.succeed("systemctl is-active nix-gc.timer")
-    machine.succeed("systemctl show nix-gc.service -p ExecStart --value | grep -o '/nix/store/[^ ;]*' | xargs grep -F -- '--delete-older-than 14d'")
+    machine.succeed("systemctl show nix-gc.service -p ExecStart --value | grep -o '/nix/store/[^ ;]*' | xargs grep -F -- '${gcOptions}'")
     machine.succeed("nix config show | grep -F 'auto-optimise-store = true'")
   '';
 }

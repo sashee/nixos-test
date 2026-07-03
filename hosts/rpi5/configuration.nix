@@ -33,6 +33,10 @@ in
   # Compressed RAM-backed swap (same mechanism as the laptops); useful on the 4 GB Pi.
   zramSwap.enable = true;
 
+  # No interactive boot menu on the Pi + limited SD space: keep only the current
+  # generation on GC (laptops keep 14 days to roll back from the boot menu).
+  common.nixSettings.gcOptions = "--delete-old";
+
   users.users.nixos = {
     isNormalUser = true;
     extraGroups = [ "wheel" ];

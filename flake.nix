@@ -144,6 +144,7 @@
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
         extraModule = rpiSystemModule;
+        gcOptions = "--delete-old";
       };
       autoUpgradeRebootTestRpi = import ./tests/auto-upgrade-reboot.nix {
         nixpkgs = nixrpi;
@@ -152,6 +153,12 @@
         machineModule = rpiSystemModule;
       };
       zramTestRpi = import ./tests/zram.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+      };
+      nixGcRetentionTestRpi = import ./tests/nix-gc-retention.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
@@ -173,6 +180,7 @@
         nix-settings = nixSettingsTestRpi;
         auto-upgrade-reboot = autoUpgradeRebootTestRpi;
         zram = zramTestRpi;
+        nix-gc-retention = nixGcRetentionTestRpi;
       };
       rpiAllTests = pkgsRpi.runCommand "rpi-all-tests" { } ''
         mkdir -p $out
@@ -210,6 +218,7 @@
       };
       nixSettingsTest = import ./tests/nix-settings.nix {
         inherit nixpkgs pkgs stateVersion;
+        gcOptions = "--delete-older-than 14d";
       };
       autoUpgradeMockedServiceTest = import ./tests/auto-upgrade-mocked-service.nix {
         autoUpgradeModule = ./modules/auto-upgrade.nix;
