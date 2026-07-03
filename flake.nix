@@ -237,7 +237,7 @@
           imports = [ commonDesktopModule ];
           common.monitoring.enable = false;
         };
-        keptAfterGc = 15;  # --delete-older-than 14d: 14 in-window + newest gen past cutoff (base)
+        keptAfterGc = 14;  # --delete-older-than 14d: ~14 days of history kept under daily GC
       };
       testResults = builtins.mapAttrs (_: dropKvm) ({
         auto-upgrade-mocked-service = autoUpgradeMockedServiceTest;

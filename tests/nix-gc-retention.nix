@@ -1,13 +1,17 @@
 { nixpkgs, pkgs, stateVersion, machineModule, keptAfterGc }:
 
-# Behavioral test of GC retention across the 14-day window. It stages 20 system
-# generations, one per simulated day (advancing the clock with *relative* bumps so
-# no hardcoded date is used and we stay above systemd's lower clock bound), then
-# runs the host's automatic GC:
-#   - laptop (--delete-older-than 14d): keeps the generations inside the 14-day
-#     window plus the most recent one just past it (a rollback base) -> keptAfterGc = 15
-#   - rpi (--delete-old): keeps only the current generation           -> keptAfterGc = 1
+# Behavioral test of GC retention, modelling real daily use. Each "day" it creates a
+# system generation, then advances the clock one day so the host's Persistent
+# nix-gc.timer fires, and waits for that GC run to finish before the next day. Over
+# 20 days the host's real gc policy converges:
+#   - laptop (--delete-older-than 14d): daily GC prunes one generation per day as it
+#     ages out, leaving ~14 days of history (the boundary generation just past the
+#     cutoff is kept as the rollback base)                            -> keptAfterGc = 14
+#   - rpi (--delete-old): only the current generation                 -> keptAfterGc = 1
 # Uses the real per-host config, so changing a host's gc policy makes its variant fail.
+# Creating the generation *before* the clock jump, and only proceeding once the GC has
+# completed, keeps the GC from ever running concurrently with `nix-env --set` -- the
+# staging/GC race that otherwise makes this flaky under slow TCG emulation.
 nixpkgs.lib.nixos.runTest {
   name = "nix-gc-retention";
   hostPkgs = pkgs;
@@ -21,6 +25,11 @@ nixpkgs.lib.nixos.runTest {
     # always-failing in the sandbox) auto-upgrade from adding noise/new generations.
     common.autoUpgrade.enable = lib.mkForce false;
 
+    # This test fires the (daily) nix-gc.timer ~20 times within seconds; in reality it
+    # runs once a day. Lift systemd's start rate limit so the rapid re-triggers don't
+    # trip 'start-limit-hit'. Does not change what the GC does.
+    systemd.services.nix-gc.startLimitIntervalSec = lib.mkForce 0;
+
     system.stateVersion = stateVersion;
   };
 
@@ -31,32 +40,35 @@ nixpkgs.lib.nixos.runTest {
     def generation_count():
         return machine.succeed("find /nix/var/nix/profiles -maxdepth 1 -name 'system-*-link' | wc -l").strip()
 
+    def gc_invocation():
+        return machine.succeed("systemctl show nix-gc.service -p InvocationID --value").strip()
+
     def add_generation(i):
         # A real generation via the same `nix-env --set` mechanism nixos-rebuild uses;
-        # a distinct in-VM store path so --set makes a new generation each time. The
-        # generation's timestamp is the current (faked) wall clock.
+        # a distinct in-VM store path so --set makes a new generation each time.
         path = machine.succeed(f"mkdir -p /tmp/gen{i} && echo {i} > /tmp/gen{i}/marker && nix-store --add /tmp/gen{i}").strip()
         machine.succeed(f"nix-env -p /nix/var/nix/profiles/system --set {path}")
 
     assert generation_count() == "0", f"unexpected baseline: {generation_count()}"
 
-    # Stage 20 generations, one per day. Relative bumps only (no hardcoded dates):
-    # each generation's timestamp ends up one day apart.
-    for i in range(1, 21):
-        machine.succeed("date -s '+1 day'")
-        add_generation(i)
-    assert generation_count() == "20", f"expected 20 staged generations, got {generation_count()}"
-
-    # Nudge a half-day so the 14-day cutoff lands mid-gap, not exactly on a
-    # generation's timestamp (which would make the boundary result flaky).
-    machine.succeed("date -s '+12 hours'")
-
-    # Run the host's automatic GC, then check how many generations survive.
-    machine.succeed("systemctl start nix-gc.service")
+    # Let any boot-time (Persistent catch-up) GC run settle before we start.
     machine.wait_until_succeeds("systemctl show nix-gc.service -p ActiveState --value | grep -Fqx inactive")
-    machine.succeed("systemctl show nix-gc.service -p Result --value | grep -Fqx success")
 
-    assert generation_count() == "${toString keptAfterGc}", f"expected ${toString keptAfterGc} generation(s) after GC, got {generation_count()}"
+    # 20 days of use: create a generation, advance one day so nix-gc.timer fires, then
+    # wait for that GC run to complete before the next day. GC never overlaps staging.
+    for i in range(1, 21):
+        add_generation(i)
+        prev = gc_invocation()
+        machine.succeed("date -s '+1 day'")   # crosses 03:15 -> wakes the Persistent nix-gc.timer
+        machine.wait_until_succeeds(
+            f'id=$(systemctl show nix-gc.service -p InvocationID --value); '
+            f'[ "$id" != "{prev}" ] && '
+            f'[ "$(systemctl show nix-gc.service -p ActiveState --value)" = inactive ] && '
+            f'[ "$(systemctl show nix-gc.service -p Result --value)" = success ]',
+            timeout=120,
+        )
+
+    assert generation_count() == "${toString keptAfterGc}", f"expected ${toString keptAfterGc} generation(s), got {generation_count()}"
 
     # Whatever the policy, the current generation must always survive.
     machine.succeed("nix-env -p /nix/var/nix/profiles/system --list-generations | grep -F '(current)'")
