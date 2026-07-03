@@ -3,9 +3,12 @@
 , autoUpgradeModule
 , stateVersion
 , nodeModule ? { }
+, flakeRef
 }:
 
 let
+  # Flake dir (the part before '#'), as used by the preStart `nix flake update`.
+  flakeRoot = builtins.head (nixpkgs.lib.splitString "#" flakeRef);
   fakeNix = pkgs.writeShellScriptBin "nix" ''
     set -eu
     printf 'nix' >> /run/auto-upgrade-calls.log
@@ -31,7 +34,13 @@ nixpkgs.lib.nixos.runTest {
   nodes.machine = { lib, ... }: {
     imports = [ autoUpgradeModule nodeModule ];
 
-    common.autoUpgrade.flake = "/etc/nixos#laptop";
+    # mkDefault so a full system config (e.g. the rpi one) can set its own flake.
+    common.autoUpgrade.flake = lib.mkDefault flakeRef;
+
+    # This test covers timer + command shape; reboot-on-kernel-change is covered by
+    # the auto-upgrade-reboot test. Force it off so the mocked rebuild (which never
+    # updates the system profile) does not hit the reboot branch's readlink under set -e.
+    system.autoUpgrade.allowReboot = lib.mkForce false;
 
     networking.hostName = "auto-upgrade-mocked-service";
     system.stateVersion = stateVersion;
@@ -72,7 +81,7 @@ nixpkgs.lib.nixos.runTest {
 
     assert calls() - baseline == 2, f"one upgrade should add 2 calls, got {calls() - baseline}"
 
-    machine.succeed("test \"$(tail -n 2 /run/auto-upgrade-calls.log | sed -n '1p')\" = 'nix flake update common --flake /etc/nixos --commit-lock-file'")
+    machine.succeed("test \"$(tail -n 2 /run/auto-upgrade-calls.log | sed -n '1p')\" = 'nix flake update common --flake ${flakeRoot} --commit-lock-file'")
     machine.succeed("""
       second="$(tail -n 2 /run/auto-upgrade-calls.log | sed -n '2p')"
       case "$second" in
@@ -80,7 +89,7 @@ nixpkgs.lib.nixos.runTest {
         *) exit 1 ;;
       esac
       case "$second" in *"--refresh"*) ;; *) exit 1 ;; esac
-      case "$second" in *"--flake /etc/nixos#laptop"*) ;; *) exit 1 ;; esac
+      case "$second" in *"--flake ${flakeRef}"*) ;; *) exit 1 ;; esac
       case "$second" in *"--print-build-logs"*) ;; *) exit 1 ;; esac
       case "$second" in *"--commit-lock-file"*) ;; *) exit 1 ;; esac
       case "$second" in *"--upgrade"*) ;; *) exit 1 ;; esac

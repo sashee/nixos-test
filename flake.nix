@@ -136,13 +136,14 @@
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
         autoUpgradeModule = ./modules/auto-upgrade.nix;
-        nodeModule = rpiTestKernel;
+        nodeModule = rpiSystemModule;
+        flakeRef = "/etc/nixos#rpi5";
       };
       nixSettingsTestRpi = import ./tests/nix-settings.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
-        extraModule = rpiTestKernel;
+        extraModule = rpiSystemModule;
       };
       autoUpgradeRebootTestRpi = import ./tests/auto-upgrade-reboot.nix {
         nixpkgs = nixrpi;
@@ -205,6 +206,7 @@
       };
       autoUpgradeMockedServiceTest = import ./tests/auto-upgrade-mocked-service.nix {
         autoUpgradeModule = ./modules/auto-upgrade.nix;
+        flakeRef = "/etc/nixos#laptop";
         inherit nixpkgs pkgs stateVersion;
       };
       zramTest = import ./tests/zram.nix {

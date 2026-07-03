@@ -9,6 +9,7 @@ nixpkgs.lib.nixos.runTest {
 
   nodes.machine = {
     imports = [ ../modules/nix-settings.nix extraModule ];
+    networking.hostName = "nix-settings";
 
     system.stateVersion = stateVersion;
   };
