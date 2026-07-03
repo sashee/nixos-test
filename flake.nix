@@ -163,6 +163,7 @@
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiSystemModule;
+        keptAfterGc = 1;  # --delete-old keeps only the current generation
       };
       # Nix only exposes /dev/kvm in the sandbox based on the daemon's system-features
       # (auto-set from the host's /dev/kvm), NOT a derivation's requiredSystemFeatures.
@@ -229,6 +230,15 @@
         inherit nixpkgs pkgs stateVersion;
         machineModule = ./modules/laptop-base.nix;
       };
+      nixGcRetentionTest = import ./tests/nix-gc-retention.nix {
+        inherit nixpkgs pkgs stateVersion;
+        # The real laptop config (common-desktop imports nix-settings -> 14d default).
+        machineModule = { ... }: {
+          imports = [ commonDesktopModule ];
+          common.monitoring.enable = false;
+        };
+        keptAfterGc = 3;  # --delete-older-than 14d keeps all freshly-staged gens
+      };
       testResults = builtins.mapAttrs (_: dropKvm) ({
         auto-upgrade-mocked-service = autoUpgradeMockedServiceTest;
         common-desktop = commonDesktopTest;
@@ -245,6 +255,7 @@
         monitoring-reporting = monitoringReportingTest;
         monitoring-restic = monitoringResticTest;
         nix-settings = nixSettingsTest;
+        nix-gc-retention = nixGcRetentionTest;
         plasma-firefox = plasmaFirefoxTest;
         restic = resticTest;
         zram = zramTest;

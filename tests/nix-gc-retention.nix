@@ -1,8 +1,10 @@
-{ nixpkgs, pkgs, stateVersion, machineModule }:
+{ nixpkgs, pkgs, stateVersion, machineModule, keptAfterGc }:
 
-# Behavioral test of the rpi GC retention: with `--delete-old`, an automatic GC
-# keeps ONLY the current system generation. Uses the real rpi config so a revert
-# to the 14d (or any keep-more) policy makes this fail.
+# Behavioral test of GC retention: stage several system generations, run the host's
+# automatic GC, and assert how many survive. Uses the real per-host config, so both
+# the rpi (--delete-old -> keptAfterGc = 1) and the laptop (--delete-older-than 14d,
+# which keeps all the freshly-staged gens -> keptAfterGc = 3) are exercised; a change
+# to a host's gc policy makes its variant fail.
 nixpkgs.lib.nixos.runTest {
   name = "nix-gc-retention";
   hostPkgs = pkgs;
@@ -13,8 +15,8 @@ nixpkgs.lib.nixos.runTest {
     imports = [ machineModule ];
 
     networking.hostName = "nix-gc-retention";
-    # Isolate GC behavior: keep the rpi config's gc settings, but stop the
-    # (network-less, always-failing in the sandbox) auto-upgrade from adding noise.
+    # Isolate GC behavior: keep the host's gc settings, but stop the (network-less,
+    # always-failing in the sandbox) auto-upgrade from adding noise/new generations.
     common.autoUpgrade.enable = lib.mkForce false;
 
     system.stateVersion = stateVersion;
@@ -42,11 +44,11 @@ nixpkgs.lib.nixos.runTest {
     make_generations(range(1, 4))
     assert generation_count() == "3", f"expected 3 generations, got {generation_count()}"
 
-    # The rpi GC (--delete-old) must prune everything but the current generation.
+    # Run the host's automatic GC, then check how many generations survive.
     machine.succeed("systemctl start nix-gc.service")
     machine.wait_until_succeeds("systemctl show nix-gc.service -p ActiveState --value | grep -Fqx inactive")
     machine.succeed("systemctl show nix-gc.service -p Result --value | grep -Fqx success")
 
-    assert generation_count() == "1", f"--delete-old should keep only the current generation, got {generation_count()}"
+    assert generation_count() == "${toString keptAfterGc}", f"expected ${toString keptAfterGc} generation(s) kept after GC, got {generation_count()}"
   '';
 }
