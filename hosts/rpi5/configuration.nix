@@ -30,6 +30,9 @@ in
 
   networking.hostName = lib.mkDefault "nixos-rpi5";
 
+  # Compressed RAM-backed swap (same mechanism as the laptops); useful on the 4 GB Pi.
+  zramSwap.enable = true;
+
   users.users.nixos = {
     isNormalUser = true;
     extraGroups = [ "wheel" ];

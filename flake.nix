@@ -151,6 +151,12 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiSystemModule;
       };
+      zramTestRpi = import ./tests/zram.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+      };
       # Nix only exposes /dev/kvm in the sandbox based on the daemon's system-features
       # (auto-set from the host's /dev/kvm), NOT a derivation's requiredSystemFeatures.
       # So dropping the kvm *requirement* lets tests schedule on KVM-less builders (the
@@ -166,6 +172,7 @@
         auto-upgrade = autoUpgradeTestRpi;
         nix-settings = nixSettingsTestRpi;
         auto-upgrade-reboot = autoUpgradeRebootTestRpi;
+        zram = zramTestRpi;
       };
       rpiAllTests = pkgsRpi.runCommand "rpi-all-tests" { } ''
         mkdir -p $out
@@ -211,6 +218,7 @@
       };
       zramTest = import ./tests/zram.nix {
         inherit nixpkgs pkgs stateVersion;
+        machineModule = ./modules/laptop-base.nix;
       };
       testResults = builtins.mapAttrs (_: dropKvm) ({
         auto-upgrade-mocked-service = autoUpgradeMockedServiceTest;
