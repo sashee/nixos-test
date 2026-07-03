@@ -65,17 +65,6 @@ nixpkgs.lib.nixos.runTest {
   };
 
   testScript = ''
-    start_all()
-
-    def by_hostname(hostname):
-        for node in machines:
-            if node.succeed("hostname").strip() == hostname:
-                return node
-        raise Exception(f"No machine with hostname {hostname}")
-
-    english = by_hostname("locale-english-test")
-    hungarian = by_hostname("locale-hungarian-test")
-
     def wait_for_desktop(node):
         node.wait_for_unit("graphical.target")
         node.wait_until_succeeds("pgrep -u demo plasmashell")
@@ -109,14 +98,18 @@ nixpkgs.lib.nixos.runTest {
         node.succeed("sleep 5")
         node.screenshot(f"{name}-desktop")
 
-    for node in [english, hungarian]:
+    # Run one desktop VM at a time: two Plasma + Firefox guests booted in
+    # parallel oversubscribe the 2-vCPU CI runner (2:1) and soft-lock the guest
+    # kernel. Shutting each node down before starting the next keeps it 1:1.
+    def run_locale(node, name, system_locale, firefox_locale, expected_langpack):
+        node.start()
         wait_for_desktop(node)
         start_http_server(node)
+        assert_locale(node, system_locale, firefox_locale, expected_langpack)
+        open_firefox_and_screenshot(node, name)
+        node.shutdown()
 
-    assert_locale(english, "en_US.UTF-8", "en", None)
-    assert_locale(hungarian, "hu_HU.UTF-8", "hu", "langpack-hu@firefox.mozilla.org")
-
-    open_firefox_and_screenshot(english, "english")
-    open_firefox_and_screenshot(hungarian, "hungarian")
+    run_locale(english, "english", "en_US.UTF-8", "en", None)
+    run_locale(hungarian, "hungarian", "hu_HU.UTF-8", "hu", "langpack-hu@firefox.mozilla.org")
   '';
 }
