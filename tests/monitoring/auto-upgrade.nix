@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion }:
+{ nixpkgs, pkgs, commonDesktopModule, stateVersion }:
 
 let
   monitoringPlatform = import ./platform.nix { inherit pkgs; };
@@ -40,12 +40,10 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
   globalTimeout = 240;
 
+  # Exercise monitoring within the full laptop module (commonDesktopModule = the real
+  # laptop base), overriding only what drives the auto-upgrade check (mocked rebuild).
   nodes.client = { lib, ... }: {
-    imports = [
-      ../../modules/restic.nix
-      ../../modules/auto-upgrade.nix
-      ../../modules/monitoring.nix
-    ];
+    imports = [ commonDesktopModule ];
 
     networking.hostName = "monitoring-client";
     boot.initrd.availableKernelModules = [ "rtc_cmos" ];

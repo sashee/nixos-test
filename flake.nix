@@ -210,16 +210,16 @@
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
       monitoringAutoUpgradeTest = import ./tests/monitoring/auto-upgrade.nix {
-        inherit nixpkgs pkgs stateVersion;
+        inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
       monitoringDiskSpaceTest = import ./tests/monitoring/disk-space.nix {
-        inherit nixpkgs pkgs stateVersion;
+        inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
       monitoringGenerationsTest = import ./tests/monitoring/generations.nix {
-        inherit nixpkgs pkgs stateVersion;
+        inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
       monitoringReportingTest = import ./tests/monitoring/reporting.nix {
-        inherit nixpkgs pkgs stateVersion;
+        inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
       monitoringResticTest = import ./tests/monitoring/restic.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion;

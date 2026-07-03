@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion }:
+{ nixpkgs, pkgs, commonDesktopModule, stateVersion }:
 
 let
   fakeSmartmontools = pkgs.writeShellScriptBin "smartctl" ''
@@ -35,12 +35,10 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
   globalTimeout = 180;
 
+  # Exercise monitoring within the full laptop module (commonDesktopModule = the real
+  # laptop base), overriding only what isolates the smart + reporting behavior.
   nodes.client = { ... }: {
-    imports = [
-      ../../modules/restic.nix
-      ../../modules/auto-upgrade.nix
-      ../../modules/monitoring.nix
-    ];
+    imports = [ commonDesktopModule ];
 
     networking.hostName = "monitoring-client";
     common.autoUpgrade.enable = false;

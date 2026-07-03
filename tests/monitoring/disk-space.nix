@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion }:
+{ nixpkgs, pkgs, commonDesktopModule, stateVersion }:
 
 let
   monitoringPlatform = import ./platform.nix { inherit pkgs; };
@@ -8,12 +8,10 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
   globalTimeout = 180;
 
+  # Exercise monitoring within the full laptop module (commonDesktopModule = the real
+  # laptop base), overriding only what isolates the disk-space behavior.
   nodes.client = { ... }: {
-    imports = [
-      ../../modules/restic.nix
-      ../../modules/auto-upgrade.nix
-      ../../modules/monitoring.nix
-    ];
+    imports = [ commonDesktopModule ];
 
     networking.hostName = "monitoring-client";
     common.autoUpgrade.enable = false;
