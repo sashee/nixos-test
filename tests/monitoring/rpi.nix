@@ -227,14 +227,20 @@ nixpkgs.lib.nixos.runTest {
     # Warm up: one day forward wakes the daily timers on their own. The mocked upgrade
     # succeeds and the real restic backup to the REST server succeeds, each recording its
     # last-success marker via the module's OnSuccess. No unit is ever started by hand.
+    # Reset first so the terminal-ping wait below tracks the warm-up run's own posts, not
+    # any earlier (e.g. boot-time) monitoring run's leftovers.
+    reset_platform()
     next_day()
     client.wait_until_succeeds(f"test -r {upgrade_marker}", timeout=600)
     client.wait_until_succeeds(f"test -r {restic_marker}", timeout=600)
     # Let the warm-up monitoring run (also fired by the jump) finish so its POSTs can't
-    # leak into the next run's log after we reset it. It may itself have lost the race
-    # against the marker writes and failed -- we only care that it is no longer running
-    # (state inactive or failed), not that it succeeded.
-    client.wait_until_succeeds("! systemctl is-active --quiet common-monitoring.service", timeout=600)
+    # leak into the next run's log after we reset it. `! systemctl is-active` is unreliable
+    # here: common-monitoring.service is Type=oneshot, so while it runs it is in state
+    # "activating" (is-active returns non-zero) and the guard would pass mid-run. Instead
+    # wait for the run's terminal ping -- its final POST is /health on success or /health/fail
+    # if it lost the race with the marker writes -- after which it will not POST again, so the
+    # reset below can't be straddled.
+    platform.wait_until_succeeds("grep -Eq '^POST /health(/fail)?$' /var/lib/monitoring-platform/events.log", timeout=600)
 
     # OK run: another day forward fires common-monitoring.timer with both markers fresh
     # (<14d). smart stays [SKIP] (the Pi's real setting); everything else is [OK].
