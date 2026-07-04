@@ -183,21 +183,28 @@ nixpkgs.lib.nixos.runTest {
         got = [event for event in events if event.startswith(f"POST /{prefix}")]
         assert got == expected, f"unexpected {prefix} events: {got}"
 
-    # Warm up: a jump past the backup timer's 1h randomized-delay window fires the
-    # overdue backup. good-client succeeds and records its last-success marker;
-    # bad-client (wrong backend auth) fails and records nothing. From here the test
-    # only jumps the clock and inspects the recorded reports — it never touches the
-    # clients' units.
+    # Drive monitoring synchronously via `systemctl start` (see auto-upgrade.nix). Stop
+    # common-monitoring.timer on both clients first: every clock jump below (needed to fire the
+    # overdue backup and to age its marker) would otherwise also wake the timer, whose async
+    # Type=oneshot run (state "activating", not "active") races reset_platform() and drops events.
+    for client in [good_client, bad_client]:
+        client.succeed("systemctl stop common-monitoring.timer")
+
+    # Warm up: a jump past the backup timer's 1h randomized-delay window fires the overdue backup.
+    # good-client succeeds and records its last-success marker; bad-client (wrong backend auth)
+    # fails and records nothing. From here the test starts common-monitoring.service by hand to
+    # inspect one clean cycle at a time.
     set_time(test_timestamp(1, "01:05:00"))
     good_client.wait_until_succeeds(f"test -r {marker}", timeout=120)
     bad_client.fail(f"test -e {marker}")
 
-    # Recent success: good reports OK (last success within maxAge); bad has never
-    # succeeded, so it reports "no successful run". A bare "POST /good" is the
-    # success ping; "POST /bad/fail" is the failure ping.
+    # Recent success: good reports OK (last success within maxAge) and exits 0; bad has never
+    # succeeded, so it reports "no successful run" and exits non-zero. `systemctl start` blocks on
+    # each oneshot until it finishes, so the platform log holds exactly these two cycles' events.
     reset_platform()
     set_time(test_timestamp(2, "01:05:00"))
-    platform.wait_until_succeeds("grep -Fxq 'POST /good' /var/lib/monitoring-platform/events.log && grep -Fxq 'POST /bad/fail' /var/lib/monitoring-platform/events.log", timeout=120)
+    good_client.succeed("systemctl start common-monitoring.service")
+    bad_client.fail("systemctl start common-monitoring.service")
     assert_events("good", ["POST /good/start", "POST /good/log", "POST /good"])
     assert_events("bad", ["POST /bad/start", "POST /bad/log", "POST /bad/fail"])
     platform.succeed("grep -F '[OK] restic monitored: restic-backups-monitored.service last succeeded' /var/lib/monitoring-platform/bodies.log")
@@ -211,7 +218,7 @@ nixpkgs.lib.nixos.runTest {
     platform.succeed("systemctl stop restic-rest-auth.socket restic-rest-auth.service")
     reset_platform()
     set_time(test_timestamp(17, "01:05:00"), [good_client, platform])
-    platform.wait_until_succeeds("grep -Fxq 'POST /good/fail' /var/lib/monitoring-platform/events.log", timeout=120)
+    good_client.fail("systemctl start common-monitoring.service")
     assert_events("good", ["POST /good/start", "POST /good/log", "POST /good/fail"])
     platform.succeed("grep -F '[FAIL] restic monitored: restic-backups-monitored.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")
     platform.succeed("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
