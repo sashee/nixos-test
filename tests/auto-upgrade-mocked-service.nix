@@ -37,10 +37,12 @@ nixpkgs.lib.nixos.runTest {
     # mkDefault so a full system config (e.g. the rpi one) can set its own flake.
     common.autoUpgrade.flake = lib.mkDefault flakeRef;
 
-    # This test covers timer + command shape; reboot-on-kernel-change is covered by
-    # the auto-upgrade-reboot test. Force it off so the mocked rebuild (which never
-    # updates the system profile) does not hit the reboot branch's readlink under set -e.
+    # This test covers timer + command shape; reboot behavior is covered by the
+    # auto-upgrade-reboot test. Force both reboot paths off so the mocked rebuild (which never
+    # updates the system profile) never reboots mid-test. (nodeModule is the rpi config, which
+    # enables rebootOnChange.)
     system.autoUpgrade.allowReboot = lib.mkForce false;
+    common.autoUpgrade.rebootOnChange = lib.mkForce false;
 
     networking.hostName = "auto-upgrade-mocked-service";
     system.stateVersion = stateVersion;

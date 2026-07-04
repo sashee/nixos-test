@@ -1,8 +1,8 @@
 { nixpkgs, pkgs, stateVersion, machineModule }:
 
 let
-  # A fake "upgraded" system whose {initrd,kernel,kernel-modules} differ from the
-  # booted one, so auto-upgrade's reboot logic decides a reboot is needed. Just
+  # A fake "upgraded" system: its system toplevel differs from the booted one, so
+  # common.autoUpgrade.rebootOnChange decides a reboot is needed. Just
   # symlinks to a tiny cached pkg — no real kernel is built.
   fakeTarget = pkgs.runCommand "fake-upgraded-system" { } ''
     mkdir -p $out
@@ -19,7 +19,7 @@ nixpkgs.lib.nixos.runTest {
   name = "auto-upgrade-reboot";
   hostPkgs = pkgs;
 
-  # The real rpi system config (incl. system.autoUpgrade.allowReboot). The test only
+  # The real rpi system config (incl. common.autoUpgrade.rebootOnChange). The test only
   # mocks the upgrade itself + the preStart `nix`, so if the config didn't enable
   # reboot, this test would fail.
   nodes.machine = { lib, ... }: {
@@ -42,8 +42,8 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("shutdown -c || true")
     machine.fail("test -e /run/systemd/shutdown/scheduled")
 
-    # One upgrade -> simulated kernel change -> reboot scheduled (the rpi config sets
-    # allowReboot; if it didn't, this wait times out and the test fails).
+    # One upgrade -> new generation differs from booted -> reboot scheduled (the rpi config
+    # sets rebootOnChange; if it didn't, this wait times out and the test fails).
     machine.succeed("systemctl start nixos-upgrade.service")
     machine.wait_until_succeeds("test -e /run/systemd/shutdown/scheduled", timeout=30)
 

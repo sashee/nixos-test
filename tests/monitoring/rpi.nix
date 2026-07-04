@@ -76,8 +76,9 @@ nixpkgs.lib.nixos.runTest {
     system.build.nixos-rebuild = lib.mkForce fakeNixosRebuild;
     systemd.services.nixos-upgrade.path = lib.mkBefore [ fakeNix ];
     # Test-only safety: a "successful" mocked upgrade must never reboot mid-test (it
-    # changes no system, so it wouldn't anyway, but pin it off to be sure).
+    # changes no system, so it wouldn't anyway, but pin both reboot paths off to be sure).
     system.autoUpgrade.allowReboot = lib.mkForce false;
+    common.autoUpgrade.rebootOnChange = lib.mkForce false;
 
     # Warping the clock past midnight would otherwise wake the Persistent nix-gc.timer,
     # and its catch-up GC starves the monitoring run under slow TCG emulation.

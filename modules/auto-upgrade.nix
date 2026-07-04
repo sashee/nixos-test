@@ -12,6 +12,23 @@ let
     flakeRoot
     "--commit-lock-file"
   ]);
+
+  # Reboot after a successful boot-generation upgrade when the freshly-built generation differs
+  # from the running system. operation = "boot" already made it the default generation, so the
+  # reboot just activates it. Compares the full system toplevel, so ANY change triggers a reboot --
+  # unlike system.autoUpgrade.allowReboot, which reboots only on kernel/initrd/kernel-modules changes.
+  rebootIfChanged = pkgs.writeShellApplication {
+    name = "nixos-upgrade-reboot-if-changed";
+    runtimeInputs = [ pkgs.coreutils config.systemd.package ];
+    text = ''
+      booted="$(readlink -f /run/booted-system)"
+      built="$(readlink -f /nix/var/nix/profiles/system)"
+      if [ "$booted" != "$built" ]; then
+        echo "auto-upgrade: new generation differs from booted system; scheduling reboot"
+        shutdown -r +1
+      fi
+    '';
+  };
 in
 {
   options.common.autoUpgrade = {
@@ -30,6 +47,17 @@ in
       '';
     };
 
+    rebootOnChange = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Reboot (via `shutdown -r +1`) after a successful upgrade whenever the new boot
+        generation differs from the currently running system -- i.e. on ANY change, not only
+        kernel/initrd/kernel-modules changes (which is all `system.autoUpgrade.allowReboot`
+        covers). Enable only one of the two reboot paths.
+      '';
+    };
+
   };
 
   config = lib.mkIf cfg.enable {
@@ -37,6 +65,10 @@ in
       {
         assertion = cfg.flake != null;
         message = "common.autoUpgrade.flake must be set when common.autoUpgrade.enable is true.";
+      }
+      {
+        assertion = !(cfg.rebootOnChange && config.system.autoUpgrade.allowReboot);
+        message = "common.autoUpgrade.rebootOnChange and system.autoUpgrade.allowReboot both reboot after an upgrade; enable only one.";
       }
     ];
 
@@ -62,6 +94,12 @@ in
     };
 
     systemd.services.nixos-upgrade.preStart = updateCommand;
+
+    # After a successful boot-generation upgrade, reboot if anything changed (opt-in). Runs only
+    # on ExecStart success and exits 0 either way, so the unit still succeeds and nixos-upgrade's
+    # OnSuccess (the monitoring last-success marker) still fires before the +1min reboot.
+    systemd.services.nixos-upgrade.serviceConfig.ExecStartPost =
+      lib.mkIf cfg.rebootOnChange (lib.getExe rebootIfChanged);
 
     # The system `git` may be a sandboxed wrapper (nix-utils) that cannot write
     # outside the user's home; auto-upgrade commits the lock in the flake dir
