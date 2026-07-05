@@ -171,6 +171,11 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiSystemModule;
       };
+      monitoringNixGcTestRpi = import ./tests/monitoring/nix-gc.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+      };
       connectivityFallbackTestRpi = import ./tests/connectivity-fallback.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
@@ -196,6 +201,7 @@
         nix-gc-retention = nixGcRetentionTestRpi;
         monitoring = monitoringTestRpi;
         connectivity-fallback = connectivityFallbackTestRpi;
+        monitoring-nix-gc = monitoringNixGcTestRpi;
       };
       rpiAllTests = pkgsRpi.runCommand "rpi-all-tests" { } ''
         mkdir -p $out
@@ -230,6 +236,9 @@
       };
       monitoringResticTest = import ./tests/monitoring/restic.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
+      };
+      monitoringNixGcTest = import ./tests/monitoring/nix-gc.nix {
+        inherit nixpkgs pkgs stateVersion;
       };
       nixSettingsTest = import ./tests/nix-settings.nix {
         inherit nixpkgs pkgs stateVersion;
@@ -272,6 +281,7 @@
         monitoring-generations = monitoringGenerationsTest;
         monitoring-reporting = monitoringReportingTest;
         monitoring-restic = monitoringResticTest;
+        monitoring-nix-gc = monitoringNixGcTest;
         nix-settings = nixSettingsTest;
         nix-gc-retention = nixGcRetentionTest;
         plasma-firefox = plasmaFirefoxTest;
@@ -368,6 +378,8 @@
         monitoring-reporting-driver-interactive = monitoringReportingTest.driverInteractive;
         monitoring-restic-driver = monitoringResticTest.driver;
         monitoring-restic-driver-interactive = monitoringResticTest.driverInteractive;
+        monitoring-nix-gc-driver = monitoringNixGcTest.driver;
+        monitoring-nix-gc-driver-interactive = monitoringNixGcTest.driverInteractive;
         nix-settings-driver = nixSettingsTest.driver;
         nix-settings-driver-interactive = nixSettingsTest.driverInteractive;
         qemu-vm = qemuVm;

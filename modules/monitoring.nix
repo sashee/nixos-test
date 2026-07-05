@@ -32,7 +32,9 @@ let
     lib.optionals cfg.restic.enable
       (map (b: rec { name = "restic-backups-${b}"; unit = "${name}.service"; }) resticBackups)
     ++ lib.optional (cfg.autoUpgrade.enable && config.system.autoUpgrade.enable)
-      { name = "nixos-upgrade"; unit = "nixos-upgrade.service"; };
+      { name = "nixos-upgrade"; unit = "nixos-upgrade.service"; }
+    ++ lib.optional (cfg.nixGc.enable && config.nix.gc.automatic)
+      { name = "nix-gc"; unit = "nix-gc.service"; };
 
   monitorScript = pkgs.writeShellApplication {
     name = "common-monitoring-checks";
@@ -56,6 +58,8 @@ let
       disk_space_enabled=${lib.escapeShellArg (lib.boolToString cfg.diskSpace.enable)}
       monitoring_auto_upgrade_enabled=${lib.escapeShellArg (lib.boolToString cfg.autoUpgrade.enable)}
       system_auto_upgrade_enabled=${lib.escapeShellArg (lib.boolToString config.system.autoUpgrade.enable)}
+      nix_gc_enabled=${lib.escapeShellArg (lib.boolToString cfg.nixGc.enable)}
+      nix_gc_automatic_enabled=${lib.escapeShellArg (lib.boolToString config.nix.gc.automatic)}
       generations_enabled=${lib.escapeShellArg (lib.boolToString cfg.generations.enable)}
       restic_backups=(${resticBackupArgs})
       flake_lock=${lib.escapeShellArg (if cfg.flakeLock.path == null then "" else cfg.flakeLock.path)}
@@ -261,6 +265,20 @@ let
         check_unit_recent "auto-upgrade" "nixos-upgrade.service" "${cfg.autoUpgrade.maxAge}"
       }
 
+      check_nix_gc() {
+        if [ "$nix_gc_enabled" != "true" ]; then
+          skip "nix-gc: disabled"
+          return 0
+        fi
+
+        if [ "$nix_gc_automatic_enabled" != "true" ]; then
+          skip "nix-gc: nix.gc.automatic is disabled"
+          return 0
+        fi
+
+        check_unit_recent "nix-gc" "nix-gc.service" "${cfg.nixGc.maxAge}"
+      }
+
       check_generations() {
         if [ "$generations_enabled" != "true" ]; then
           skip "generations: disabled"
@@ -317,6 +335,7 @@ let
       check_restic
       check_disk_space
       check_auto_upgrade
+      check_nix_gc
       check_generations
 
       log "finished=$(date --iso-8601=seconds)"
@@ -474,6 +493,20 @@ in
         type = lib.types.str;
         default = "14d";
         description = "Maximum age of the last successful auto-upgrade run. Supports Ns, Nm, Nh, Nd.";
+      };
+    };
+
+    nixGc = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Whether to check that automatic nix garbage collection runs successfully.";
+      };
+
+      maxAge = lib.mkOption {
+        type = lib.types.str;
+        default = "3d";
+        description = "Maximum age of the last successful nix-gc run. Supports Ns, Nm, Nh, Nd.";
       };
     };
 

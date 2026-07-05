@@ -18,6 +18,7 @@ nixpkgs.lib.nixos.runTest {
 
     common.monitoring = {
       enable = true;
+      nixGc.enable = false;
       smart.enable = false;
       restic.enable = false;
       autoUpgrade.enable = false;

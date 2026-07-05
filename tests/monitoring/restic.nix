@@ -59,6 +59,7 @@ let
 
     common.monitoring = {
       enable = true;
+      nixGc.enable = false;
       smart.enable = false;
       restic.enable = true;
       autoUpgrade.enable = false;
