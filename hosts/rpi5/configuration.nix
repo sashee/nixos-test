@@ -19,6 +19,7 @@ in
     ../../modules/restic.nix
     ../../modules/auto-upgrade.nix
     ../../modules/monitoring.nix
+    ../../modules/connectivity-fallback.nix
   ];
 
   # Daily boot-generation auto-upgrade: pulls the latest `common` from the host
@@ -66,6 +67,7 @@ in
   # };
 
   networking.wireless.iwd.enable = true;
+  common.connectivityFallback.enable = true;
   services.openssh.enable = true;
   # nix-utils runs git/ssh in a bubblewrap userns where root-owned store files
   # appear as 'nobody', so OpenSSH rejects the Include'd systemd-ssh-proxy config

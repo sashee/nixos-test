@@ -171,6 +171,12 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiSystemModule;
       };
+      connectivityFallbackTestRpi = import ./tests/connectivity-fallback.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        moduleUnderTest = ./modules/connectivity-fallback.nix;
+      };
       # Nix only exposes /dev/kvm in the sandbox based on the daemon's system-features
       # (auto-set from the host's /dev/kvm), NOT a derivation's requiredSystemFeatures.
       # So dropping the kvm *requirement* lets tests schedule on KVM-less builders (the
@@ -189,6 +195,7 @@
         zram = zramTestRpi;
         nix-gc-retention = nixGcRetentionTestRpi;
         monitoring = monitoringTestRpi;
+        connectivity-fallback = connectivityFallbackTestRpi;
       };
       rpiAllTests = pkgsRpi.runCommand "rpi-all-tests" { } ''
         mkdir -p $out
@@ -246,6 +253,10 @@
         };
         keptAfterGc = 14;  # --delete-older-than 14d: ~14 days of history kept under daily GC
       };
+      connectivityFallbackTest = import ./tests/connectivity-fallback.nix {
+        inherit nixpkgs pkgs stateVersion;
+        moduleUnderTest = ./modules/connectivity-fallback.nix;
+      };
       testResults = builtins.mapAttrs (_: dropKvm) ({
         auto-upgrade-mocked-service = autoUpgradeMockedServiceTest;
         common-desktop = commonDesktopTest;
@@ -265,6 +276,7 @@
         nix-gc-retention = nixGcRetentionTest;
         plasma-firefox = plasmaFirefoxTest;
         restic = resticTest;
+        connectivity-fallback = connectivityFallbackTest;
         zram = zramTest;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
