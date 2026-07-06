@@ -39,7 +39,7 @@ in
   # generation on GC (laptops keep 14 days to roll back from the boot menu).
   common.nixSettings.gcOptions = "--delete-old";
 
-  # Daily health checks (disk-space, generations, auto-upgrade). smart disabled (SD
+  # Health checks every 30 minutes (disk-space, generations, auto-upgrade). smart disabled (SD
   # card has no SMART); restic auto-skips with no backups. Reporting posts to a
   # Healthchecks URL read from a systemd-creds-encrypted file (LoadCredentialEncrypted);
   # provision it out-of-band: `systemd-creds encrypt --name=healthchecks-url - \
@@ -47,6 +47,7 @@ in
   common.monitoring = {
     report.credentialDirectory = "/etc/credentials/monitoring";
     smart.enable = false;
+    timerConfig.OnCalendar = "*:0/30";  # every 30 minutes (:00 and :30)
   };
 
   users.users.nixos = {

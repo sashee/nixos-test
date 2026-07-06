@@ -3,8 +3,8 @@
 # Clock-driven monitoring test on the REAL Raspberry Pi 5 config (hosts/rpi5), booted
 # on the Pi kernel. The x86 monitoring tests already cover module behavior; this one
 # proves the deployed Pi config integrates monitoring correctly and does it the way the
-# host does: it never starts a unit by hand -- it warps the clock so the (Persistent)
-# daily timers fire on their own, then inspects the reports.
+# host does: it never starts a unit by hand -- it warps the clock so the timers fire on
+# their own (monitoring every 30 min; restic/upgrade Persistent daily), then inspects reports.
 #
 # On top of the real config it layers three test-only things:
 #   - one restic backup (the Pi has none yet, but will) so the restic check reports for real,
@@ -201,8 +201,8 @@ nixpkgs.lib.nixos.runTest {
     platform.wait_for_open_port(8080)
 
     # --- config-shape: the real Pi config wires monitoring + restic with encrypted creds ---
-    client.succeed("systemctl show common-monitoring.timer -p TimersCalendar --value | grep -F '*-*-* 00:00:00'")
-    client.succeed("systemctl show common-monitoring.timer -p Persistent --value | grep -F yes")
+    client.succeed("systemctl show common-monitoring.timer -p TimersCalendar --value | grep -F '*-*-* *:00/30:00'")
+    client.succeed("systemctl show common-monitoring.timer -p Persistent --value | grep -F no")
     client.succeed("systemctl is-active --quiet common-monitoring.timer")
     client.succeed("systemctl cat common-monitoring.service | grep -F 'LoadCredentialEncrypted=healthchecks-url:/etc/credentials/monitoring/healthchecks-url'")
     client.fail("systemctl cat common-monitoring.service | grep -F 'http://monitoring-platform:8080/health'")
