@@ -216,11 +216,16 @@ nixpkgs.lib.nixos.runTest {
         events = platform.succeed("cat /var/lib/monitoring-platform/events.log").strip().splitlines()
         assert events == expected, f"unexpected events: {events}"
 
-    # Advance the client to the next day at 05:00 -- past every timer's randomized-delay
-    # window (monitoring 10m, restic 1h, upgrade 2h), so each overdue Persistent timer
-    # fires promptly on the clock change instead of waiting out its delay in real time.
+    # Advance the client ~one day forward, landing 15 s before a :30 boundary. The Persistent
+    # daily timers (restic 1h, upgrade 2h randomized-delay) are overdue after the midnight
+    # crossing and, since 05:29 is past their delay windows, catch up and fire promptly. But
+    # common-monitoring.timer is now OnCalendar=*:0/30 with Persistent=no: a non-persistent
+    # calendar timer is re-armed for the next boundary strictly after the new wall clock on a
+    # clock jump -- it does NOT replay a :30 the jump skipped (that is what Persistent= does).
+    # So we land just before a :30 and let the real clock cross it seconds later; the timer
+    # then fires on its own, once per cycle, keeping the exact-events asserts below valid.
     def next_day():
-        client.succeed("date -s \"$(date -d 'tomorrow 05:00')\"")
+        client.succeed("date -s \"$(date -d 'tomorrow 05:29:45')\"")
 
     upgrade_marker = "/var/lib/common-monitoring/nixos-upgrade.service.last-success"
     restic_marker = "/var/lib/common-monitoring/restic-backups-test.service.last-success"
@@ -267,11 +272,12 @@ nixpkgs.lib.nixos.runTest {
 
     # FAIL run: break both success sources (mock upgrade now fails; REST backend down),
     # then jump 15 days so both markers age past maxAge (14d) with no new success recorded.
-    # A single catch-up firing per timer is enough -- monitoring reports failure.
+    # Land 15 s before a :30 (same reason as next_day) so common-monitoring fires on its own;
+    # 15 days minus 15 s is still > 14d, so both markers read as stale.
     client.succeed("printf '%s' fail > /run/upgrade-status")
     platform.succeed("systemctl stop restic-rest-auth.socket restic-rest-auth.service")
     reset_platform()
-    client.succeed("date -s '+15 days'")
+    client.succeed("date -s \"$(date -d '+15 days' +%Y-%m-%d) 05:29:45\"")
     platform.wait_until_succeeds("grep -Fxq 'POST /health/fail' /var/lib/monitoring-platform/events.log", timeout=600)
     assert_events(["POST /health/start", "POST /health/log", "POST /health/fail"])
     platform.succeed("grep -F '[FAIL] auto-upgrade: nixos-upgrade.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")
