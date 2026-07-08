@@ -79,14 +79,23 @@ jobs:
         run: |
           host-telemetry &
           trap 'echo "=== STEP SIGNALLED at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="; dump-host-state; sudo dmesg | tail -n 100' INT TERM
-          nix build -L --max-jobs auto .#qemu-vm &
+          # Evaluate in a short-lived process: the evaluator peaks at multiple
+          # GiB that Boehm GC never returns to the OS, which starved the VM
+          # tests and OOMed the long-lived nix client when eval and build
+          # shared one process. Building the .drv keeps the client small.
+          drv=$(nix path-info --derivation .#qemu-vm)
+          nix build -L --max-jobs auto "$drv^*" &
           wait $!
 
       - name: Build checked QEMU result (VM tests one at a time)
         run: |
           host-telemetry &
           trap 'echo "=== STEP SIGNALLED at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="; dump-host-state; sudo dmesg | tail -n 100' INT TERM
-          nix build -L --max-jobs 1 .#qemu-plasma-result &
+          # Eval-then-build split: see the comment in the previous step. The
+          # ~23 VM-test eval peaked at ~13 GiB and pinned it for the whole
+          # test run, leaving ~3 GiB for the qemu guests.
+          drv=$(nix path-info --derivation .#qemu-plasma-result)
+          nix build -L --max-jobs 1 "$drv^*" &
           wait $!
 
       - name: Upload VM artifacts
@@ -176,5 +185,8 @@ jobs:
         run: |
           host-telemetry &
           trap 'echo "=== STEP SIGNALLED at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="; dump-host-state; sudo dmesg | tail -n 100' INT TERM
-          nix build -L --max-jobs 1 .#rpi-all-tests &
+          # Eval-then-build split so the evaluator's heap is released before
+          # the VM tests run; see the full-build job for the OOM background.
+          drv=$(nix path-info --derivation .#rpi-all-tests)
+          nix build -L --max-jobs 1 "$drv^*" &
           wait $!
