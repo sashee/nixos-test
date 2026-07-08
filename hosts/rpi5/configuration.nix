@@ -81,6 +81,12 @@ in
   # nix-utils tools live on the nixos user PATH only (see users.users.nixos).
   environment.systemPackages = [ pkgs.git ];
 
+  # The bumped rpi kernel (6.18.34-unstable_20260604) no longer builds tpm-crb as a
+  # module, but systemd-initrd TPM2 support pulls tpm-crb into
+  # boot.initrd.availableKernelModules on aarch64, so the initrd module closure fails
+  # with "modprobe: FATAL: Module tpm-crb not found". The Pi 5 has no TPM, so disable it.
+  boot.initrd.systemd.tpm2.enable = false;
+
   boot.kernelPatches = [{
     name = "headless-trim";
     patch = null;
