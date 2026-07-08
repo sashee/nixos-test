@@ -32,7 +32,7 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
-          enable_kvm: false
+          enable_kvm: true
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
@@ -51,8 +51,11 @@ jobs:
       - name: Build VM image + shared closure (parallel)
         run: nix build -L --max-jobs auto .#qemu-vm
 
-      - name: Build checked QEMU result (VM tests one at a time)
-        run: nix build -L --max-jobs 1 .#qemu-plasma-result
+      - name: Run VM tests (per-check eval, built one at a time)
+        # NOT .#qemu-plasma-result: instantiating that aggregate forces the
+        # ~15 GiB whole-flake eval that OOMed the runner. The make target
+        # evaluates each check in its own short-lived process instead.
+        run: make run-tests MAX_JOBS=1
 
       - name: Upload VM artifacts
         uses: actions/upload-artifact@v7.0.1
@@ -60,9 +63,8 @@ jobs:
         with:
           name: qemu-plasma-result
           path: |
-            result/qemu-command
-            result/plasma-desktop.png
-            result/firefox-page.png
+            results/x86_64-linux/plasma-firefox/plasma-desktop.png
+            results/x86_64-linux/plasma-firefox/firefox-page.png
           if-no-files-found: warn
 
   rpi:
@@ -94,7 +96,7 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
-          enable_kvm: false
+          enable_kvm: true
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
@@ -111,4 +113,6 @@ jobs:
           df -h
 
       - name: Build Raspberry Pi 5 checks (aarch64 VM tests, real kernel)
-        run: nix build -L --max-jobs 1 .#rpi-all-tests
+        # Per-check eval so the evaluator's heap stays bounded; building the
+        # .#rpi-all-tests aggregate would force one big whole-flake eval.
+        run: make run-rpi-tests MAX_JOBS=1

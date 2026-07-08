@@ -1,3 +1,5 @@
 *.qcow2
 result
 result-qemu-vm
+/results/
+/.drvs/
