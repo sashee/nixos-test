@@ -93,8 +93,10 @@ jobs:
       - name: Build VM image + shared closure (parallel)
         run: nix build -L --max-jobs auto .#qemu-vm
 
-      - name: Build checked QEMU result (VM tests one at a time)
-        run: nix build -L --max-jobs 1 .#qemu-plasma-result
+      - name: Run VM tests (per-check eval, built one at a time)
+        # NOT .#qemu-plasma-result: instantiating the aggregate forces a
+        # ~15 GiB whole-flake eval that OOMs the 16 GiB runner.
+        run: make run-tests MAX_JOBS=1
 
   rpi:
     # Verify the aarch64 Raspberry Pi 5 checks against the UPDATED lock, on a
@@ -148,7 +150,8 @@ jobs:
           df -h
 
       - name: Build Raspberry Pi 5 checks (aarch64 VM tests, real kernel)
-        run: nix build -L --max-jobs 1 .#rpi-all-tests
+        # Per-check eval; the .#rpi-all-tests aggregate would force one big eval.
+        run: make run-rpi-tests MAX_JOBS=1
 
   commit:
     # Only reached if BOTH the x86_64 and aarch64 checks passed.

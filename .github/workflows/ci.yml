@@ -48,55 +48,14 @@ jobs:
           free -h
           df -h
 
-      - name: Set up host telemetry
-        run: |
-          # Telemetry streams into the step log because logs are delivered live;
-          # artifacts and if:always() steps are lost when the runner VM is killed.
-          sudo tee /usr/local/bin/dump-host-state >/dev/null <<'EOF'
-          #!/usr/bin/env bash
-          echo "=== HOST $(date -u '+%Y-%m-%dT%H:%M:%SZ') load=$(cut -d' ' -f1-3 /proc/loadavg)"
-          free -m
-          grep -H "" /proc/pressure/memory /proc/pressure/io /proc/pressure/cpu
-          df -h / /mnt | tail -n +2
-          ps aux --sort=-rss | head -n 5
-          echo "IMDS scheduled events: $(curl -s --max-time 5 -H Metadata:true 'http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01' || echo unavailable)"
-          EOF
-          sudo tee /usr/local/bin/host-telemetry >/dev/null <<'EOF'
-          #!/usr/bin/env bash
-          vmstat -t 15 &
-          sudo journalctl --follow --priority=warning --no-pager &
-          while true; do
-            dump-host-state
-            sleep 15
-          done
-          EOF
-          sudo chmod +x /usr/local/bin/dump-host-state /usr/local/bin/host-telemetry
-          # First call to the scheduled-events endpoint can block ~2 min while
-          # Azure enables it for this VM; warm it up so later probes are fast.
-          curl -s --max-time 120 -H Metadata:true 'http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01' >/dev/null 2>&1 &
-
       - name: Build VM image + shared closure (parallel)
-        run: |
-          host-telemetry &
-          trap 'echo "=== STEP SIGNALLED at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="; dump-host-state; sudo dmesg | tail -n 100' INT TERM
-          # Evaluate in a short-lived process: the evaluator peaks at multiple
-          # GiB that Boehm GC never returns to the OS, which starved the VM
-          # tests and OOMed the long-lived nix client when eval and build
-          # shared one process. Building the .drv keeps the client small.
-          drv=$(nix path-info --derivation .#qemu-vm)
-          nix build -L --max-jobs auto "$drv^*" &
-          wait $!
+        run: nix build -L --max-jobs auto .#qemu-vm
 
-      - name: Build checked QEMU result (VM tests one at a time)
-        run: |
-          host-telemetry &
-          trap 'echo "=== STEP SIGNALLED at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="; dump-host-state; sudo dmesg | tail -n 100' INT TERM
-          # Eval-then-build split: see the comment in the previous step. The
-          # ~23 VM-test eval peaked at ~13 GiB and pinned it for the whole
-          # test run, leaving ~3 GiB for the qemu guests.
-          drv=$(nix path-info --derivation .#qemu-plasma-result)
-          nix build -L --max-jobs 1 "$drv^*" &
-          wait $!
+      - name: Run VM tests (per-check eval, built one at a time)
+        # NOT .#qemu-plasma-result: instantiating that aggregate forces the
+        # ~15 GiB whole-flake eval that OOMed the runner. The make target
+        # evaluates each check in its own short-lived process instead.
+        run: make run-tests MAX_JOBS=1
 
       - name: Upload VM artifacts
         uses: actions/upload-artifact@v7.0.1
@@ -104,9 +63,8 @@ jobs:
         with:
           name: qemu-plasma-result
           path: |
-            result/qemu-command
-            result/plasma-desktop.png
-            result/firefox-page.png
+            results/x86_64-linux/plasma-firefox/plasma-desktop.png
+            results/x86_64-linux/plasma-firefox/firefox-page.png
           if-no-files-found: warn
 
   rpi:
@@ -154,39 +112,7 @@ jobs:
           free -h
           df -h
 
-      - name: Set up host telemetry
-        run: |
-          # Telemetry streams into the step log because logs are delivered live;
-          # artifacts and if:always() steps are lost when the runner VM is killed.
-          sudo tee /usr/local/bin/dump-host-state >/dev/null <<'EOF'
-          #!/usr/bin/env bash
-          echo "=== HOST $(date -u '+%Y-%m-%dT%H:%M:%SZ') load=$(cut -d' ' -f1-3 /proc/loadavg)"
-          free -m
-          grep -H "" /proc/pressure/memory /proc/pressure/io /proc/pressure/cpu
-          df -h / /mnt | tail -n +2
-          ps aux --sort=-rss | head -n 5
-          echo "IMDS scheduled events: $(curl -s --max-time 5 -H Metadata:true 'http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01' || echo unavailable)"
-          EOF
-          sudo tee /usr/local/bin/host-telemetry >/dev/null <<'EOF'
-          #!/usr/bin/env bash
-          vmstat -t 15 &
-          sudo journalctl --follow --priority=warning --no-pager &
-          while true; do
-            dump-host-state
-            sleep 15
-          done
-          EOF
-          sudo chmod +x /usr/local/bin/dump-host-state /usr/local/bin/host-telemetry
-          # First call to the scheduled-events endpoint can block ~2 min while
-          # Azure enables it for this VM; warm it up so later probes are fast.
-          curl -s --max-time 120 -H Metadata:true 'http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01' >/dev/null 2>&1 &
-
       - name: Build Raspberry Pi 5 checks (aarch64 VM tests, real kernel)
-        run: |
-          host-telemetry &
-          trap 'echo "=== STEP SIGNALLED at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="; dump-host-state; sudo dmesg | tail -n 100' INT TERM
-          # Eval-then-build split so the evaluator's heap is released before
-          # the VM tests run; see the full-build job for the OOM background.
-          drv=$(nix path-info --derivation .#rpi-all-tests)
-          nix build -L --max-jobs 1 "$drv^*" &
-          wait $!
+        # Per-check eval so the evaluator's heap stays bounded; building the
+        # .#rpi-all-tests aggregate would force one big whole-flake eval.
+        run: make run-rpi-tests MAX_JOBS=1
