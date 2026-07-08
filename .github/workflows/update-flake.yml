@@ -25,7 +25,7 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
-          enable_kvm: false
+          enable_kvm: true
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
@@ -74,7 +74,7 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
-          enable_kvm: false
+          enable_kvm: true
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
@@ -131,7 +131,7 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
-          enable_kvm: false
+          enable_kvm: true
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true

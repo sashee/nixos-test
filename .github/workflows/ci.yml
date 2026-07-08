@@ -32,7 +32,7 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
-          enable_kvm: false
+          enable_kvm: true
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
@@ -48,11 +48,46 @@ jobs:
           free -h
           df -h
 
+      - name: Set up host telemetry
+        run: |
+          # Telemetry streams into the step log because logs are delivered live;
+          # artifacts and if:always() steps are lost when the runner VM is killed.
+          sudo tee /usr/local/bin/dump-host-state >/dev/null <<'EOF'
+          #!/usr/bin/env bash
+          echo "=== HOST $(date -u '+%Y-%m-%dT%H:%M:%SZ') load=$(cut -d' ' -f1-3 /proc/loadavg)"
+          free -m
+          grep -H "" /proc/pressure/memory /proc/pressure/io /proc/pressure/cpu
+          df -h / /mnt | tail -n +2
+          ps aux --sort=-rss | head -n 5
+          echo "IMDS scheduled events: $(curl -s --max-time 5 -H Metadata:true 'http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01' || echo unavailable)"
+          EOF
+          sudo tee /usr/local/bin/host-telemetry >/dev/null <<'EOF'
+          #!/usr/bin/env bash
+          vmstat -t 15 &
+          sudo journalctl --follow --priority=warning --no-pager &
+          while true; do
+            dump-host-state
+            sleep 15
+          done
+          EOF
+          sudo chmod +x /usr/local/bin/dump-host-state /usr/local/bin/host-telemetry
+          # First call to the scheduled-events endpoint can block ~2 min while
+          # Azure enables it for this VM; warm it up so later probes are fast.
+          curl -s --max-time 120 -H Metadata:true 'http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01' >/dev/null 2>&1 &
+
       - name: Build VM image + shared closure (parallel)
-        run: nix build -L --max-jobs auto .#qemu-vm
+        run: |
+          host-telemetry &
+          trap 'echo "=== STEP SIGNALLED at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="; dump-host-state; sudo dmesg | tail -n 100' INT TERM
+          nix build -L --max-jobs auto .#qemu-vm &
+          wait $!
 
       - name: Build checked QEMU result (VM tests one at a time)
-        run: nix build -L --max-jobs 1 .#qemu-plasma-result
+        run: |
+          host-telemetry &
+          trap 'echo "=== STEP SIGNALLED at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="; dump-host-state; sudo dmesg | tail -n 100' INT TERM
+          nix build -L --max-jobs 1 .#qemu-plasma-result &
+          wait $!
 
       - name: Upload VM artifacts
         uses: actions/upload-artifact@v7.0.1
@@ -94,7 +129,7 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
-          enable_kvm: false
+          enable_kvm: true
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
@@ -110,5 +145,36 @@ jobs:
           free -h
           df -h
 
+      - name: Set up host telemetry
+        run: |
+          # Telemetry streams into the step log because logs are delivered live;
+          # artifacts and if:always() steps are lost when the runner VM is killed.
+          sudo tee /usr/local/bin/dump-host-state >/dev/null <<'EOF'
+          #!/usr/bin/env bash
+          echo "=== HOST $(date -u '+%Y-%m-%dT%H:%M:%SZ') load=$(cut -d' ' -f1-3 /proc/loadavg)"
+          free -m
+          grep -H "" /proc/pressure/memory /proc/pressure/io /proc/pressure/cpu
+          df -h / /mnt | tail -n +2
+          ps aux --sort=-rss | head -n 5
+          echo "IMDS scheduled events: $(curl -s --max-time 5 -H Metadata:true 'http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01' || echo unavailable)"
+          EOF
+          sudo tee /usr/local/bin/host-telemetry >/dev/null <<'EOF'
+          #!/usr/bin/env bash
+          vmstat -t 15 &
+          sudo journalctl --follow --priority=warning --no-pager &
+          while true; do
+            dump-host-state
+            sleep 15
+          done
+          EOF
+          sudo chmod +x /usr/local/bin/dump-host-state /usr/local/bin/host-telemetry
+          # First call to the scheduled-events endpoint can block ~2 min while
+          # Azure enables it for this VM; warm it up so later probes are fast.
+          curl -s --max-time 120 -H Metadata:true 'http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01' >/dev/null 2>&1 &
+
       - name: Build Raspberry Pi 5 checks (aarch64 VM tests, real kernel)
-        run: nix build -L --max-jobs 1 .#rpi-all-tests
+        run: |
+          host-telemetry &
+          trap 'echo "=== STEP SIGNALLED at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="; dump-host-state; sudo dmesg | tail -n 100' INT TERM
+          nix build -L --max-jobs 1 .#rpi-all-tests &
+          wait $!
