@@ -6,7 +6,7 @@ MAX_JOBS := 2
 # so keep EVAL_JOBS * 2 GiB well under available RAM.
 EVAL_JOBS := 3
 
-.PHONY: all-tests test-results qemu-result update-flake run-tests run-rpi-tests run-checks
+.PHONY: all-tests test-results qemu-result update-flake run-tests run-rpi-tests run-checks export-rpi-kernel import-rpi-kernel
 
 all-tests: test-results
 
@@ -24,6 +24,28 @@ run-tests:
 
 run-rpi-tests:
 	$(MAKE) run-checks SYSTEM=aarch64-linux
+
+# CI: build the patched rpi kernel (the expensive part every rpi check reuses)
+# and pack its closure into a file:// binary cache for upload as a workflow
+# artifact. zstd instead of the default xz: the multi-hundred-MB kernel NAR
+# compresses much faster and the artifact gets zipped anyway.
+export-rpi-kernel:
+	$(NIX) build -L --max-jobs $(MAX_JOBS) --no-link "$(FLAKE)#packages.aarch64-linux.rpi-test-kernel"
+	rm -rf rpi-kernel-cache
+	$(NIX) copy --to "file://$(CURDIR)/rpi-kernel-cache?compression=zstd" "$(FLAKE)#packages.aarch64-linux.rpi-test-kernel"
+
+# Laptop: import a CI-built rpi kernel (the downloaded+unzipped rpi-kernel-cache
+# artifact) into the local store so run-rpi-tests skips the kernel compile.
+# Evaluates the kernel path locally first: if flake.lock or the kernel config
+# drifted from the CI run that produced the artifact, the copy fails with "path
+# not available" instead of silently importing a stale kernel. The artifact is
+# unsigned (CI has no signing key), hence --no-check-sigs via sudo.
+import-rpi-kernel:
+	@test -n "$(CACHE)" || { echo "usage: make import-rpi-kernel CACHE=path/to/rpi-kernel-cache" >&2; exit 1; }
+	set -euo pipefail; \
+	path=$$($(NIX) eval --raw "$(FLAKE)#packages.aarch64-linux.rpi-test-kernel.outPath"); \
+	echo "importing $$path"; \
+	sudo $(NIX) copy --no-check-sigs --from "file://$(abspath $(CACHE))" "$$path"
 
 # Evaluating all tests in one nix process peaks at ~15 GiB (each NixOS machine
 # eval costs 1-2 GiB and the Boehm-GC evaluator never returns heap to the OS),
