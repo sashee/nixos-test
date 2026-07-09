@@ -35,6 +35,7 @@
             system.stateVersion = stateVersion;
             common.autoUpgrade.enable = false;
             common.monitoring.enable = false;
+            common.irohSsh.enable = false;
           }
         ];
         user = "demo";
@@ -75,6 +76,9 @@
             common.locale.default = "hu_HU.UTF-8";
             common.autoUpgrade.enable = false;
             common.monitoring.enable = false;
+            # iroh SSH tunnel: enabled with a credential dir, but the key is
+            # provisioned live in the running VM, not baked into the image.
+            common.irohSsh.credentialDirectory = "/etc/credentials/iroh-ssh";
 
             virtualisation = {
               cores = 6;
@@ -103,6 +107,7 @@
           imports = [ commonDesktopModule ];
           common.autoUpgrade.enable = false;
           common.monitoring.enable = false;
+          common.irohSsh.enable = false;
         };
       };
 
@@ -222,6 +227,9 @@
       resticTest = import ./tests/restic.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
+      irohSshTest = import ./tests/iroh-ssh.nix {
+        inherit nixpkgs pkgs commonDesktopModule stateVersion dohStamps;
+      };
       monitoringAutoUpgradeTest = import ./tests/monitoring/auto-upgrade.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
@@ -259,6 +267,7 @@
         machineModule = { ... }: {
           imports = [ commonDesktopModule ];
           common.monitoring.enable = false;
+          common.irohSsh.enable = false;
         };
         keptAfterGc = 14;  # --delete-older-than 14d: ~14 days of history kept under daily GC
       };
@@ -271,6 +280,7 @@
         common-desktop = commonDesktopTest;
         doh = dohTest;
         doh-upstream = dohUpstreamTest;
+        iroh-ssh = irohSshTest;
         doh-captive = dohCaptiveTest;
         nm-captive-portal = nmCaptivePortalTest;
         nm-captive-portal-ipv6 = nmCaptivePortalIpv6Test;
@@ -355,12 +365,15 @@
       packages.${system} = {
         default = qemuPlasmaResult;
         all-test-results = allTestResults;
+        iroh-ssh = pkgs.callPackage ./packages/iroh-ssh/package.nix { };
         auto-upgrade-mocked-service-driver = autoUpgradeMockedServiceTest.driver;
         auto-upgrade-mocked-service-driver-interactive = autoUpgradeMockedServiceTest.driverInteractive;
         common-desktop-driver = commonDesktopTest.driver;
         common-desktop-driver-interactive = commonDesktopTest.driverInteractive;
         doh-driver = dohTest.driver;
         doh-driver-interactive = dohTest.driverInteractive;
+        iroh-ssh-driver = irohSshTest.driver;
+        iroh-ssh-driver-interactive = irohSshTest.driverInteractive;
         doh-upstream-driver = dohUpstreamTest.driver;
         doh-upstream-driver-interactive = dohUpstreamTest.driverInteractive;
         doh-captive-driver = dohCaptiveTest.driver;

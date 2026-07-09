@@ -49,6 +49,7 @@ nixpkgs.lib.nixos.runTest {
     boot.initrd.availableKernelModules = [ "rtc_cmos" ];
 
     common.autoUpgrade.enable = true;
+    common.irohSsh.enable = false;
     common.autoUpgrade.flake = "/etc/nixos#laptop";
 
     common.monitoring = {

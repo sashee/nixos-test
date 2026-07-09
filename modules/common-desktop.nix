@@ -9,6 +9,7 @@
     ./restic.nix
     ./auto-upgrade.nix
     ./monitoring.nix
+    ./iroh-ssh.nix
     ./fonts.nix
     ./development-base.nix
     ./nix-utils.nix

@@ -42,6 +42,7 @@ nixpkgs.lib.nixos.runTest {
 
     networking.hostName = "monitoring-client";
     common.autoUpgrade.enable = false;
+    common.irohSsh.enable = false;
 
     # Fabricate the deployed lock the report reads (default flakeLock.path). On real
     # hosts this is the git-tracked /etc/nixos/flake.lock; here we synthesize one.
