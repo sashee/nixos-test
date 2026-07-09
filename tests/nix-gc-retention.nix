@@ -54,6 +54,12 @@ nixpkgs.lib.nixos.runTest {
     # Let any boot-time (Persistent catch-up) GC run settle before we start.
     machine.wait_until_succeeds("systemctl show nix-gc.service -p ActiveState --value | grep -Fqx inactive")
 
+    # The VM's store image ships with many paths unreferenced by the runtime closure
+    # (build-time deps). Drain that bulk garbage once, with a generous timeout, before
+    # the day loop: under TCG this initial sweep alone can exceed the per-day timeout,
+    # which is sized for the incremental one-generation-aged-out runs below.
+    machine.succeed("systemctl start nix-gc.service", timeout=900)
+
     # 20 days of use: create a generation, advance one day so nix-gc.timer fires, then
     # wait for that GC run to complete before the next day. GC never overlaps staging.
     for i in range(1, 21):
