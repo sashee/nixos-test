@@ -209,23 +209,42 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("systemctl cat restic-backups-test.service | grep -F 'LoadCredentialEncrypted=repository-password:/etc/credentials/restic/test/repository-password'")
     client.succeed("systemctl show restic-backups-test.timer -p Persistent --value | grep -F yes")
 
+    def quiesce_monitoring():
+        # Pause the timer and drain any in-flight run before touching the platform log, so a
+        # reset can't straddle a run (its /start pre-reset, its body post-reset) and so the next
+        # clock warp can't spawn systemd's immediate catch-up run: a *running* OnCalendar timer
+        # fires once right away on a forward jump, on top of the next-boundary run -- two runs
+        # per warp, which corrupted the exact-events asserts under slow (KVM-less) emulation.
+        client.succeed("systemctl stop common-monitoring.timer")
+        # oneshot: while running it is "activating" (is-active is unreliable); wait for a settled state.
+        client.wait_until_succeeds(
+            "systemctl show common-monitoring.service -p ActiveState --value | grep -qxE 'inactive|failed'"
+        )
+
+    def arm_monitoring():
+        # Start the timer only AFTER the clock warp. Arming a timer whose OnCalendar already elapsed
+        # fires one run immediately; since we landed clear of :00/:30, the next scheduled boundary is
+        # ~15 min out (never reached in a phase), so exactly that one run fires.
+        client.succeed("systemctl start common-monitoring.timer")
+
     def reset_platform():
+        quiesce_monitoring()
         platform.succeed("rm -f /var/lib/monitoring-platform/events.log /var/lib/monitoring-platform/bodies.log")
 
     def assert_events(expected):
         events = platform.succeed("cat /var/lib/monitoring-platform/events.log").strip().splitlines()
         assert events == expected, f"unexpected events: {events}"
 
-    # Advance the client ~one day forward, landing 15 s before a :30 boundary. The Persistent
+    # Advance the client ~one day forward, landing clear of any :00/:30 boundary. The Persistent
     # daily timers (restic 1h, upgrade 2h randomized-delay) are overdue after the midnight
     # crossing and, since 05:29 is past their delay windows, catch up and fire promptly. But
     # common-monitoring.timer is now OnCalendar=*:0/30 with Persistent=no: a non-persistent
-    # calendar timer is re-armed for the next boundary strictly after the new wall clock on a
-    # clock jump -- it does NOT replay a :30 the jump skipped (that is what Persistent= does).
-    # So we land just before a :30 and let the real clock cross it seconds later; the timer
-    # then fires on its own, once per cycle, keeping the exact-events asserts below valid.
+    # calendar timer, if left running across the jump, ALSO fires an immediate catch-up run on top
+    # of the boundary run. So we pause it across every warp (quiesce_monitoring) and arm it just
+    # after (arm_monitoring), making exactly one run fire per cycle -- keeping the asserts valid.
     def next_day():
-        client.succeed("date -s \"$(date -d 'tomorrow 05:29:45')\"")
+        client.succeed("date -s \"$(date -d 'tomorrow 05:15:00')\"")
+        arm_monitoring()
 
     upgrade_marker = "/var/lib/common-monitoring/nixos-upgrade.service.last-success"
     restic_marker = "/var/lib/common-monitoring/restic-backups-test.service.last-success"
@@ -272,12 +291,13 @@ nixpkgs.lib.nixos.runTest {
 
     # FAIL run: break both success sources (mock upgrade now fails; REST backend down),
     # then jump 15 days so both markers age past maxAge (14d) with no new success recorded.
-    # Land 15 s before a :30 (same reason as next_day) so common-monitoring fires on its own;
+    # Land clear of :00/:30 (same reason as next_day) so arming fires exactly one run;
     # 15 days minus 15 s is still > 14d, so both markers read as stale.
     client.succeed("printf '%s' fail > /run/upgrade-status")
     platform.succeed("systemctl stop restic-rest-auth.socket restic-rest-auth.service")
     reset_platform()
-    client.succeed("date -s \"$(date -d '+15 days' +%Y-%m-%d) 05:29:45\"")
+    client.succeed("date -s \"$(date -d '+15 days' +%Y-%m-%d) 05:15:00\"")
+    arm_monitoring()
     platform.wait_until_succeeds("grep -Fxq 'POST /health/fail' /var/lib/monitoring-platform/events.log", timeout=600)
     assert_events(["POST /health/start", "POST /health/log", "POST /health/fail"])
     platform.succeed("grep -F '[FAIL] auto-upgrade: nixos-upgrade.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")

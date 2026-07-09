@@ -346,6 +346,11 @@
       checks.${system} = testResults;
       checks.aarch64-linux = aarch64TestResults;
       packages.aarch64-linux.rpi-all-tests = rpiAllTests;
+      # The exact patched kernel every rpi check boots (rpiTestKernel pins the
+      # node to this package, so the outPath matches the checks). CI exports its
+      # closure as the rpi-kernel-cache artifact; `make import-rpi-kernel` loads
+      # it into a laptop's store so local rpi test runs skip the kernel compile.
+      packages.aarch64-linux.rpi-test-kernel = rpi5Base.config.boot.kernelPackages.kernel;
 
       packages.${system} = {
         default = qemuPlasmaResult;

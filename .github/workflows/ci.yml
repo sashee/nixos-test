@@ -112,6 +112,20 @@ jobs:
           free -h
           df -h
 
+      - name: Build + export rpi kernel
+        # The kernel is the ~1-2h part and every rpi check reuses it, so build
+        # it first: a later test failure still yields the kernel artifact.
+        run: make export-rpi-kernel MAX_JOBS=1
+
+      - name: Upload rpi kernel cache
+        # Downloadable file:// binary cache of the patched rpi kernel closure.
+        # Import on a dev machine with `make import-rpi-kernel CACHE=...` to run
+        # the rpi checks locally without the emulated kernel compile.
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: rpi-kernel-cache
+          path: rpi-kernel-cache
+
       - name: Build Raspberry Pi 5 checks (aarch64 VM tests, real kernel)
         # Per-check eval so the evaluator's heap stays bounded; building the
         # .#rpi-all-tests aggregate would force one big whole-flake eval.

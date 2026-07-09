@@ -367,6 +367,34 @@ If QEMU complains about KVM permissions, either add your host user to the `kvm` 
 QEMU_OPTS="-accel tcg" ./result/bin/run-nixos-qemu-vm
 ```
 
+## Running the rpi tests locally
+
+The aarch64 checks boot the exact patched rpi kernel, which is in no binary
+cache — built from scratch it takes hours under emulation. CI builds it on the
+native arm64 runner and uploads its closure as the `rpi-kernel-cache` artifact,
+so a laptop can import it instead of compiling:
+
+```bash
+# once per flake.lock / kernel-config change:
+gh run download --name rpi-kernel-cache --dir rpi-kernel-cache
+make import-rpi-kernel CACHE=rpi-kernel-cache
+
+make run-rpi-tests
+```
+
+`import-rpi-kernel` first evaluates the kernel path locally, so it fails
+loudly if the artifact was produced from a different flake.lock or kernel
+config instead of importing a stale kernel. The host also needs to be able to
+build the remaining (cheap) aarch64 derivations, e.g. on NixOS:
+
+```nix
+boot.binfmt.emulatedSystems = [ "aarch64-linux" ];
+```
+
+Note the checks use aarch64 `hostPkgs`, so the test driver and QEMU themselves
+run under binfmt user emulation on x86 — correct but slow; expect much longer
+runtimes than CI's native arm64 runner.
+
 ## Verified Result
 
 Build the combined result with live logs:
