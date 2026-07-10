@@ -74,7 +74,7 @@ nixpkgs.lib.nixos.runTest {
     for i in range(1, 21):
         add_generation(i)
         prev = gc_invocation()
-        machine.succeed("date -s '+1 day'")   # crosses 03:15 -> wakes the Persistent nix-gc.timer
+        machine.succeed("date -s '+1 day'")   # crosses all of the day's gc slots -> one coalesced Persistent nix-gc.timer firing
         machine.wait_until_succeeds(
             f'id=$(systemctl show nix-gc.service -p InvocationID --value); '
             f'[ "$id" != "{prev}" ] && '
