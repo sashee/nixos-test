@@ -79,15 +79,10 @@ nixpkgs.lib.nixos.runTest {
     doh_ipv6 = json.loads("""${dohIpv6Json}""")
     doh_domains = json.loads("""${dohDomainsJson}""")
 
-    def by_hostname(hostname):
-        for node in machines:
-            if node.succeed("hostname").strip() == hostname:
-                return node
-        raise Exception(f"No machine with hostname {hostname}")
-
-    dns_peer = by_hostname("doh-upstream-peer")
-    ipv4_client = by_hostname("doh-upstream-ipv4")
-    ipv6_client = by_hostname("doh-upstream-ipv6")
+    # Node-name symbols exposed by the driver; binding them starts nothing.
+    dns_peer = dnsPeer
+    ipv4_client = ipv4Client
+    ipv6_client = ipv6Client
 
     dns_peer.start()
     dns_peer.wait_for_unit("multi-user.target")
@@ -104,21 +99,6 @@ nixpkgs.lib.nixos.runTest {
 
     peer_ipv4 = dns_peer.succeed("${pkgs.python3}/bin/python3 -c 'import json, subprocess; data = json.loads(subprocess.check_output([\"${pkgs.iproute2}/bin/ip\", \"-j\", \"-4\", \"addr\", \"show\", \"dev\", \"eth1\"])); print(data[0][\"addr_info\"][0][\"local\"])'").strip()
     peer_ipv6 = dns_peer.succeed("${pkgs.python3}/bin/python3 -c 'import json, subprocess; data = json.loads(subprocess.check_output([\"${pkgs.iproute2}/bin/ip\", \"-j\", \"-6\", \"addr\", \"show\", \"dev\", \"eth1\"])); print(next(addr[\"local\"] for addr in data[0][\"addr_info\"] if addr[\"scope\"] == \"global\" and addr[\"local\"].startswith(\"2001:db8:1:\")))'").strip()
-
-    for client in [ipv4_client, ipv6_client]:
-        client.start()
-        client.wait_for_unit("multi-user.target")
-        client.succeed("systemctl is-active dnscrypt-proxy.service")
-        client.succeed("systemctl is-active nftables.service")
-        client.succeed("${pkgs.nftables}/bin/nft list table inet common-doh-egress")
-
-    ipv4_client.succeed(f"${pkgs.iproute2}/bin/ip -4 route replace default via {peer_ipv4}")
-    ipv6_client.succeed("${pkgs.iproute2}/bin/ip -6 route del default || true")
-    ipv6_client.succeed(f"${pkgs.iproute2}/bin/ip -6 route add default via {peer_ipv6} dev eth1 metric 42")
-    for address in doh_ipv6:
-        ipv4_client.succeed(f"${pkgs.iproute2}/bin/ip -6 route replace unreachable {address}/128")
-    for address in doh_ipv4:
-        ipv6_client.succeed(f"${pkgs.iproute2}/bin/ip route replace unreachable {address}/32")
 
     def check_request(path, family, question, qtype):
         request = json.loads(dns_peer.succeed(f"cat {path}"))
@@ -176,14 +156,40 @@ nixpkgs.lib.nixos.runTest {
         print_peer_diagnostics()
         raise Exception(f"{label} did not resolve {question} to {expected}")
 
+    # Bring up the heavy (Plasma) clients ONE AT A TIME, shutting each down before
+    # the next boots: booting both full desktops at once starved a client's initrd
+    # store mount past its timeout on the small CI runner (kernel panic). dns_peer
+    # (light, no desktop) stays up throughout for the fake DoH + request checks.
+
+    # IPv4 client: force the v4 DoH path (v6 upstreams unreachable).
+    ipv4_client.start()
+    ipv4_client.wait_for_unit("multi-user.target")
+    ipv4_client.succeed("systemctl is-active dnscrypt-proxy.service")
+    ipv4_client.succeed("systemctl is-active nftables.service")
+    ipv4_client.succeed("${pkgs.nftables}/bin/nft list table inet common-doh-egress")
+    ipv4_client.succeed(f"${pkgs.iproute2}/bin/ip -4 route replace default via {peer_ipv4}")
+    for address in doh_ipv6:
+        ipv4_client.succeed(f"${pkgs.iproute2}/bin/ip -6 route replace unreachable {address}/128")
     ipv4_client.succeed("systemctl restart dnscrypt-proxy.service")
     wait_for_answer(ipv4_client, "doh-upstream-ipv4", "127.0.0.1", "ipv4.upstream-test.example", "A", "203.0.113.5")
     dns_peer.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-requests/ipv4_upstream-test_example-1.json; do sleep 0.2; done'")
     check_request("/tmp/fake-doh-requests/ipv4_upstream-test_example-1.json", "ipv4", "ipv4.upstream-test.example", 1)
+    ipv4_client.shutdown()
 
+    # IPv6 client: force the v6 DoH path (v4 upstreams unreachable).
+    ipv6_client.start()
+    ipv6_client.wait_for_unit("multi-user.target")
+    ipv6_client.succeed("systemctl is-active dnscrypt-proxy.service")
+    ipv6_client.succeed("systemctl is-active nftables.service")
+    ipv6_client.succeed("${pkgs.nftables}/bin/nft list table inet common-doh-egress")
+    ipv6_client.succeed("${pkgs.iproute2}/bin/ip -6 route del default || true")
+    ipv6_client.succeed(f"${pkgs.iproute2}/bin/ip -6 route add default via {peer_ipv6} dev eth1 metric 42")
+    for address in doh_ipv4:
+        ipv6_client.succeed(f"${pkgs.iproute2}/bin/ip route replace unreachable {address}/32")
     ipv6_client.succeed("systemctl restart dnscrypt-proxy.service")
     wait_for_answer(ipv6_client, "doh-upstream-ipv6", "::1", "ipv6.upstream-test.example", "AAAA", "2001:db8::5")
     dns_peer.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-requests/ipv6_upstream-test_example-28.json; do sleep 0.2; done'")
     check_request("/tmp/fake-doh-requests/ipv6_upstream-test_example-28.json", "ipv6", "ipv6.upstream-test.example", 28)
+    ipv6_client.shutdown()
   '';
 }
