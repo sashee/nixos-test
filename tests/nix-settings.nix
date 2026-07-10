@@ -22,5 +22,6 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("systemctl is-active nix-gc.timer")
     machine.succeed("systemctl show nix-gc.service -p ExecStart --value | grep -o '/nix/store/[^ ;]*' | xargs grep -F -- '${gcOptions}'")
     machine.succeed("nix config show | grep -F 'auto-optimise-store = true'")
+    machine.succeed("nix config show | grep -F 'fsync-store-paths = true'")
   '';
 }
