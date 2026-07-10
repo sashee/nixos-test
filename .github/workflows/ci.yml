@@ -130,3 +130,25 @@ jobs:
         # Per-check eval so the evaluator's heap stays bounded; building the
         # .#rpi-all-tests aggregate would force one big whole-flake eval.
         run: make run-rpi-tests MAX_JOBS=1
+
+  automerge:
+    # DIY auto-merge: main has no branch protection (so update-flake.yml can
+    # push to it with the plain GITHUB_TOKEN), which also disables GitHub's
+    # native auto-merge. `needs` gives the same semantics: this job only runs
+    # when both checks passed. Draft = "don't auto-merge yet". Owner-only so
+    # fork PRs (read-only token anyway) are never merged unreviewed.
+    needs: [full-build, rpi]
+    if: >
+      github.event_name == 'pull_request' &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.user.login == github.repository_owner
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Merge PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge ${{ github.event.pull_request.number }} --rebase --repo ${{ github.repository }}
