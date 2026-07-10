@@ -74,9 +74,6 @@ in
   # outbound connection, so no inbound port is needed. Secret provisioned out-of-band:
   #   iroh-ssh-generate-secret | systemd-creds encrypt --name=iroh-secret - /etc/credentials/iroh-ssh/iroh-secret
   common.irohSsh.credentialDirectory = "/etc/credentials/iroh-ssh";
-  # TRANSITION: keep LAN ssh reachable until the tunnel is verified end-to-end.
-  # Remove this override to fall back to the module default (port 22 closed).
-  services.openssh.openFirewall = true;
   services.openssh.enable = true;
   # nix-utils runs git/ssh in a bubblewrap userns where root-owned store files
   # appear as 'nobody', so OpenSSH rejects the Include'd systemd-ssh-proxy config
