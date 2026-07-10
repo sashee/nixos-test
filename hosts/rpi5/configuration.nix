@@ -44,6 +44,12 @@ in
   # generation on GC (laptops keep 14 days to roll back from the boot menu).
   common.nixSettings.gcOptions = "--delete-old";
 
+  # GC twice a day: the nightly upgrade (starts 00:00-02:00) can run past the default
+  # 03:15 slot (a nixpkgs-bump kernel rebuild took until ~05:20), which would leave the
+  # old generation + build deps (GBs) on the SD until the *next* night -- overlapping
+  # the next upgrade's download. The 15:15 pass clears them the same afternoon.
+  nix.gc.dates = "*-*-* 03,15:15:00";
+
   # Health checks every 30 minutes (disk-space, generations, auto-upgrade). smart disabled (SD
   # card has no SMART); restic auto-skips with no backups. Reporting posts to a
   # Healthchecks URL read from a systemd-creds-encrypted file (LoadCredentialEncrypted);
