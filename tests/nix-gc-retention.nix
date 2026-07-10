@@ -17,7 +17,7 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
   globalTimeout = 1800;
 
-  nodes.machine = { lib, ... }: {
+  nodes.machine = { lib, config, ... }: {
     imports = [ machineModule ];
 
     networking.hostName = "nix-gc-retention";
@@ -29,6 +29,15 @@ nixpkgs.lib.nixos.runTest {
     # runs once a day. Lift systemd's start rate limit so the rapid re-triggers don't
     # trip 'start-limit-hit'. Does not change what the GC does.
     systemd.services.nix-gc.startLimitIntervalSec = lib.mkForce 0;
+
+    # Bound the store-sweep phase. The VM 9p-mounts the whole host /nix/store, so a
+    # full collection scales with the developer's store size and can exceed the
+    # timeout on large stores. Appending --max-freed caps the sweep to ~one path;
+    # the host's real gc options (config.nix.gc.options) still run first and prune
+    # generations in full, so retention counts are unaffected -- only the (here
+    # irrelevant) bulk deletion is short-circuited.
+    systemd.services.nix-gc.script =
+      lib.mkForce "exec ${config.nix.package.out}/bin/nix-collect-garbage ${config.nix.gc.options} --max-freed 1";
 
     system.stateVersion = stateVersion;
   };
