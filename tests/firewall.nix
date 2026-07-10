@@ -1,28 +1,30 @@
-{ nixpkgs, pkgs, commonDesktopModule, stateVersion }:
+{ nixpkgs, pkgs, machineModule, stateVersion }:
 
 nixpkgs.lib.nixos.runTest {
   name = "firewall";
   hostPkgs = pkgs;
   skipTypeCheck = true;
 
-  nodes.machine = { pkgs, ... }: {
-    imports = [ commonDesktopModule ];
+  # mkForce on the common.* toggles: the rpi host config enables them at
+  # normal priority (the laptop module only defaults them).
+  nodes.machine = { pkgs, lib, ... }: {
+    imports = [ machineModule ];
 
     networking.hostName = "firewall-test";
-    common.autoUpgrade.enable = false;
-    common.monitoring.enable = false;
-    common.irohSsh.enable = false;
+    common.autoUpgrade.enable = lib.mkForce false;
+    common.monitoring.enable = lib.mkForce false;
+    common.irohSsh.enable = lib.mkForce false;
     system.stateVersion = stateVersion;
   };
 
-  nodes.unfiltered = { pkgs, ... }: {
-    imports = [ commonDesktopModule ];
+  nodes.unfiltered = { pkgs, lib, ... }: {
+    imports = [ machineModule ];
 
     common = {
-      autoUpgrade.enable = false;
-      monitoring.enable = false;
-      irohSsh.enable = false;
-      firewall.enable = false;
+      autoUpgrade.enable = lib.mkForce false;
+      monitoring.enable = lib.mkForce false;
+      irohSsh.enable = lib.mkForce false;
+      firewall.enable = lib.mkForce false;
     };
     networking = {
       firewall.enable = false;

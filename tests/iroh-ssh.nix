@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, commonDesktopModule, stateVersion, dohStamps }:
+{ nixpkgs, pkgs, machineModule, stateVersion, dohStamps }:
 
 let
   irohSsh = pkgs.callPackage ../packages/iroh-ssh/package.nix { };
@@ -53,7 +53,9 @@ nixpkgs.lib.nixos.runTest {
   name = "iroh-ssh";
   hostPkgs = pkgs;
   skipTypeCheck = true;
-  globalTimeout = 600;
+  # Ceiling, not a wait: the rpi variant runs under TCG emulation on the
+  # KVM-less aarch64 CI runner and needs the room (4 nodes).
+  globalTimeout = 2400;
 
   # The DoH interceptor: hijacks the DoH upstream IPs and answers the relay
   # hostnames with the relay node's address. Binds 0.0.0.0:443, so it lives on
@@ -63,6 +65,9 @@ nixpkgs.lib.nixos.runTest {
       hostName = "dohpeer";
       firewall.enable = false;
     };
+
+    # Helper node, tiny workload: keep the 4-node test within the 4 GB Pi.
+    virtualisation.memorySize = 512;
 
     # Assigns the DoH provider IPs and answers the relay hostnames with the
     # relay node's IP (passed as the server's argv).
@@ -77,6 +82,9 @@ nixpkgs.lib.nixos.runTest {
   nodes.relay = { ... }: {
     networking.hostName = "relay";
 
+    # Helper node, tiny workload: keep the 4-node test within the 4 GB Pi.
+    virtualisation.memorySize = 512;
+
     networking.firewall.allowedTCPPorts = [ 443 ];
     systemd.services.iroh-relay = {
       description = "iroh relay impersonating the n0 relays";
@@ -88,28 +96,29 @@ nixpkgs.lib.nixos.runTest {
     system.stateVersion = stateVersion;
   };
 
-  # The machine under test: the real laptop module, unmodified except for the
-  # required credential dir and trusting the test CA. Default-deny firewall ON.
-  nodes.server = { ... }: {
-    imports = [ commonDesktopModule trustTestCa ];
+  # The machine under test: the real host module (laptop or rpi), unmodified
+  # except for the required credential dir and trusting the test CA.
+  # Default-deny firewall ON. mkForce: the rpi config enables auto-upgrade.
+  nodes.server = { lib, ... }: {
+    imports = [ machineModule trustTestCa ];
 
     networking.hostName = "iroh-server";
-    common.autoUpgrade.enable = false;
-    common.monitoring.enable = false;
+    common.autoUpgrade.enable = lib.mkForce false;
+    common.monitoring.enable = lib.mkForce false;
     common.irohSsh.credentialDirectory = "/etc/credentials/iroh-ssh";
 
     system.stateVersion = stateVersion;
   };
 
-  # The connecting machine: also stock laptop config (so it resolves and dials
+  # The connecting machine: the same stock config (so it resolves and dials
   # the relay through the same real path), plus the iroh-ssh client.
-  nodes.client = { ... }: {
-    imports = [ commonDesktopModule trustTestCa ];
+  nodes.client = { lib, ... }: {
+    imports = [ machineModule trustTestCa ];
 
     networking.hostName = "iroh-client";
-    common.autoUpgrade.enable = false;
-    common.monitoring.enable = false;
-    common.irohSsh.enable = false;
+    common.autoUpgrade.enable = lib.mkForce false;
+    common.monitoring.enable = lib.mkForce false;
+    common.irohSsh.enable = lib.mkForce false;
     environment.systemPackages = [ irohSsh ];
 
     system.stateVersion = stateVersion;
