@@ -21,6 +21,10 @@ in
     ../../modules/monitoring.nix
     ../../modules/connectivity-fallback.nix
     ../../modules/iroh-ssh.nix
+    # Same default-deny inbound firewall as the laptops (nftables backend,
+    # allowPing=false + ICMP echo-drop pre-table). The iroh tunnel and the
+    # wlan0 setup-portal interface rules are unaffected.
+    ../../modules/firewall.nix
   ];
 
   # Daily boot-generation auto-upgrade: pulls the latest `common` from the host

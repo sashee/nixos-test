@@ -99,7 +99,8 @@
         inherit nixpkgs pkgs commonDesktopModule qemuDemoUserModule stateVersion;
       };
       firewallTest = import ./tests/firewall.nix {
-        inherit nixpkgs pkgs commonDesktopModule stateVersion;
+        inherit nixpkgs pkgs stateVersion;
+        machineModule = commonDesktopModule;
       };
       dohTest = import ./tests/doh.nix {
         inherit nixpkgs pkgs stateVersion;
@@ -187,6 +188,19 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         moduleUnderTest = ./modules/connectivity-fallback.nix;
       };
+      firewallTestRpi = import ./tests/firewall.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+      };
+      irohSshTestRpi = import ./tests/iroh-ssh.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+        inherit dohStamps;
+      };
       # Nix only exposes /dev/kvm in the sandbox based on the daemon's system-features
       # (auto-set from the host's /dev/kvm), NOT a derivation's requiredSystemFeatures.
       # So dropping the kvm *requirement* lets tests schedule on KVM-less builders (the
@@ -207,6 +221,8 @@
         monitoring = monitoringTestRpi;
         connectivity-fallback = connectivityFallbackTestRpi;
         monitoring-nix-gc = monitoringNixGcTestRpi;
+        firewall = firewallTestRpi;
+        iroh-ssh = irohSshTestRpi;
       };
       rpiAllTests = pkgsRpi.runCommand "rpi-all-tests" { } ''
         mkdir -p $out
@@ -228,7 +244,8 @@
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
       };
       irohSshTest = import ./tests/iroh-ssh.nix {
-        inherit nixpkgs pkgs commonDesktopModule stateVersion dohStamps;
+        inherit nixpkgs pkgs stateVersion dohStamps;
+        machineModule = commonDesktopModule;
       };
       monitoringAutoUpgradeTest = import ./tests/monitoring/auto-upgrade.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion;
