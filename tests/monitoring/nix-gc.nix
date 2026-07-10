@@ -13,6 +13,13 @@ nixpkgs.lib.nixos.runTest {
     imports = [ ../../modules/monitoring.nix ../../modules/restic.nix ];
 
     nix.gc.automatic = true;
+    # nix-gc.service runs `nix-collect-garbage <options>`. In a VM test the guest
+    # sees the host's whole /nix/store over 9p, so an unbounded collection sweeps
+    # the entire host store (minutes, host-size-dependent -> flaky timeout). This
+    # check only needs a GC to succeed once and record its marker, so cap the
+    # work: stop after freeing a trivial amount. It still exits 0 and fires
+    # OnSuccess, so all three subtests behave the same, just fast.
+    nix.gc.options = "--max-freed 1";
 
     common.monitoring = {
       enable = true;
