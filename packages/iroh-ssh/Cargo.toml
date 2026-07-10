@@ -1,0 +1,35 @@
+[package]
+name = "iroh-ssh"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Expose the local sshd over an iroh endpoint; wire-compatible with dumbpipe"
+
+[dependencies]
+iroh = { version = "1.0.0", default-features = false, features = ["tls-ring", "platform-verifier"] }
+iroh-tickets = "1.0.0"
+n0-error = "1.0.0"
+noq = "1.0.0"
+tokio = { version = "1.34", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
+tokio-util = "0.7"
+
+[lib]
+name = "iroh_ssh"
+path = "src/lib.rs"
+
+[[bin]]
+name = "iroh-ssh-listen"
+path = "src/bin/iroh-ssh-listen.rs"
+
+[[bin]]
+name = "iroh-ssh-connect"
+path = "src/bin/iroh-ssh-connect.rs"
+
+[[bin]]
+name = "iroh-ssh-generate-secret"
+path = "src/bin/iroh-ssh-generate-secret.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

@@ -15,6 +15,7 @@ nixpkgs.lib.nixos.runTest {
 
     networking.hostName = "monitoring-client";
     common.autoUpgrade.enable = false;
+    common.irohSsh.enable = false;
 
     common.monitoring = {
       enable = true;

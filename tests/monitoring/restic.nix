@@ -16,6 +16,7 @@ let
     networking.hostName = name;
     boot.initrd.availableKernelModules = [ "rtc_cmos" ];
     common.autoUpgrade.enable = false;
+    common.irohSsh.enable = false;
 
     users.users.backup-user = {
       isNormalUser = true;

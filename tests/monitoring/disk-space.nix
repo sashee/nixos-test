@@ -15,6 +15,7 @@ nixpkgs.lib.nixos.runTest {
 
     networking.hostName = "monitoring-client";
     common.autoUpgrade.enable = false;
+    common.irohSsh.enable = false;
     boot.kernelModules = [ "loop" ];
     environment.systemPackages = [ pkgs.e2fsprogs ];
 

@@ -58,3 +58,12 @@
 ## Dotfiles
 
 * available to the user's path
+
+## Iroh SSH
+
+* SSH is listening on port 22
+* firewall denies incoming connections on port 22
+* iroh-based port forwarding exposes port 22, allowing ssh access via iroh
+* it requires the secret key that is loaded using an encrypted credential
+* if the credential is not provided, the service is not started
+* the service auto-restarts
