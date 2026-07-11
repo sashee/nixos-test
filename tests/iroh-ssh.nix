@@ -137,9 +137,15 @@ nixpkgs.lib.nixos.runTest {
     relay.wait_for_unit("iroh-relay.service")
 
     def vlan_ip(node):
-        return node.succeed(
+        # eth1's static address is assigned by network-addresses-eth1.service,
+        # which under slow TCG boots can land seconds after the units we wait
+        # for; retry until it appears. grep . turns empty jq output (exit 0)
+        # into a failure so a missing address can't leak out as "".
+        return node.wait_until_succeeds(
             "${pkgs.iproute2}/bin/ip -j -4 addr show dev eth1 "
-            "| ${pkgs.jq}/bin/jq -r '.[0].addr_info[] | select(.prefixlen==24) | .local'"
+            "| ${pkgs.jq}/bin/jq -r '.[0].addr_info[] | select(.prefixlen==24) | .local' "
+            "| ${pkgs.gnugrep}/bin/grep .",
+            timeout=120,
         ).strip()
 
     dohpeer_ip = vlan_ip(dohpeer)
