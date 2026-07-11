@@ -59,18 +59,18 @@ nixpkgs.lib.nixos.runTest {
 
     machine.succeed("systemd-run --unit blocked-http-server ${pkgs.python3}/bin/python3 -m http.server 18080 --bind 0.0.0.0 --directory /tmp")
     machine.wait_for_unit("blocked-http-server.service")
-    machine.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until ${pkgs.curl}/bin/curl --fail --max-time 3 http://127.0.0.1:18080/; do sleep 0.2; done'")
+    machine.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until ${pkgs.curl}/bin/curl --fail --max-time 3 http://127.0.0.1:18080/; do sleep 0.2; done'")
     unfiltered.fail("${pkgs.curl}/bin/curl --fail --connect-timeout 2 --max-time 3 http://firewall-test:18080/")
 
     unfiltered.succeed("systemd-run --unit unfiltered-http-server ${pkgs.python3}/bin/python3 -m http.server 18080 --bind 0.0.0.0 --directory /tmp")
     unfiltered.wait_for_unit("unfiltered-http-server.service")
-    unfiltered.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until ${pkgs.curl}/bin/curl --fail --max-time 3 http://127.0.0.1:18080/; do sleep 0.2; done'")
-    machine.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until ${pkgs.curl}/bin/curl --fail --max-time 3 http://firewall-disabled:18080/; do sleep 0.2; done'")
+    unfiltered.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until ${pkgs.curl}/bin/curl --fail --max-time 3 http://127.0.0.1:18080/; do sleep 0.2; done'")
+    machine.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until ${pkgs.curl}/bin/curl --fail --max-time 3 http://firewall-disabled:18080/; do sleep 0.2; done'")
 
     machine.succeed("rm -f /tmp/inbound-udp-ready /tmp/inbound-udp-received")
     machine.succeed("systemd-run --unit blocked-udp-server ${pkgs.python3}/bin/python3 -c \"import pathlib,socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('0.0.0.0', 18082)); pathlib.Path('/tmp/inbound-udp-ready').touch(); data, _ = s.recvfrom(4096); pathlib.Path('/tmp/inbound-udp-received').write_bytes(data)\"")
     machine.wait_for_unit("blocked-udp-server.service")
-    machine.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/inbound-udp-ready; do sleep 0.2; done'")
+    machine.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/inbound-udp-ready; do sleep 0.2; done'")
     unfiltered.succeed("${pkgs.python3}/bin/python3 -c \"import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1); s.sendto(b'blocked', ('firewall-test', 18082))\"")
     machine.succeed("sleep 2")
     machine.fail("test -e /tmp/inbound-udp-received")
@@ -78,9 +78,9 @@ nixpkgs.lib.nixos.runTest {
     unfiltered.succeed("rm -f /tmp/unfiltered-udp-ready /tmp/unfiltered-udp-received")
     unfiltered.succeed("systemd-run --unit unfiltered-udp-server ${pkgs.python3}/bin/python3 -c \"import pathlib,socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('0.0.0.0', 18082)); pathlib.Path('/tmp/unfiltered-udp-ready').touch(); data, _ = s.recvfrom(4096); pathlib.Path('/tmp/unfiltered-udp-received').write_bytes(data)\"")
     unfiltered.wait_for_unit("unfiltered-udp-server.service")
-    unfiltered.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/unfiltered-udp-ready; do sleep 0.2; done'")
+    unfiltered.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/unfiltered-udp-ready; do sleep 0.2; done'")
     machine.succeed("${pkgs.python3}/bin/python3 -c \"import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1); s.sendto(b'unfiltered', ('firewall-disabled', 18082))\"")
-    unfiltered.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/unfiltered-udp-received; do sleep 0.2; done'")
+    unfiltered.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/unfiltered-udp-received; do sleep 0.2; done'")
 
     unfiltered.fail("${pkgs.iputils}/bin/ping -4 -c 1 -W 2 firewall-test")
     unfiltered.fail("${pkgs.iputils}/bin/ping -6 -c 1 -W 2 firewall-test")
@@ -98,20 +98,20 @@ nixpkgs.lib.nixos.runTest {
     # Inbound IPv6 HTTP to the firewalled host is blocked; locally it serves.
     machine.succeed("systemd-run --unit blocked-http6-server ${pkgs.python3}/bin/python3 -m http.server 18084 --bind :: --directory /tmp")
     machine.wait_for_unit("blocked-http6-server.service")
-    machine.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until ${pkgs.curl}/bin/curl --fail --max-time 3 http://[::1]:18084/; do sleep 0.2; done'")
+    machine.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until ${pkgs.curl}/bin/curl --fail --max-time 3 http://[::1]:18084/; do sleep 0.2; done'")
     unfiltered.fail("${pkgs.curl}/bin/curl --fail --connect-timeout 2 --max-time 3 http://[fc00::1]:18084/")
 
     # The unfiltered host accepts inbound IPv6 HTTP.
     unfiltered.succeed("systemd-run --unit unfiltered-http6-server ${pkgs.python3}/bin/python3 -m http.server 18084 --bind :: --directory /tmp")
     unfiltered.wait_for_unit("unfiltered-http6-server.service")
-    unfiltered.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until ${pkgs.curl}/bin/curl --fail --max-time 3 http://[::1]:18084/; do sleep 0.2; done'")
-    machine.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until ${pkgs.curl}/bin/curl --fail --max-time 3 http://[fc00::2]:18084/; do sleep 0.2; done'")
+    unfiltered.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until ${pkgs.curl}/bin/curl --fail --max-time 3 http://[::1]:18084/; do sleep 0.2; done'")
+    machine.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until ${pkgs.curl}/bin/curl --fail --max-time 3 http://[fc00::2]:18084/; do sleep 0.2; done'")
 
     # Inbound IPv6 UDP to the firewalled host is blocked.
     machine.succeed("rm -f /tmp/inbound-udp6-ready /tmp/inbound-udp6-received")
     machine.succeed("systemd-run --unit blocked-udp6-server ${pkgs.python3}/bin/python3 -c \"import pathlib,socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(('::', 18086)); pathlib.Path('/tmp/inbound-udp6-ready').touch(); data, _ = s.recvfrom(4096); pathlib.Path('/tmp/inbound-udp6-received').write_bytes(data)\"")
     machine.wait_for_unit("blocked-udp6-server.service")
-    machine.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/inbound-udp6-ready; do sleep 0.2; done'")
+    machine.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/inbound-udp6-ready; do sleep 0.2; done'")
     unfiltered.succeed("${pkgs.python3}/bin/python3 -c \"import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.settimeout(1); s.sendto(b'blocked', ('fc00::1', 18086))\"")
     machine.succeed("sleep 2")
     machine.fail("test -e /tmp/inbound-udp6-received")
@@ -120,8 +120,8 @@ nixpkgs.lib.nixos.runTest {
     unfiltered.succeed("rm -f /tmp/unfiltered-udp6-ready /tmp/unfiltered-udp6-received")
     unfiltered.succeed("systemd-run --unit unfiltered-udp6-server ${pkgs.python3}/bin/python3 -c \"import pathlib,socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(('::', 18086)); pathlib.Path('/tmp/unfiltered-udp6-ready').touch(); data, _ = s.recvfrom(4096); pathlib.Path('/tmp/unfiltered-udp6-received').write_bytes(data)\"")
     unfiltered.wait_for_unit("unfiltered-udp6-server.service")
-    unfiltered.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/unfiltered-udp6-ready; do sleep 0.2; done'")
+    unfiltered.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/unfiltered-udp6-ready; do sleep 0.2; done'")
     machine.succeed("${pkgs.python3}/bin/python3 -c \"import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.settimeout(1); s.sendto(b'unfiltered', ('fc00::2', 18086))\"")
-    unfiltered.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/unfiltered-udp6-received; do sleep 0.2; done'")
+    unfiltered.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/unfiltered-udp6-received; do sleep 0.2; done'")
   '';
 }

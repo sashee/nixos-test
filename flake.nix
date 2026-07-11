@@ -20,10 +20,26 @@
         inherit system;
         config.allowUnfree = true;
       };
-      commonDesktopModule = { ... }: {
+      commonDesktopHostModule = { ... }: {
         imports = [ ./modules/common-desktop.nix ];
         _module.args.commonDotfiles = dotfiles;
         _module.args.unstable = unstable;
+      };
+      # VM-test guest clock: tomorrow at 10:00 UTC, computed when the VM starts
+      # (qemu-vm.nix splices options unescaped into the start script, so the $()
+      # runs at launch; the derivation string itself is constant). Always 10-34h
+      # ahead of real time: past systemd's built-in epoch, past the notBefore of
+      # build-time-generated test certs (tests/test-cert.nix mints CAs with the
+      # real clock, so a base in the past fails their validation), and pinned to
+      # 10:00 so no host timer slot (nix-gc at 03:15/15:15) can elapse mid-test.
+      # The coreutils must match the platform the test driver runs on.
+      testRtcBase = coreutils:
+        "-rtc base=$(${coreutils}/bin/date -u -d tomorrow +%Y-%m-%dT10:00:00)";
+      # The desktop config as a VM-test node; all tests use this variant so the
+      # real host timers (nix-gc, ...) stay enabled but can never elapse mid-test.
+      commonDesktopModule = { ... }: {
+        imports = [ commonDesktopHostModule ];
+        virtualisation.qemu.options = [ (testRtcBase pkgs.coreutils) ];
       };
       qemuDemoUserModule = ./modules/qemu-demo-user.nix;
       nixUtilsTests = import "${dotfiles}/nix-utils/tests/lib.nix" {
@@ -65,7 +81,7 @@
 
         modules = [
           "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
-          commonDesktopModule
+          commonDesktopHostModule
           qemuDemoUserModule
 
           {
@@ -119,10 +135,14 @@
       rpi5Base = mkRpi5 { };
       # Boot rpi tests on the EXACT rpi kernel. QEMU's virt machine needs the generic
       # ECAM PCIe host bridge (a DT-bound module) force-loaded; virtio + 9p then autoload.
+      # rtc-pl031 (QEMU virt's RTC) must probe in the initrd so HCTOSYS sets the clock
+      # before stage-2 timer units start: left to udev it can land minutes into a TCG
+      # boot, and that late clock jump wakes Persistent timers (nix-gc) mid-test.
       rpiTestKernel = { lib, ... }: {
         boot.kernelPackages = lib.mkForce rpi5Base.config.boot.kernelPackages;
         boot.kernelPatches = lib.mkForce [ ];
-        boot.initrd.kernelModules = [ "pci_host_generic" ];
+        boot.initrd.kernelModules = [ "pci_host_generic" "rtc-pl031" ];
+        virtualisation.qemu.options = [ (testRtcBase pkgsRpi.coreutils) ];
       };
       # The real rpi system config as a test node (hosts/rpi5 on the rpi kernel, with
       # the nix-utils args mkRpi5 passes via specialArgs). All rpi tests build on this
@@ -356,7 +376,7 @@
     {
       nixosModules = {
         auto-upgrade = ./modules/auto-upgrade.nix;
-        common-desktop = commonDesktopModule;
+        common-desktop = commonDesktopHostModule;
         doh = ./modules/doh.nix;
         restic = ./modules/restic.nix;
       };
