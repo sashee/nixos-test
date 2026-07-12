@@ -25,6 +25,10 @@ in
 
       settings = {
         auto-optimise-store = true;
+        # Fsync store path contents before registering them in the Nix DB, so a
+        # power cut mid-upgrade/GC can't leave a path registered as valid with
+        # non-durable contents. Costs some write speed on builds/substitutions.
+        fsync-store-paths = true;
         experimental-features = [ "nix-command" "flakes" ];
       };
     };
