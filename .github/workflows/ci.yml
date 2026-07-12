@@ -3,6 +3,10 @@ name: CI
 on:
   push:
   pull_request:
+    # Defaults plus ready_for_review, so marking a draft PR ready starts a
+    # fresh run whose payload has draft=false and can reach the automerge job
+    # (a run started while draft keeps draft=true in its frozen payload).
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 # Read-only token by default; only the automerge job elevates.
