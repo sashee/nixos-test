@@ -5,13 +5,20 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only token by default; only the automerge job elevates.
+permissions:
+  contents: read
+
 jobs:
   full-build:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # This job builds incoming flake code; don't leave a token in .git.
+          persist-credentials: false
 
       - name: Reclaim disk space
         run: |
@@ -30,7 +37,7 @@ jobs:
           df -h
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
         with:
           enable_kvm: true
           extra_nix_config: |
@@ -58,7 +65,7 @@ jobs:
         run: make run-tests MAX_JOBS=1
 
       - name: Upload VM artifacts
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: qemu-plasma-result
@@ -75,7 +82,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # This job builds incoming flake code; don't leave a token in .git.
+          persist-credentials: false
 
       - name: Reclaim disk space
         run: |
@@ -94,7 +104,7 @@ jobs:
           df -h
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
         with:
           enable_kvm: true
           extra_nix_config: |
@@ -121,7 +131,7 @@ jobs:
         # Downloadable file:// binary cache of the patched rpi kernel closure.
         # Import on a dev machine with `make import-rpi-kernel CACHE=...` to run
         # the rpi checks locally without the emulated kernel compile.
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rpi-kernel-cache
           path: rpi-kernel-cache
@@ -141,14 +151,33 @@ jobs:
     if: >
       github.event_name == 'pull_request' &&
       !github.event.pull_request.draft &&
-      github.event.pull_request.user.login == github.repository_owner
+      github.event.pull_request.user.login == github.repository_owner &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    # Serialize merges: if several PRs go green at once, they merge one at a
+    # time and each later one re-checks main (and correctly fails if it moved).
+    concurrency:
+      group: automerge
     permissions:
       contents: write
       pull-requests: write
 
     steps:
-      - name: Merge PR
+      - name: Merge PR (only if it matches what CI tested)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr merge ${{ github.event.pull_request.number }} --rebase --repo ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          # SHAs the test merge ref was built from. Comparing against them
+          # before merging closes the CI-ran-against-stale-code races:
+          # BASE_SHA guards main moving under us, --match-head-commit guards
+          # a push to the PR branch after tests started (checked atomically
+          # by the merge API itself).
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          current_main=$(gh api repos/${{ github.repository }}/branches/main --jq .commit.sha)
+          if [ "$current_main" != "$BASE_SHA" ]; then
+            echo "::error::main moved since CI ran ($BASE_SHA -> $current_main); update the PR branch to re-run CI against current main"
+            exit 1
+          fi
+          gh pr merge "$PR" --rebase --repo ${{ github.repository }} --match-head-commit "$HEAD_SHA"
