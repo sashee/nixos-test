@@ -123,5 +123,24 @@ nixpkgs.lib.nixos.runTest {
     unfiltered.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/unfiltered-udp6-ready; do sleep 0.2; done'")
     machine.succeed("${pkgs.python3}/bin/python3 -c \"import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.settimeout(1); s.sendto(b'unfiltered', ('fc00::2', 18086))\"")
     unfiltered.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/unfiltered-udp6-received; do sleep 0.2; done'")
+
+    # Every blocked probe above must leave kernel-log evidence (the module's
+    # nft log rules -> journalctl -k). Each probe used a unique dport, so the
+    # DPT greps are unambiguous. Log delivery is async, hence the retries.
+    for port in [18080, 18082, 18084, 18086]:
+        machine.wait_until_succeeds(f"journalctl -k --no-pager | grep -E 'refused connection: .*DPT={port}'", timeout=60)
+    # Trailing space distinguishes IPv4 "PROTO=ICMP " from "PROTO=ICMPv6".
+    machine.wait_until_succeeds("journalctl -k --no-pager | grep -E 'refused ping: .*PROTO=ICMP '", timeout=60)
+    machine.wait_until_succeeds("journalctl -k --no-pager | grep -E 'refused ping: .*PROTO=ICMPv6'", timeout=60)
+
+    # Accepted traffic is not logged: the successful outbound curls to
+    # firewall-disabled:18080 produced established return traffic (SPT=18080),
+    # and loopback is accepted as a trusted interface before the log rule.
+    machine.fail("journalctl -k --no-pager | grep -E 'refused connection: .*SPT=18080'")
+    machine.fail("journalctl -k --no-pager | grep -F 'refused connection: ' | grep -F 'IN=lo'")
+
+    # No firewall on the unfiltered node, so no refused-log lines at all.
+    unfiltered.fail("journalctl -k --no-pager | grep -F 'refused connection: '")
+    unfiltered.fail("journalctl -k --no-pager | grep -F 'refused ping: '")
   '';
 }
