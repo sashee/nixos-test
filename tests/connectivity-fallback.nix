@@ -1,17 +1,20 @@
 { nixpkgs, pkgs, stateVersion, moduleUnderTest }:
 
-# QEMU cannot emulate the brcmfmac radio, so the AP/station path is not exercised here
-# (that is validated on real hardware). This test covers the module's LOGIC with the
-# radio-side effects mocked: offline-detection -> setup trigger, the captive portal
-# (form + probe redirect), wildcard DNS, credential writing, and the .ap profile
-# rendering (SSID-named file + Channel + DisableHT -- the bits the firmware needs).
-#
-# The AP interface is eth1 (the test VLAN) instead of a wifi radio, and a second
-# `prober` node stands in for a phone joining the setup AP. That makes the firewall
-# behavior observable end-to-end: with the default-deny firewall module active, the
-# AP service ports must be unreachable from the prober in station mode (even with
-# listeners bound to them) and reachable only while setup mode runs (the setup script
-# inserts session-scoped nftables accepts).
+# QEMU cannot emulate the brcmfmac radio, so the AP/station RADIO path is mocked here
+# (fake iwctl/iw; the real-radio path is covered by connectivity-fallback-wifi.nix on
+# mac80211_hwsim, and the brcmfmac firmware quirks only on real hardware). Everything
+# else is real and exercised the way the field would:
+#   * the AP interface is eth1 (the test VLAN) and a `prober` node plays the phone:
+#     with the default-deny firewall module active, the AP service ports must be
+#     unreachable in station mode (even with listeners bound) and reachable only while
+#     setup mode runs (the setup script inserts session-scoped nftables accepts);
+#   * the prober joins the AP subnet via real DHCP and reaches the portal through the
+#     captive wildcard DNS + redirect, like a phone's connectivity probe;
+#   * reboots are real (portal submit and the setupTimeout safety net both power-cycle
+#     the VM); /var/lib/iwd sits on a persistent disk so written credentials survive;
+#   * the OnBootSec check timer fires naturally for the online no-op (boot #2) and the
+#     offline self-heal re-entry (boot #3); only boot #1 disarms it for the controlled
+#     firewall/negative subtests.
 let
   fakeIwctl = pkgs.writeShellScriptBin "iwctl" ''
     echo "iwctl $*" >> /tmp/iwctl.log
@@ -21,14 +24,18 @@ let
     echo "iw $*" >> /tmp/iw.log
     exit 0
   '';
-  # Intercept the portal's `systemctl reboot` so the test VM does not actually reboot;
-  # everything else still goes to the real systemctl.
-  fakeSystemctl = pkgs.writeShellScriptBin "systemctl" ''
-    if [ "$1" = "reboot" ]; then
-      echo reboot >> /tmp/reboot.log
-      exit 0
-    fi
-    exec /run/current-system/sw/bin/systemctl "$@"
+
+  # udhcpc action script: configure the interface from the lease, record the offered
+  # options for assertions, and point DNS at the lease's server like a real client.
+  udhcpcScript = pkgs.writeShellScript "prober-udhcpc-script" ''
+    case "$1" in
+      bound|renew)
+        ip addr add "$ip/''${mask:-24}" dev "$interface" 2>/dev/null || true
+        printf 'ip=%s\nrouter=%s\ndns=%s\n' "$ip" "$router" "$dns" > /tmp/lease.env
+        rm -f /etc/resolv.conf
+        printf 'nameserver %s\n' "$dns" > /etc/resolv.conf
+        ;;
+    esac
   '';
 in
 nixpkgs.lib.nixos.runTest {
@@ -51,19 +58,30 @@ nixpkgs.lib.nixos.runTest {
       interface = "eth1";
       # A local server the test toggles stands in for "the internet".
       connectivityCheck.url = "http://127.0.0.1:8080/health";
-      # Push the safety-net reboot far away so it cannot fire mid-test.
-      setupTimeout = "1h";
+      # Long enough for the setup-mode subtests, short enough to test the real
+      # safety-net reboot on boot #2.
+      setupTimeout = "3min";
+      # OnBootSec must land AFTER the driver's first commands on every boot (it stops
+      # the timer on boot #1 and starts fakehealth on boot #2), including slow hosts.
+      bootGrace = "90s";
       tools.iwd = fakeIwctl;
       tools.iw = fakeIw;
     };
-    # Neutralize the portal's reboot (fires ~2s after a successful submit).
-    systemd.services.connectivity-fallback-portal.path = lib.mkForce [ fakeSystemctl ];
+
+    # Test VMs have tmpfs roots; keep iwd's state (the portal-written credentials) on
+    # a real disk so it survives the reboots like on the Pi.
+    virtualisation.emptyDiskImages = [ { size = 32; driveConfig.deviceExtraOpts.serial = "iwdstate"; } ];
+    virtualisation.fileSystems."/var/lib/iwd" = {
+      device = "/dev/disk/by-id/virtio-iwdstate";
+      fsType = "ext4";
+      autoFormat = true;
+    };
 
     environment.systemPackages = [ pkgs.curl pkgs.dnsutils ];
     system.stateVersion = stateVersion;
   };
 
-  # A device on the AP's network: probes the AP service ports from outside.
+  # The phone: joins the setup AP's network and provisions the machine from outside.
   nodes.prober = { pkgs, ... }: {
     networking.firewall.enable = false;
     environment.systemPackages = [ pkgs.curl pkgs.dnsutils ];
@@ -71,8 +89,13 @@ nixpkgs.lib.nixos.runTest {
   };
 
   testScript = ''
+    import time
+
     start_all()
     machine.wait_for_unit("multi-user.target")
+    # Boot #1 is the controlled phase: disarm the natural OnBootSec trigger so the
+    # station-mode subtests below cannot be raced by the check entering setup mode.
+    machine.succeed("systemctl stop connectivity-fallback-check.timer")
     prober.wait_for_unit("multi-user.target")
 
     machine_ip = machine.succeed(
@@ -111,23 +134,12 @@ nixpkgs.lib.nixos.runTest {
         prober.fail(f"host -T -t A -W 2 foo.example {machine_ip}")
         machine.succeed("systemctl stop fakeportal fakedns")
 
-    with subtest("online: check does not enter setup mode"):
-        machine.succeed(
-            "systemd-run --unit=fakehealth ${pkgs.python3}/bin/python3 "
-            "-m http.server 8080 --bind 127.0.0.1"
-        )
-        machine.wait_until_succeeds("curl -s -o /dev/null http://127.0.0.1:8080/")
-        machine.succeed("systemctl start connectivity-fallback-check.service")
-        machine.succeed(
-            '[ "$(systemctl is-active connectivity-fallback-setup.service)" = inactive ]'
-        )
-        machine.succeed("systemctl stop fakehealth")
-
     with subtest("offline: check enters setup mode and brings up AP services"):
         machine.succeed("systemctl start connectivity-fallback-check.service")
         machine.wait_for_unit("connectivity-fallback-setup.service")
         machine.wait_for_unit("connectivity-fallback-dnsmasq.service")
         machine.wait_for_unit("connectivity-fallback-portal.service")
+        setup_started = time.monotonic()
 
     with subtest("setup mode inserts the session-scoped firewall accepts"):
         rules = machine.succeed("nft list chain inet nixos-fw input-allow")
@@ -142,35 +154,79 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed("grep -q 'set-property Mode ap' /tmp/iwctl.log")
         machine.succeed("grep -q 'start-profile nixos-rpi5-setup' /tmp/iwctl.log")
 
-    with subtest("setup mode: portal and DNS are reachable from the prober"):
-        # The prober joins the AP subnet (a real client would get this via DHCP).
-        prober.succeed("ip addr add 10.42.0.50/24 dev eth1")
+    with subtest("prober joins the AP subnet via real DHCP"):
+        prober.succeed("ip addr flush dev eth1")
         prober.wait_until_succeeds(
-            "curl -s -o /dev/null -w '%{http_code}' http://10.42.0.1/ | grep -qx 200"
+            "${pkgs.busybox}/bin/udhcpc -i eth1 -f -n -q -t 5 -T 3 "
+            "-s ${udhcpcScript}"
         )
-        prober.succeed(
-            "curl -s -o /dev/null -w '%{http_code}' http://10.42.0.1/generate_204 | grep -qx 302"
+        lease = prober.succeed("cat /tmp/lease.env")
+        assert "router=10.42.0.1" in lease, lease
+        assert "dns=10.42.0.1" in lease, lease
+        ip_line = [l for l in lease.splitlines() if l.startswith("ip=10.42.0.")]
+        assert ip_line, lease
+        offered = int(ip_line[0].removeprefix("ip=10.42.0."))
+        assert 10 <= offered <= 100, lease
+        machine.succeed(
+            "grep -q . /run/connectivity-fallback-dnsmasq/dnsmasq.leases"
         )
-        prober.wait_until_succeeds(
-            "host -t A whatever.example 10.42.0.1 | grep -q '10.42.0.1'"
-        )
-        prober.succeed("host -T -t A whatever.example 10.42.0.1 | grep -q '10.42.0.1'")
 
-    with subtest("submitting credentials writes the psk and triggers reboot"):
-        prober.succeed(
-            "curl -s -o /dev/null -X POST --data 'ssid=MyNet&psk=secret12345' "
-            "http://10.42.0.1/submit"
-        )
-        machine.wait_until_succeeds("test -f /var/lib/iwd/MyNet.psk")
-        machine.succeed("grep -qx 'Passphrase=secret12345' /var/lib/iwd/MyNet.psk")
-        machine.succeed('[ "$(stat -c %a /var/lib/iwd/MyNet.psk)" = 600 ]')
-        machine.wait_until_succeeds("test -f /tmp/reboot.log")
+    with subtest("captive probe: wildcard DNS + redirect lead to the portal form"):
+        page = prober.wait_until_succeeds("curl -sL http://captive.example/probe")
+        assert "Wi-Fi setup" in page, page
+        assert 'action="/submit"' in page, page
 
     with subtest("invalid submission is rejected and writes nothing"):
-        machine.succeed(
+        prober.succeed(
             "curl -s -o /dev/null -w '%{http_code}' -X POST --data 'ssid=Valid&psk=short' "
-            "http://127.0.0.1/submit | grep -qx 400"
+            "http://10.42.0.1/submit | grep -qx 400"
         )
         machine.succeed("! test -e /var/lib/iwd/Valid.psk")
+
+    with subtest("submitting credentials reboots the machine for real"):
+        prober.succeed(
+            "curl -s -X POST --data 'ssid=MyNet&psk=secret12345' "
+            "http://10.42.0.1/submit | grep -q Saved"
+        )
+        machine.wait_for_shutdown()
+        # Well before the 3min safety net: the reboot cause was the submit.
+        assert time.monotonic() - setup_started < 150
+
+    with subtest("boot #2: written credentials persisted where iwd looks for them"):
+        machine.start()
+        machine.wait_for_unit("multi-user.target")
+        machine.succeed("grep -qx 'Passphrase=secret12345' /var/lib/iwd/MyNet.psk")
+        machine.succeed('[ "$(stat -c %a /var/lib/iwd/MyNet.psk)" = 600 ]')
+
+    with subtest("boot #2: natural timer fires online -> no setup mode"):
+        machine.succeed(
+            "systemd-run --unit=fakehealth ${pkgs.python3}/bin/python3 "
+            "-m http.server 8080 --bind 127.0.0.1"
+        )
+        machine.wait_until_succeeds(
+            "journalctl -u connectivity-fallback-check.service "
+            "| grep -q 'online, nothing to do'",
+            timeout=180,
+        )
+        machine.succeed(
+            '[ "$(systemctl is-active connectivity-fallback-setup.service)" = inactive ]'
+        )
+
+    with subtest("boot #2: setup re-opens the firewall and the safety-net reboot fires"):
+        machine.succeed("systemctl stop fakehealth")
+        machine.succeed("systemctl start connectivity-fallback-check.service")
+        machine.wait_for_unit("connectivity-fallback-setup.service")
+        rules = machine.succeed("nft list chain inet nixos-fw input-allow")
+        assert 'iifname "eth1" udp dport { 53, 67 } accept' in rules, rules
+        # The setupTimeout (3min) systemd-run unit reboots the machine on its own.
+        machine.wait_for_shutdown()
+
+    with subtest("boot #3: self-heal loop re-enters setup mode with no help"):
+        machine.start()
+        machine.wait_for_unit("multi-user.target")
+        machine.wait_until_succeeds(
+            '[ "$(systemctl is-active connectivity-fallback-setup.service)" = active ]',
+            timeout=240,
+        )
   '';
 }

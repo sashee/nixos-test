@@ -314,6 +314,12 @@
         inherit nixpkgs pkgs stateVersion;
         moduleUnderTest = ./modules/connectivity-fallback.nix;
       };
+      # x86-only: real-radio (mac80211_hwsim) provisioning loop; the rpi test kernel
+      # may not ship the hwsim module.
+      connectivityFallbackWifiTest = import ./tests/connectivity-fallback-wifi.nix {
+        inherit nixpkgs pkgs stateVersion;
+        moduleUnderTest = ./modules/connectivity-fallback.nix;
+      };
       testResults = builtins.mapAttrs (_: dropKvm) ({
         auto-upgrade-mocked-service = autoUpgradeMockedServiceTest;
         common-desktop = commonDesktopTest;
@@ -336,6 +342,7 @@
         plasma-firefox = plasmaFirefoxTest;
         restic = resticTest;
         connectivity-fallback = connectivityFallbackTest;
+        connectivity-fallback-wifi = connectivityFallbackWifiTest;
         zram = zramTest;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
