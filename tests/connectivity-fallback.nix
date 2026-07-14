@@ -22,9 +22,10 @@
 # Slow-boot proofing (a KVM-less CI runner boots this under TCG, where
 # multi-user can take longer than bootGrace): the check timer is never disarmed
 # and the driver never races it. Everything the check's outcome depends on is
-# guest-side and ordered ahead of the timer (the boot-time home-router unit +
-# the module's After=nftables.service), so the timer may fire before the driver
-# gets a single command in and every phase still holds.
+# guest-side and ordered ahead of the timer (the boot-time home-router unit, the
+# test-wait-online gate for the provisioned boot, and the module's own
+# After=iwd/nftables), so the timer may fire before the driver gets a single
+# command in and every phase still holds.
 #
 # bootGrace/setupTimeout are shortened here (KVM, interactive choreography);
 # the PRODUCTION timer constants are covered by connectivity-fallback-timing.nix
@@ -114,15 +115,40 @@ nixpkgs.lib.nixos.runTest {
           ${pkgs.python3}/bin/python3 -m http.server 80 --bind 192.168.77.1
       '';
     };
-    # The check must never race the home network's availability: hold the timer
-    # until the home-router unit has finished (or been condition-skipped). An
+    # Boot #2 determinism: "home router up" is not "machine online" -- iwd still
+    # has to scan/associate/DHCP after boot. When this boot is expected to come
+    # up provisioned (psk present, no boot-#3 marker), hold the check timer until
+    # the health URL is actually reachable; bounded so a genuine regression fails
+    # the online assertion instead of hanging the boot. Skipped on boot #1 (no
+    # psk) and boot #3 (marker), where being offline is the point.
+    systemd.services.test-wait-online = {
+      wantedBy = [ "multi-user.target" ];
+      unitConfig = {
+        ConditionPathExists = [ "/var/lib/iwd/HomeNet.psk" "!/var/lib/iwd/test-no-home-router" ];
+        RequiresMountsFor = [ "/var/lib/iwd" ];
+      };
+      path = [ pkgs.curl pkgs.coreutils ];
+      serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+      script = ''
+        for _ in $(seq 1 120); do
+          if curl -s -m 2 -o /dev/null http://192.168.77.1/health; then exit 0; fi
+          sleep 1
+        done
+        exit 0
+      '';
+    };
+    # The check must never race guest-side state: hold the timer until the home
+    # router is up and (on provisioned boots) the machine is actually online. An
     # already-elapsed OnBootSec then fires immediately when the timer starts.
-    systemd.timers.connectivity-fallback-check.after = [ "home-router.service" ];
+    systemd.timers.connectivity-fallback-check.after = [
+      "home-router.service"
+      "test-wait-online.service"
+    ];
 
+    # DHCP on wlan0 after joining is dhcpcd's job (networking.useDHCP default),
+    # exactly as on the real Pi -- no iwd EnableNetworkConfiguration here, which
+    # would add a second, racing DHCP client.
     networking.wireless.iwd.enable = true;
-    # Let iwd configure the interface (DHCP) after joining a network, as the
-    # check needs actual connectivity, not just an association.
-    networking.wireless.iwd.settings.General.EnableNetworkConfiguration = true;
 
     common.connectivityFallback = {
       enable = true;
@@ -130,9 +156,11 @@ nixpkgs.lib.nixos.runTest {
       # until the machine joins HomeNet.
       connectivityCheck.url = "http://192.168.77.1/health";
       # Shortened (see header); safe on slow boots because nothing driver-side
-      # races the timer (see the slow-boot proofing note above).
+      # races the timer (see the slow-boot proofing note above). setupTimeout
+      # must outlast boot #1's whole phone choreography (scan/associate/DHCP/
+      # portal round-trips) even under TCG, or the safety net reboots mid-subtest.
       bootGrace = "90s";
-      setupTimeout = "3min";
+      setupTimeout = "5min";
     };
 
     # Test VMs have tmpfs roots; keep iwd's state (the portal-written
