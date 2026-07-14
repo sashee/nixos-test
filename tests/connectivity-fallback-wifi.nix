@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion, moduleUnderTest }:
+{ nixpkgs, pkgs, stateVersion, moduleUnderTest, extraMachineModules ? [ ] }:
 
 # Full provisioning loop on a REAL radio stack via mac80211_hwsim: nothing is mocked.
 # The machine runs the real iwd; the module's generated .ap profile must actually
@@ -12,7 +12,9 @@
 # never re-enters. hwsim cannot model the brcmfmac firmware quirks (pinned channel /
 # DisableHT); those remain hardware-validated.
 #
-# x86-only: the rpi test kernel may not ship mac80211_hwsim.
+# The rpi kernel ships mac80211_hwsim (verified on the Pi, 6.18.34, 2026-07-14), so
+# the aarch64 variant runs this on the exact Pi kernel via rpiTestKernel
+# (extraMachineModules).
 let
   ssid = "nixos-rpi5-setup";
   homePsk = "homenet12345";
@@ -55,7 +57,7 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
 
   nodes.machine = { config, lib, pkgs, ... }: {
-    imports = [ moduleUnderTest ../modules/firewall.nix ];
+    imports = [ moduleUnderTest ../modules/firewall.nix ] ++ extraMachineModules;
 
     networking.hostName = "nixos-rpi5";
 
