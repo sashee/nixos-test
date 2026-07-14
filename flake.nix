@@ -209,6 +209,15 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         moduleUnderTest = ./modules/connectivity-fallback.nix;
       };
+      # Real-radio provisioning loop on the EXACT rpi kernel (which ships
+      # mac80211_hwsim; verified on the Pi, 6.18.34).
+      connectivityFallbackWifiTestRpi = import ./tests/connectivity-fallback-wifi.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        moduleUnderTest = ./modules/connectivity-fallback.nix;
+        extraMachineModules = [ rpiTestKernel ];
+      };
       firewallTestRpi = import ./tests/firewall.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
@@ -242,6 +251,7 @@
         nix-gc-retention = nixGcRetentionTestRpi;
         monitoring = monitoringTestRpi;
         connectivity-fallback = connectivityFallbackTestRpi;
+        connectivity-fallback-wifi = connectivityFallbackWifiTestRpi;
         monitoring-nix-gc = monitoringNixGcTestRpi;
         firewall = firewallTestRpi;
         iroh-ssh = irohSshTestRpi;
@@ -314,8 +324,7 @@
         inherit nixpkgs pkgs stateVersion;
         moduleUnderTest = ./modules/connectivity-fallback.nix;
       };
-      # x86-only: real-radio (mac80211_hwsim) provisioning loop; the rpi test kernel
-      # may not ship the hwsim module.
+      # Real-radio (mac80211_hwsim) provisioning loop.
       connectivityFallbackWifiTest = import ./tests/connectivity-fallback-wifi.nix {
         inherit nixpkgs pkgs stateVersion;
         moduleUnderTest = ./modules/connectivity-fallback.nix;
