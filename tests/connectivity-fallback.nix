@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion, moduleUnderTest, extraMachineModules ? [ ] }:
+{ nixpkgs, pkgs, stateVersion, machineModule }:
 
 # The whole setup-helper story on a REAL radio stack (mac80211_hwsim), nothing
 # mocked but the internet itself. The machine runs the real iwd; the module's
@@ -30,9 +30,14 @@
 # bootGrace/setupTimeout are shortened here (KVM, interactive choreography);
 # the PRODUCTION timer constants are covered by connectivity-fallback-timing.nix
 # (icount time-warp). hwsim cannot model brcmfmac firmware quirks (pinned
-# channel / DisableHT); those remain hardware-validated. The rpi kernel ships
-# mac80211_hwsim (verified on the Pi, 6.18.34, 2026-07-14), so the aarch64
-# variant runs this on the exact Pi kernel via rpiTestKernel (extraMachineModules).
+# channel / DisableHT); those remain hardware-validated.
+#
+# machineModule picks the system under test: the aarch64 variant passes the REAL
+# rpi system config (rpiSystemModule, i.e. hosts/rpi5 on the exact Pi kernel,
+# which ships mac80211_hwsim -- verified 6.18.34, 2026-07-14) with only
+# auto-upgrade/monitoring disabled, so the whole deployed stack (doh egress
+# firewall, dnscrypt, iroh-ssh) is live during the flow. The x86 variant has no
+# real image (aarch64-only), so it uses a minimal module+firewall node instead.
 let
   ssid = "nixos-rpi5-setup";
   homePsk = "homenet12345";
@@ -75,7 +80,7 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
 
   nodes.machine = { config, lib, pkgs, ... }: {
-    imports = [ moduleUnderTest ../modules/firewall.nix ] ++ extraMachineModules;
+    imports = [ machineModule ];
 
     networking.hostName = "nixos-rpi5";
 
@@ -327,12 +332,15 @@ nixpkgs.lib.nixos.runTest {
             "--conf-file=/dev/null --no-resolv --no-hosts --port=53 "
             "--address=/#/192.0.2.1 --listen-address=192.168.99.1 --bind-interfaces"
         )
-        # Connects to the machine's own veth IP arrive via lo (trusted), so
-        # these prove the listeners answer -- the firewall is the only thing the
-        # phone's failures below can be blamed on.
+        # Prove the listeners are really there, so the firewall is the only thing
+        # the phone's failures below can be blamed on. HTTP is probed live via lo
+        # (trusted); DNS only via bound sockets, because on the real rpi config
+        # the DoH module REJECTS machine-originated port-53 egress to anything
+        # but localhost (the phone-side probes below are in a separate netns and
+        # unaffected).
         machine.wait_until_succeeds("curl -s -o /dev/null http://192.168.99.1/")
-        machine.wait_until_succeeds("host -t A -W 2 foo.example 192.168.99.1")
-        machine.succeed("host -T -t A -W 2 foo.example 192.168.99.1")
+        machine.wait_until_succeeds("ss -lnu | grep -q '192.168.99.1:53'")
+        machine.succeed("ss -lnt | grep -q '192.168.99.1:53'")
         machine.fail(
             "ip netns exec phone curl -s --connect-timeout 3 -o /dev/null "
             "http://192.168.99.1/"
