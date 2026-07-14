@@ -203,14 +203,20 @@
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
       };
-      # Runs on the EXACT rpi kernel (which ships mac80211_hwsim for the
-      # real-radio path; verified on the Pi, 6.18.34).
+      # The REAL rpi system config as the node (exact Pi kernel, which ships
+      # mac80211_hwsim -- verified 6.18.34 -- and carries the tpm-crb initrd
+      # workaround). Only what cannot work in a VM is disabled: auto-upgrade
+      # (needs /etc/nixos) and monitoring (needs credentials; 30-min timer would
+      # fire mid-test). The rest of the deployed stack stays live.
       connectivityFallbackTestRpi = import ./tests/connectivity-fallback.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
-        moduleUnderTest = ./modules/connectivity-fallback.nix;
-        extraMachineModules = [ rpiTestKernel ];
+        machineModule = { lib, ... }: {
+          imports = [ rpiSystemModule ];
+          common.autoUpgrade.enable = lib.mkForce false;
+          common.monitoring.enable = lib.mkForce false;
+        };
       };
       firewallTestRpi = import ./tests/firewall.nix {
         nixpkgs = nixrpi;
@@ -313,9 +319,13 @@
         };
         keptAfterGc = 14;  # --delete-older-than 14d: ~14 days of history kept under daily GC
       };
+      # No real image exists for x86 (the deployed system is aarch64-only), so
+      # this variant runs on a minimal module+firewall node.
       connectivityFallbackTest = import ./tests/connectivity-fallback.nix {
         inherit nixpkgs pkgs stateVersion;
-        moduleUnderTest = ./modules/connectivity-fallback.nix;
+        machineModule = { ... }: {
+          imports = [ ./modules/connectivity-fallback.nix ./modules/firewall.nix ];
+        };
       };
       # icount concept test: production timer constants under TCG time-warp.
       connectivityFallbackTimingTest = import ./tests/connectivity-fallback-timing.nix {
