@@ -284,11 +284,12 @@ in
     };
 
     # Started only by the check service; never wanted by a boot target. Ordered
-    # after the firewall so a trigger that lands mid-boot (slow boot + short
-    # bootGrace) waits for the nixos-fw table instead of racing its creation.
+    # after iwd (the script drives it via iwctl) and after the firewall (the
+    # nixos-fw table must exist for the port openings), so a trigger that lands
+    # mid-boot (slow boot + short bootGrace) waits instead of racing either.
     systemd.services.connectivity-fallback-setup = {
       description = "WiFi setup mode: AP + captive portal";
-      after = lib.mkIf firewallManaged [ "nftables.service" ];
+      after = [ "iwd.service" ] ++ lib.optional firewallManaged "nftables.service";
       serviceConfig = { Type = "oneshot"; RemainAfterExit = true; ExecStart = lib.getExe setupScript; };
     };
 
