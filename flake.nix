@@ -129,7 +129,8 @@
       };
 
       # aarch64 Raspberry Pi 5 check: exercise the doh module on the exact kernel
-      # and nixpkgs the Pi runs, in a KVM-accelerated aarch64 VM.
+      # and nixpkgs the Pi runs, in an aarch64 VM (KVM-accelerated on the Pi itself,
+      # slow TCG on the KVM-less aarch64 CI runner).
       nixrpi = nixos-raspberrypi.inputs.nixpkgs;
       pkgsRpi = nixrpi.legacyPackages.aarch64-linux;
       rpi5Base = mkRpi5 { };
@@ -225,7 +226,8 @@
       # (auto-set from the host's /dev/kvm), NOT a derivation's requiredSystemFeatures.
       # So dropping the kvm *requirement* lets tests schedule on KVM-less builders (the
       # free aarch64 CI runner) while QEMU's accel=kvm:tcg still uses KVM wherever it
-      # exists (x86 runner) and only falls back to slow TCG when it doesn't (rpi).
+      # exists (x86 runner, and the Pi itself: the rpi5 kernel ships KVM), falling
+      # back to slow TCG only where /dev/kvm is missing (the aarch64 CI runner).
       dropKvm = test: test.overrideTestDerivation (old: {
         requiredSystemFeatures = builtins.filter (f: f != "kvm") old.requiredSystemFeatures;
       });
