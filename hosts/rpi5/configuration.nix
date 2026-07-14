@@ -22,8 +22,8 @@ in
     ../../modules/connectivity-fallback.nix
     ../../modules/iroh-ssh.nix
     # Same default-deny inbound firewall as the laptops (nftables backend,
-    # allowPing=false + ICMP echo-drop pre-table). The iroh tunnel and the
-    # wlan0 setup-portal interface rules are unaffected.
+    # allowPing=false + ICMP echo-drop pre-table). The iroh tunnel is unaffected;
+    # the wlan0 setup-portal ports are opened at runtime only while setup mode runs.
     ../../modules/firewall.nix
   ];
 

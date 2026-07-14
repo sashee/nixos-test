@@ -1,5 +1,10 @@
 # Features for the RPI 5
 
+## System
+
+* zram swap enabled
+* DWARF/BTF disabled in the kernel due to disk space running out when compiling otherwise
+
 ## Wifi
 
 * uses IWD
@@ -10,9 +15,10 @@
 * if there is no internet after 5 minutes of boot then it enters setup mode
 * in setup mode:
     * automatically reboots after 10 minutes
-    * starts an open Wifi network; if passwordless does not work then the password should be the same as the ssid
+    * starts a Wifi network where the password is the same as the ssid
     * the ssid is `nixos-rpi5-setup`
     * this network is a captive portal and has a webserver
+    * opens the ports on the firewall that is needed for its operations
     * this webserver allows selecting a wifi network and providing a password
     * when an ssid+pw is provided, they are written to a place where iwd can find it and then reboot
 
@@ -30,13 +36,8 @@
 
 ## Auto GC
 
-* runs daily
+* runs twice daily
 * only the last generation is kept
-
-## SSH
-
-* SSH is running on port 22
-* only keys are allowed, no passwords
 
 ## Monitoring
 
@@ -44,11 +45,12 @@
 * reports success:
     * backups ran
     * disk is alright
-    * auto-upgrade run successfully in the last 3 days
+    * auto-upgrade run successfully in the last 14 days
     * auto-gc ran successfully in the last 3 days
     * number of generations is not too big
 * plus a couple of infos: disk usage, last boot time, kernel version, common repo rev + last updated + url
 * remote url is configured outside the store, it is an encrypted credential that is loaded by the systemd unit
+* uses the healthchecks API
 
 ## Backups
 
@@ -57,7 +59,7 @@
 
 ## Dotfiles
 
-* available to the user's path
+* the nix-utils available to the user's path
 
 ## Iroh SSH
 
@@ -67,3 +69,9 @@
 * it requires the secret key that is loaded using an encrypted credential
 * if the credential is not provided, the service is not started
 * the service auto-restarts
+* only keys are allowed, no passwords
+
+## Firewall
+
+* all inbound connections are dropped by default
+* denied connections are logged with a rate-limiter
