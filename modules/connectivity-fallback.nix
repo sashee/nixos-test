@@ -119,9 +119,20 @@ let
 
   setupScript = pkgs.writeShellApplication {
     name = "connectivity-fallback-setup";
-    runtimeInputs = [ cfg.tools.iwd cfg.tools.iw cfg.tools.iproute2 cfg.tools.systemd cfg.tools.coreutils ];
+    runtimeInputs = [ cfg.tools.iwd cfg.tools.iw cfg.tools.iproute2 cfg.tools.systemd cfg.tools.coreutils cfg.tools.nftables ];
     text = ''
       set -x
+      # Open the AP service ports (DNS, DHCP, portal) for this setup session only, so
+      # they stay closed in normal (station-mode) operation. The rules must go into the
+      # NixOS firewall's own input-allow chain: an accept in a separate nftables table
+      # would not bypass its drop policy (every hook chain sees the packet; any drop
+      # wins). No teardown is needed: every setup session ends in a reboot (portal
+      # submit or the setupTimeout safety net below), and runtime rules do not survive
+      # it. Caveat: a firewall reload mid-setup wipes them for the rest of the session.
+      if nft list table inet nixos-fw >/dev/null 2>&1; then
+        nft insert rule inet nixos-fw input-allow iifname "${cfg.interface}" udp dport "{ 53, 67 }" accept
+        nft insert rule inet nixos-fw input-allow iifname "${cfg.interface}" tcp dport "{ 53, ${toString cfg.portal.listenPort} }" accept
+      fi
       # Regulatory domain: required so the firmware permits beaconing in AP mode.
       iw reg set ${cfg.regulatoryCountry} || true
       # Materialize the AP profile where iwd expects it (regenerated from the store).
@@ -226,6 +237,7 @@ in
       dnsmasq = lib.mkPackageOption pkgs "dnsmasq" { };
       python3 = lib.mkPackageOption pkgs "python3" { };
       iproute2 = lib.mkPackageOption pkgs "iproute2" { };
+      nftables = lib.mkPackageOption pkgs "nftables" { };
       curl = lib.mkPackageOption pkgs "curl" { };
       coreutils = lib.mkPackageOption pkgs "coreutils" { };
       systemd = lib.mkPackageOption pkgs "systemd" { };
@@ -246,12 +258,9 @@ in
 
     networking.wireless.iwd.settings.General.Country = cfg.regulatoryCountry;
 
-    # Only reachable while the AP is up (services listen only in setup mode); harmless in
-    # station mode where nothing binds these ports.
-    networking.firewall.interfaces.${cfg.interface} = {
-      allowedUDPPorts = [ 53 67 ];
-      allowedTCPPorts = [ 53 cfg.portal.listenPort ];
-    };
+    # No static firewall openings: the setup script inserts session-scoped accepts for
+    # the AP service ports into the running nixos-fw ruleset, so in normal (station
+    # mode) operation the ports are closed like everything else.
 
     systemd.services.connectivity-fallback-check = {
       description = "Check internet connectivity; enter WiFi setup mode if offline";
