@@ -1,39 +1,63 @@
-{ nixpkgs, pkgs, stateVersion, moduleUnderTest }:
+{ nixpkgs, pkgs, stateVersion, moduleUnderTest, extraMachineModules ? [ ] }:
 
-# QEMU cannot emulate the brcmfmac radio, so the AP/station RADIO path is mocked here
-# (fake iwctl/iw; the real-radio path is covered by connectivity-fallback-wifi.nix on
-# mac80211_hwsim, and the brcmfmac firmware quirks only on real hardware). Everything
-# else is real and exercised the way the field would:
-#   * the AP interface is eth1 (the test VLAN) and a `prober` node plays the phone:
-#     with the default-deny firewall module active, the AP service ports must be
-#     unreachable in station mode (even with listeners bound) and reachable only while
-#     setup mode runs (the setup script inserts session-scoped nftables accepts);
-#   * the prober joins the AP subnet via real DHCP and reaches the portal through the
-#     captive wildcard DNS + redirect, like a phone's connectivity probe;
-#   * reboots are real (portal submit and the setupTimeout safety net both power-cycle
-#     the VM); /var/lib/iwd sits on a persistent disk so written credentials survive;
-#   * the OnBootSec check timer fires naturally for the online no-op (boot #2) and the
-#     offline self-heal re-entry (boot #3); only boot #1 disarms it for the controlled
-#     firewall/negative subtests.
+# The whole setup-helper story on a REAL radio stack (mac80211_hwsim), nothing
+# mocked but the internet itself. The machine runs the real iwd; the module's
+# generated .ap profile must actually start a WPA2 AP. A "phone" lives in a
+# network namespace holding the second hwsim radio AND one end of a veth pair:
+#   * over the veth ("the LAN") it plays a wired neighbor for the station-mode
+#     firewall checks: with the default-deny firewall module active, the AP
+#     service ports must be unreachable in station mode even with listeners
+#     bound, and reachable only while setup mode runs (the setup script inserts
+#     session-scoped nixos-fw accepts, iifname-scoped to wlan0);
+#   * over the air it provisions the machine like a phone would: associates with
+#     passphrase == SSID, gets a DHCP lease through the firewall accepts, walks
+#     captive DNS -> redirect -> portal, and submits home-wifi credentials.
+# Reboots are real (portal submit and the setupTimeout safety net both
+# power-cycle the VM); /var/lib/iwd sits on a persistent disk so credentials
+# survive like on an SD card. Across three boots this covers: provisioning,
+# psk persistence + iwd auto-joining the submitted network (check passes, setup
+# never re-enters), the natural OnBootSec timer in both the online no-op and
+# the offline self-heal directions, and the real safety-net reboot.
+#
+# bootGrace/setupTimeout are shortened here (KVM, interactive choreography);
+# the PRODUCTION timer constants are covered by connectivity-fallback-timing.nix
+# (icount time-warp). hwsim cannot model brcmfmac firmware quirks (pinned
+# channel / DisableHT); those remain hardware-validated. The rpi kernel ships
+# mac80211_hwsim (verified on the Pi, 6.18.34, 2026-07-14), so the aarch64
+# variant runs this on the exact Pi kernel via rpiTestKernel (extraMachineModules).
 let
-  fakeIwctl = pkgs.writeShellScriptBin "iwctl" ''
-    echo "iwctl $*" >> /tmp/iwctl.log
-    exit 0
-  '';
-  fakeIw = pkgs.writeShellScriptBin "iw" ''
-    echo "iw $*" >> /tmp/iw.log
-    exit 0
+  ssid = "nixos-rpi5-setup";
+  homePsk = "homenet12345";
+
+  wpaConf = pkgs.writeText "phone-wpa.conf" ''
+    network={
+      ssid="${ssid}"
+      psk="${ssid}"
+    }
   '';
 
-  # udhcpc action script: configure the interface from the lease, record the offered
-  # options for assertions, and point DNS at the lease's server like a real client.
-  udhcpcScript = pkgs.writeShellScript "prober-udhcpc-script" ''
+  hostapdConf = pkgs.writeText "phone-hostapd.conf" ''
+    interface=wlan1
+    driver=nl80211
+    ssid=HomeNet
+    hw_mode=g
+    channel=6
+    wpa=2
+    wpa_key_mgmt=WPA-PSK
+    wpa_passphrase=${homePsk}
+    rsn_pairwise=CCMP
+  '';
+
+  # udhcpc action script for the phone (runs inside the netns): configure the
+  # interface from the lease and record the offered options for assertions.
+  udhcpcScript = pkgs.writeShellScript "phone-udhcpc-script" ''
+    # $ip/$mask/$router/$dns/$interface come from udhcpc's lease environment.
+    IP=${pkgs.iproute2}/bin/ip
     case "$1" in
       bound|renew)
-        ip addr add "$ip/''${mask:-24}" dev "$interface" 2>/dev/null || true
-        printf 'ip=%s\nrouter=%s\ndns=%s\n' "$ip" "$router" "$dns" > /tmp/lease.env
-        rm -f /etc/resolv.conf
-        printf 'nameserver %s\n' "$dns" > /etc/resolv.conf
+        $IP addr replace "$ip/''${mask:-24}" dev "$interface"
+        $IP route replace default via "$router"
+        printf 'ip=%s\nrouter=%s\ndns=%s\n' "$ip" "$router" "$dns" > /tmp/phone-lease.env
         ;;
     esac
   '';
@@ -43,33 +67,33 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
 
   nodes.machine = { config, lib, pkgs, ... }: {
-    imports = [ moduleUnderTest ../modules/firewall.nix ];
+    imports = [ moduleUnderTest ../modules/firewall.nix ] ++ extraMachineModules;
 
     networking.hostName = "nixos-rpi5";
-    # The module layers on iwd (assertion). No wifi device exists in the VM, so keep
-    # iwd.service from starting -- its failure would be irrelevant noise.
+
+    # Two virtual radios: phy0/wlan0 stays with the machine's iwd; phy1/wlan1 is
+    # moved into the "phone" netns by the test script (client on boot #1, home
+    # AP on boot #2 -- sequential roles, one radio).
+    boot.kernelModules = [ "mac80211_hwsim" ];
+
     networking.wireless.iwd.enable = true;
-    systemd.services.iwd.wantedBy = lib.mkForce [ ];
+    # Let iwd configure the interface (DHCP) after joining a network, as the
+    # check needs actual connectivity, not just an association.
+    networking.wireless.iwd.settings.General.EnableNetworkConfiguration = true;
 
     common.connectivityFallback = {
       enable = true;
-      # The test-VLAN interface stands in for the wifi radio, so the prober's packets
-      # arrive on the AP interface and the interface-scoped firewall rules apply.
-      interface = "eth1";
-      # A local server the test toggles stands in for "the internet".
-      connectivityCheck.url = "http://127.0.0.1:8080/health";
-      # Long enough for the setup-mode subtests, short enough to test the real
-      # safety-net reboot on boot #2.
-      setupTimeout = "3min";
-      # OnBootSec must land AFTER the driver's first commands on every boot (it stops
-      # the timer on boot #1 and starts fakehealth on boot #2), including slow hosts.
+      # Only served from the "home network" netns -- offline by construction
+      # until the machine joins HomeNet.
+      connectivityCheck.url = "http://192.168.77.1/health";
+      # Shortened (see header). bootGrace must land AFTER the driver's first
+      # per-boot commands (stop the timer / bring up the home router).
       bootGrace = "90s";
-      tools.iwd = fakeIwctl;
-      tools.iw = fakeIw;
+      setupTimeout = "3min";
     };
 
-    # Test VMs have tmpfs roots; keep iwd's state (the portal-written credentials) on
-    # a real disk so it survives the reboots like on the Pi.
+    # Test VMs have tmpfs roots; keep iwd's state (the portal-written
+    # credentials) on a real disk so it survives the reboots like on the Pi.
     virtualisation.emptyDiskImages = [ { size = 32; driveConfig.deviceExtraOpts.serial = "iwdstate"; } ];
     virtualisation.fileSystems."/var/lib/iwd" = {
       device = "/dev/disk/by-id/virtio-iwdstate";
@@ -81,37 +105,44 @@ nixpkgs.lib.nixos.runTest {
     system.stateVersion = stateVersion;
   };
 
-  # The phone: joins the setup AP's network and provisions the machine from outside.
-  nodes.prober = { pkgs, ... }: {
-    networking.firewall.enable = false;
-    environment.systemPackages = [ pkgs.curl pkgs.dnsutils ];
-    system.stateVersion = stateVersion;
-  };
-
   testScript = ''
-    import time
+    def phone(cmd):
+        return machine.succeed(f"ip netns exec phone {cmd}")
 
-    start_all()
-    machine.wait_for_unit("multi-user.target")
-    # Boot #1 is the controlled phase: disarm the natural OnBootSec trigger so the
-    # station-mode subtests below cannot be raced by the check entering setup mode.
-    machine.succeed("systemctl stop connectivity-fallback-check.timer")
-    prober.wait_for_unit("multi-user.target")
 
-    machine_ip = machine.succeed(
-        "ip -4 -o addr show eth1 | head -n1 | awk '{print $4}' | cut -d/ -f1"
-    ).strip()
-    prober_ip = prober.succeed(
-        "ip -4 -o addr show eth1 | head -n1 | awk '{print $4}' | cut -d/ -f1"
-    ).strip()
-
-    with subtest("sanity: the VLAN carries traffic (prober is reachable from machine)"):
-        prober.succeed(
-            "systemd-run --unit=sanityhttp ${pkgs.python3}/bin/python3 "
-            "-m http.server 8080"
+    def make_phone_ns():
+        machine.succeed("ip netns add phone")
+        machine.succeed(
+            'phy="$(cat /sys/class/net/wlan1/phy80211/name)"; '
+            'iw phy "$phy" set netns name phone'
         )
-        machine.wait_until_succeeds(f"curl -s -o /dev/null http://{prober_ip}:8080/")
-        prober.succeed("systemctl stop sanityhttp")
+        # Moving the phy leaves the interface down in the new namespace.
+        machine.succeed("ip netns exec phone ip link set wlan1 up")
+        # The LAN: a veth pair into the netns, so the phone can also probe the
+        # machine like a wired neighbor (192.168.99.1 = machine, .2 = phone).
+        machine.succeed("ip link add lan0 type veth peer name lan1")
+        machine.succeed("ip link set lan1 netns phone")
+        machine.succeed("ip addr replace 192.168.99.1/24 dev lan0 && ip link set lan0 up")
+        phone("ip addr replace 192.168.99.2/24 dev lan1")
+        phone("ip link set lan1 up")
+
+
+    machine.start()
+    machine.wait_for_unit("multi-user.target")
+    # Boot #1 is the controlled phase: disarm the natural OnBootSec trigger so
+    # the station-mode subtests below cannot be raced by setup mode starting.
+    machine.succeed("systemctl stop connectivity-fallback-check.timer")
+    machine.wait_for_unit("iwd.service")
+    machine.wait_until_succeeds("test -e /sys/class/net/wlan1")
+    make_phone_ns()
+
+    with subtest("sanity: the LAN veth carries traffic (phone reachable from machine)"):
+        machine.succeed(
+            "systemd-run --unit=sanityhttp ip netns exec phone "
+            "${pkgs.python3}/bin/python3 -m http.server 8080"
+        )
+        machine.wait_until_succeeds("curl -s -o /dev/null http://192.168.99.2:8080/")
+        machine.succeed("systemctl stop sanityhttp")
 
     with subtest("station mode: AP ports are firewalled even with listeners bound"):
         machine.succeed(
@@ -121,88 +152,130 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed(
             "systemd-run --unit=fakedns ${pkgs.dnsmasq}/bin/dnsmasq -k "
             "--conf-file=/dev/null --no-resolv --no-hosts --port=53 "
-            f"--address=/#/192.0.2.1 --listen-address={machine_ip} --bind-interfaces"
+            "--address=/#/192.0.2.1 --listen-address=192.168.99.1 --bind-interfaces"
         )
-        # Connects to the machine's own eth1 IP arrive via lo (trusted), so these
-        # prove the listeners answer -- the firewall is the only thing the prober's
-        # failures below can be blamed on.
-        machine.wait_until_succeeds(f"curl -s -o /dev/null http://{machine_ip}/")
-        machine.wait_until_succeeds(f"host -t A -W 2 foo.example {machine_ip}")
-        machine.succeed(f"host -T -t A -W 2 foo.example {machine_ip}")
-        prober.fail(f"curl -s --connect-timeout 3 -o /dev/null http://{machine_ip}/")
-        prober.fail(f"host -t A -W 2 foo.example {machine_ip}")
-        prober.fail(f"host -T -t A -W 2 foo.example {machine_ip}")
+        # Connects to the machine's own veth IP arrive via lo (trusted), so
+        # these prove the listeners answer -- the firewall is the only thing the
+        # phone's failures below can be blamed on.
+        machine.wait_until_succeeds("curl -s -o /dev/null http://192.168.99.1/")
+        machine.wait_until_succeeds("host -t A -W 2 foo.example 192.168.99.1")
+        machine.succeed("host -T -t A -W 2 foo.example 192.168.99.1")
+        machine.fail(
+            "ip netns exec phone curl -s --connect-timeout 3 -o /dev/null "
+            "http://192.168.99.1/"
+        )
+        machine.fail("ip netns exec phone host -t A -W 2 foo.example 192.168.99.1")
+        machine.fail("ip netns exec phone host -T -t A -W 2 foo.example 192.168.99.1")
         machine.succeed("systemctl stop fakeportal fakedns")
 
-    with subtest("offline: check enters setup mode and brings up AP services"):
+    with subtest("offline: check enters setup mode and starts a real WPA2 AP"):
         machine.succeed("systemctl start connectivity-fallback-check.service")
         machine.wait_for_unit("connectivity-fallback-setup.service")
         machine.wait_for_unit("connectivity-fallback-dnsmasq.service")
         machine.wait_for_unit("connectivity-fallback-portal.service")
-        setup_started = time.monotonic()
-
-    with subtest("setup mode inserts the session-scoped firewall accepts"):
         rules = machine.succeed("nft list chain inet nixos-fw input-allow")
-        assert 'iifname "eth1" udp dport { 53, 67 } accept' in rules, rules
-        assert 'iifname "eth1" tcp dport { 53, 80 } accept' in rules, rules
+        assert 'iifname "wlan0" udp dport { 53, 67 } accept' in rules, rules
+        assert 'iifname "wlan0" tcp dport { 53, 80 } accept' in rules, rules
+        # iwd really beacons: the phone's radio sees the setup SSID.
+        machine.wait_until_succeeds(
+            "ip netns exec phone iw dev wlan1 scan | grep -q 'SSID: ${ssid}'"
+        )
 
     with subtest("AP profile pins the SSID/channel/width the firmware needs"):
-        prof = "/var/lib/iwd/ap/nixos-rpi5-setup.ap"
-        machine.succeed(f"grep -qx 'Passphrase=nixos-rpi5-setup' {prof}")
+        prof = "/var/lib/iwd/ap/${ssid}.ap"
+        machine.succeed(f"grep -qx 'Passphrase=${ssid}' {prof}")
         machine.succeed(f"grep -qx 'Channel=6' {prof}")
         machine.succeed(f"grep -qx 'DisableHT=true' {prof}")
-        machine.succeed("grep -q 'set-property Mode ap' /tmp/iwctl.log")
-        machine.succeed("grep -q 'start-profile nixos-rpi5-setup' /tmp/iwctl.log")
 
-    with subtest("prober joins the AP subnet via real DHCP"):
-        prober.succeed("ip addr flush dev eth1")
-        prober.wait_until_succeeds(
-            "${pkgs.busybox}/bin/udhcpc -i eth1 -f -n -q -t 5 -T 3 "
+    with subtest("phone associates with passphrase == SSID and gets a DHCP lease"):
+        phone("${pkgs.wpa_supplicant}/bin/wpa_supplicant -B -i wlan1 -c ${wpaConf}")
+        machine.wait_until_succeeds(
+            "ip netns exec phone iw dev wlan1 link | grep -q 'SSID: ${ssid}'"
+        )
+        machine.wait_until_succeeds(
+            "ip netns exec phone ${pkgs.busybox}/bin/udhcpc -i wlan1 -f -n -q -t 8 -T 3 "
             "-s ${udhcpcScript}"
         )
-        lease = prober.succeed("cat /tmp/lease.env")
+        lease = machine.succeed("cat /tmp/phone-lease.env")
         assert "router=10.42.0.1" in lease, lease
         assert "dns=10.42.0.1" in lease, lease
         ip_line = [l for l in lease.splitlines() if l.startswith("ip=10.42.0.")]
         assert ip_line, lease
         offered = int(ip_line[0].removeprefix("ip=10.42.0."))
         assert 10 <= offered <= 100, lease
+        machine.succeed("grep -q . /run/connectivity-fallback-dnsmasq/dnsmasq.leases")
+        dns = [l.removeprefix("dns=") for l in lease.splitlines() if l.startswith("dns=")][0]
+        # The phone applies the DHCP-provided DNS (netns-scoped resolv.conf).
         machine.succeed(
-            "grep -q . /run/connectivity-fallback-dnsmasq/dnsmasq.leases"
+            f"mkdir -p /etc/netns/phone && printf 'nameserver %s\\n' {dns} "
+            "> /etc/netns/phone/resolv.conf"
         )
 
-    with subtest("captive probe: wildcard DNS + redirect lead to the portal form"):
-        page = prober.wait_until_succeeds("curl -sL http://captive.example/probe")
+    with subtest("captive probe over the air reaches the portal form"):
+        # `host` speaks DNS directly against the netns resolv.conf (the
+        # DHCP-provided server), proving the wildcard answer. curl cannot do the
+        # same on NixOS: glibc resolves via nscd, which runs in the ROOT network
+        # namespace and cannot reach the AP subnet -- so the HTTP redirect flow
+        # pins the mapping.
+        machine.wait_until_succeeds(
+            "ip netns exec phone host -t A captive.example | grep -q '10.42.0.1'"
+        )
+        page = machine.succeed(
+            "ip netns exec phone curl -sL --resolve captive.example:80:10.42.0.1 "
+            "http://captive.example/probe"
+        )
         assert "Wi-Fi setup" in page, page
         assert 'action="/submit"' in page, page
 
     with subtest("invalid submission is rejected and writes nothing"):
-        prober.succeed(
+        phone(
             "curl -s -o /dev/null -w '%{http_code}' -X POST --data 'ssid=Valid&psk=short' "
             "http://10.42.0.1/submit | grep -qx 400"
         )
         machine.succeed("! test -e /var/lib/iwd/Valid.psk")
 
-    with subtest("submitting credentials reboots the machine for real"):
-        prober.succeed(
-            "curl -s -X POST --data 'ssid=MyNet&psk=secret12345' "
+    with subtest("phone submits the home network; machine reboots for real"):
+        phone(
+            "curl -s -X POST --data 'ssid=HomeNet&psk=${homePsk}' "
             "http://10.42.0.1/submit | grep -q Saved"
         )
         machine.wait_for_shutdown()
-        # Well before the 3min safety net: the reboot cause was the submit.
-        assert time.monotonic() - setup_started < 150
 
-    with subtest("boot #2: written credentials persisted where iwd looks for them"):
+    with subtest("boot #2: portal-written psk persisted for iwd"):
         machine.start()
         machine.wait_for_unit("multi-user.target")
-        machine.succeed("grep -qx 'Passphrase=secret12345' /var/lib/iwd/MyNet.psk")
-        machine.succeed('[ "$(stat -c %a /var/lib/iwd/MyNet.psk)" = 600 ]')
+        machine.succeed("grep -qx 'Passphrase=${homePsk}' /var/lib/iwd/HomeNet.psk")
+        machine.succeed('[ "$(stat -c %a /var/lib/iwd/HomeNet.psk)" = 600 ]')
+
+    with subtest("boot #2: home router comes up in the netns"):
+        machine.wait_until_succeeds("test -e /sys/class/net/wlan1")
+        make_phone_ns()
+        phone("ip addr replace 192.168.77.1/24 dev wlan1")
+        machine.succeed(
+            "systemd-run --unit=home-ap ip netns exec phone "
+            "${pkgs.hostapd}/bin/hostapd ${hostapdConf}"
+        )
+        machine.succeed(
+            "systemd-run --unit=home-dhcp ip netns exec phone "
+            "${pkgs.dnsmasq}/bin/dnsmasq -k --conf-file=/dev/null --port=0 "
+            "--interface=wlan1 --bind-interfaces "
+            "--dhcp-leasefile=/tmp/phone-dnsmasq.leases "
+            "--dhcp-range=192.168.77.10,192.168.77.50,255.255.255.0,1h"
+        )
+        machine.succeed(
+            "systemd-run --unit=home-health ip netns exec phone "
+            "${pkgs.python3}/bin/python3 -m http.server 80 --bind 192.168.77.1"
+        )
+
+    with subtest("boot #2: iwd auto-joins HomeNet with the provisioned psk"):
+        machine.wait_until_succeeds(
+            "iw dev wlan0 link | grep -q 'SSID: HomeNet'", timeout=120
+        )
+        machine.wait_until_succeeds(
+            "ip -4 -o addr show wlan0 | grep -q 192.168.77.", timeout=60
+        )
 
     with subtest("boot #2: natural timer fires online -> no setup mode"):
-        machine.succeed(
-            "systemd-run --unit=fakehealth ${pkgs.python3}/bin/python3 "
-            "-m http.server 8080 --bind 127.0.0.1"
-        )
         machine.wait_until_succeeds(
             "journalctl -u connectivity-fallback-check.service "
             "| grep -q 'online, nothing to do'",
@@ -212,12 +285,12 @@ nixpkgs.lib.nixos.runTest {
             '[ "$(systemctl is-active connectivity-fallback-setup.service)" = inactive ]'
         )
 
-    with subtest("boot #2: setup re-opens the firewall and the safety-net reboot fires"):
-        machine.succeed("systemctl stop fakehealth")
+    with subtest("boot #2: home wifi dies -> setup re-opens the firewall; safety net reboots"):
+        machine.succeed("systemctl stop home-ap home-dhcp home-health")
         machine.succeed("systemctl start connectivity-fallback-check.service")
         machine.wait_for_unit("connectivity-fallback-setup.service")
         rules = machine.succeed("nft list chain inet nixos-fw input-allow")
-        assert 'iifname "eth1" udp dport { 53, 67 } accept' in rules, rules
+        assert 'iifname "wlan0" udp dport { 53, 67 } accept' in rules, rules
         # The setupTimeout (3min) systemd-run unit reboots the machine on its own.
         machine.wait_for_shutdown()
 

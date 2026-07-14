@@ -203,15 +203,9 @@
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
       };
+      # Runs on the EXACT rpi kernel (which ships mac80211_hwsim for the
+      # real-radio path; verified on the Pi, 6.18.34).
       connectivityFallbackTestRpi = import ./tests/connectivity-fallback.nix {
-        nixpkgs = nixrpi;
-        pkgs = pkgsRpi;
-        stateVersion = rpi5Base.config.system.stateVersion;
-        moduleUnderTest = ./modules/connectivity-fallback.nix;
-      };
-      # Real-radio provisioning loop on the EXACT rpi kernel (which ships
-      # mac80211_hwsim; verified on the Pi, 6.18.34).
-      connectivityFallbackWifiTestRpi = import ./tests/connectivity-fallback-wifi.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
@@ -251,7 +245,6 @@
         nix-gc-retention = nixGcRetentionTestRpi;
         monitoring = monitoringTestRpi;
         connectivity-fallback = connectivityFallbackTestRpi;
-        connectivity-fallback-wifi = connectivityFallbackWifiTestRpi;
         monitoring-nix-gc = monitoringNixGcTestRpi;
         firewall = firewallTestRpi;
         iroh-ssh = irohSshTestRpi;
@@ -324,8 +317,8 @@
         inherit nixpkgs pkgs stateVersion;
         moduleUnderTest = ./modules/connectivity-fallback.nix;
       };
-      # Real-radio (mac80211_hwsim) provisioning loop.
-      connectivityFallbackWifiTest = import ./tests/connectivity-fallback-wifi.nix {
+      # icount concept test: production timer constants under TCG time-warp.
+      connectivityFallbackTimingTest = import ./tests/connectivity-fallback-timing.nix {
         inherit nixpkgs pkgs stateVersion;
         moduleUnderTest = ./modules/connectivity-fallback.nix;
       };
@@ -351,7 +344,7 @@
         plasma-firefox = plasmaFirefoxTest;
         restic = resticTest;
         connectivity-fallback = connectivityFallbackTest;
-        connectivity-fallback-wifi = connectivityFallbackWifiTest;
+        connectivity-fallback-timing = connectivityFallbackTimingTest;
         zram = zramTest;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
