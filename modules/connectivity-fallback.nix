@@ -3,6 +3,10 @@
 let
   cfg = config.common.connectivityFallback;
 
+  # Whether this host runs the nftables-backed NixOS firewall whose nixos-fw
+  # table the setup script must open the AP service ports in.
+  firewallManaged = config.networking.firewall.enable && config.networking.nftables.enable;
+
   apProfileName = cfg.ap.ssid;
 
   # iwd AP profile. WPA2 with passphrase == SSID ("open in practice": the password is
@@ -119,20 +123,27 @@ let
 
   setupScript = pkgs.writeShellApplication {
     name = "connectivity-fallback-setup";
-    runtimeInputs = [ cfg.tools.iwd cfg.tools.iw cfg.tools.iproute2 cfg.tools.systemd cfg.tools.coreutils cfg.tools.nftables ];
+    runtimeInputs = [ cfg.tools.iwd cfg.tools.iw cfg.tools.iproute2 cfg.tools.systemd cfg.tools.coreutils ]
+      ++ lib.optional firewallManaged cfg.tools.nftables;
     text = ''
       set -x
-      # Open the AP service ports (DNS, DHCP, portal) for this setup session only, so
-      # they stay closed in normal (station-mode) operation. The rules must go into the
-      # NixOS firewall's own input-allow chain: an accept in a separate nftables table
-      # would not bypass its drop policy (every hook chain sees the packet; any drop
-      # wins). No teardown is needed: every setup session ends in a reboot (portal
-      # submit or the setupTimeout safety net below), and runtime rules do not survive
-      # it. Caveat: a firewall reload mid-setup wipes them for the rest of the session.
-      if nft list table inet nixos-fw >/dev/null 2>&1; then
+      ${lib.optionalString firewallManaged ''
+        # Open the AP service ports (DNS, DHCP, portal) for this setup session only, so
+        # they stay closed in normal (station-mode) operation. The rules must go into the
+        # NixOS firewall's own input-allow chain: an accept in a separate nftables table
+        # would not bypass its drop policy (every hook chain sees the packet; any drop
+        # wins). Emitted only when this host runs the nftables firewall (eval-time gate);
+        # the unit is also ordered After=nftables.service, because a mid-boot trigger
+        # can otherwise run before the nixos-fw table exists -- a runtime existence
+        # check would silently skip the openings and leave the portal unreachable for
+        # the whole session (seen on a slow TCG boot in CI). If nft fails here, the
+        # unit fails loudly instead. No teardown is needed: every setup session ends
+        # in a reboot (portal submit or the setupTimeout safety net below), and runtime
+        # rules do not survive it. Caveat: a firewall reload mid-setup wipes them for
+        # the rest of the session.
         nft insert rule inet nixos-fw input-allow iifname "${cfg.interface}" udp dport "{ 53, 67 }" accept
         nft insert rule inet nixos-fw input-allow iifname "${cfg.interface}" tcp dport "{ 53, ${toString cfg.portal.listenPort} }" accept
-      fi
+      ''}
       # Regulatory domain: required so the firmware permits beaconing in AP mode.
       iw reg set ${cfg.regulatoryCountry} || true
       # Materialize the AP profile where iwd expects it (regenerated from the store).
@@ -272,9 +283,12 @@ in
       timerConfig = { OnBootSec = cfg.bootGrace; AccuracySec = "1s"; Unit = "connectivity-fallback-check.service"; };
     };
 
-    # Started only by the check service; never wanted by a boot target.
+    # Started only by the check service; never wanted by a boot target. Ordered
+    # after the firewall so a trigger that lands mid-boot (slow boot + short
+    # bootGrace) waits for the nixos-fw table instead of racing its creation.
     systemd.services.connectivity-fallback-setup = {
       description = "WiFi setup mode: AP + captive portal";
+      after = lib.mkIf firewallManaged [ "nftables.service" ];
       serviceConfig = { Type = "oneshot"; RemainAfterExit = true; ExecStart = lib.getExe setupScript; };
     };
 
