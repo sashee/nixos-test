@@ -382,7 +382,7 @@
       };
 
       lib.restic = resticLib;
-      lib.mkRpi5 = mkRpi5;
+      lib.hosts.rpi5 = mkRpi5;
 
       legacyPackages.${system} = pkgs;
 

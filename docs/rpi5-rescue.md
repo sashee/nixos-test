@@ -68,7 +68,7 @@ committed host config stays closed.
 1. Build the image (aarch64: build on the live Pi, or with binfmt emulation):
 
        nix build --impure --expr '
-         ((builtins.getFlake "github:sashee/nixos-test").lib.mkRpi5 {
+         ((builtins.getFlake "github:sashee/nixos-test").lib.hosts.rpi5 {
            modules = [ { services.openssh.openFirewall = true; } ];
          }).config.system.build.sdImage'
 
@@ -86,7 +86,7 @@ committed host config stays closed.
        {
          inputs.common.url = "github:sashee/nixos-test";
          outputs = { common, ... }: {
-           nixosConfigurations.rpi5 = common.lib.mkRpi5 { };
+           nixosConfigurations.rpi5 = common.lib.hosts.rpi5 { };
          };
        }
        FLAKE
