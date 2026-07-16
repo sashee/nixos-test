@@ -296,6 +296,9 @@
       monitoringNixGcTest = import ./tests/monitoring/nix-gc.nix {
         inherit nixpkgs pkgs stateVersion;
       };
+      monitoringIrohSshTest = import ./tests/monitoring/iroh-ssh.nix {
+        inherit nixpkgs pkgs stateVersion;
+      };
       nixSettingsTest = import ./tests/nix-settings.nix {
         inherit nixpkgs pkgs stateVersion;
         gcOptions = "--delete-older-than 14d";
@@ -349,6 +352,7 @@
         monitoring-reporting = monitoringReportingTest;
         monitoring-restic = monitoringResticTest;
         monitoring-nix-gc = monitoringNixGcTest;
+        monitoring-iroh-ssh = monitoringIrohSshTest;
         nix-settings = nixSettingsTest;
         nix-gc-retention = nixGcRetentionTest;
         plasma-firefox = plasmaFirefoxTest;
@@ -456,6 +460,8 @@
         monitoring-restic-driver-interactive = monitoringResticTest.driverInteractive;
         monitoring-nix-gc-driver = monitoringNixGcTest.driver;
         monitoring-nix-gc-driver-interactive = monitoringNixGcTest.driverInteractive;
+        monitoring-iroh-ssh-driver = monitoringIrohSshTest.driver;
+        monitoring-iroh-ssh-driver-interactive = monitoringIrohSshTest.driverInteractive;
         nix-settings-driver = nixSettingsTest.driver;
         nix-settings-driver-interactive = nixSettingsTest.driverInteractive;
         qemu-vm = qemuVm;

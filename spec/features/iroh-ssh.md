@@ -10,5 +10,7 @@
 
 ### Failsafe
 
-* if the iroh service does not come up for 5 minutes, port 22 is opened on the firewall
+* there is a failsafe monitoring that connects to the iroh endpoint periodically and verifies that it is working
+* if it can't connect for 5 minutes, it opens port 22 on the firewall
+* if it recovers, it closes port 22
 

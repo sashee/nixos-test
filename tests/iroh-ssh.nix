@@ -106,6 +106,12 @@ nixpkgs.lib.nixos.runTest {
     common.autoUpgrade.enable = lib.mkForce false;
     common.monitoring.enable = lib.mkForce false;
     common.irohSsh.credentialDirectory = "/etc/credentials/iroh-ssh";
+    # Short failsafe timings so the no-credential phase reaches the port-22
+    # opening quickly and the close-on-recovery lands within one short probe
+    # (production defaults: 5 minutes / hourly / 30 seconds).
+    common.irohSsh.failsafe.delaySeconds = 15;
+    common.irohSsh.failsafe.probeIntervalSeconds = 5;
+    common.irohSsh.failsafe.recheckIntervalSeconds = 5;
 
     system.stateVersion = stateVersion;
   };
@@ -166,6 +172,40 @@ nixpkgs.lib.nixos.runTest {
 
     server.wait_for_unit("sshd.service")
 
+    # Authorize the client's key up front: used first to prove the failsafe
+    # opening really admits an operator over the LAN, later through the tunnel.
+    client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N \"\" -f /root/.ssh/id_ed25519")
+    pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
+    server.succeed(f"install -d -m 0700 /root/.ssh && printf '%s\n' '{pubkey}' > /root/.ssh/authorized_keys && chmod 0600 /root/.ssh/authorized_keys")
+
+    # Failsafe: no credential yet, so the tunnel cannot come up; after
+    # delaySeconds of not-ready the watchdog opens port 22 in the firewall so
+    # the operator can still ssh in over the local network (sshd is key-only).
+    nft_chain = "${pkgs.nftables}/bin/nft list chain inet nixos-fw input-allow"
+    server.wait_for_unit("iroh-ssh-failsafe.service")
+    server.wait_until_succeeds(f"{nft_chain} | grep -F 'iroh-ssh-failsafe'", timeout=120)
+    client.wait_until_succeeds(
+        "ssh -o StrictHostKeyChecking=no root@iroh-server hostname | grep -qx iroh-server",
+        timeout=60,
+    )
+
+    # The grace period is honored: the watchdog logs the downtime it counted
+    # when opening, so the first opening must not have come earlier than
+    # delaySeconds. Log-based, so no racy wall-clock window measuring.
+    downtime = int(server.succeed(
+        "journalctl -u iroh-ssh-failsafe.service -o cat"
+        " | grep -oE 'not answering for [0-9]+ seconds' | head -n1"
+        " | grep -oE '[0-9]+'"
+    ).strip())
+    assert downtime >= 15, f"failsafe opened after only {downtime}s (delaySeconds=15)"
+
+    # A firewall reload atomically replaces the nixos-fw table, wiping the
+    # runtime rule; while the tunnel is still down the watchdog re-inserts it
+    # within one recheck. (No rule-absent assertion in between — it would
+    # race the short recheck interval.)
+    server.succeed("systemctl restart nftables.service")
+    server.wait_until_succeeds(f"{nft_chain} | grep -F 'iroh-ssh-failsafe'", timeout=60)
+
     # Provision the iroh key at runtime with iroh's own generator (no hardcoded
     # key size, future-proof). Generated to a file so the secret never lands in
     # argv; the plaintext is captured only to assert later that it does not
@@ -217,19 +257,35 @@ nixpkgs.lib.nixos.runTest {
     assert len(os.path.commonprefix([ticket, second])) >= 50, \
         f"node id changed across restart: {ticket} vs {second}"
 
-    # Port 22 stays closed to the network; the tunnel is the only way in.
+    # The tunnel is ready (relay_ticket saw a clean start), so the failsafe
+    # closes its port-22 opening within one poll; wait rather than race it.
+    server.wait_until_succeeds(
+        f"test -z \"$({nft_chain} | grep -F 'iroh-ssh-failsafe' || true)\"",
+        timeout=60,
+    )
+
+    # Port 22 is closed to the network again; the tunnel is the only way in.
     client.fail("${pkgs.python3}/bin/python3 -c \"import socket; socket.create_connection(('iroh-server', 22), timeout=2)\"")
 
     # End-to-end: ssh through the tunnel with the short ticket, stock client.
-    client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N \"\" -f /root/.ssh/id_ed25519")
-    pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
-    server.succeed(f"install -d -m 0700 /root/.ssh && printf '%s\n' '{pubkey}' > /root/.ssh/authorized_keys && chmod 0600 /root/.ssh/authorized_keys")
-
     hostname = client.wait_until_succeeds(
         "ssh -o StrictHostKeyChecking=no"
         f" -o ProxyCommand='iroh-ssh-connect {ticket}' root@tunnel hostname",
         timeout=180,
     ).strip()
     assert hostname == "iroh-server", f"unexpected hostname: {hostname}"
+
+    # Failure while the tunnel service keeps running: with sshd stopped the
+    # probe still connects over iroh but gets no banner back, so the failsafe
+    # engages — unit-state inspection would never notice this; only the
+    # end-to-end probe does. Recovery closes the port again.
+    server.succeed("systemctl stop sshd.service")
+    server.wait_until_succeeds(f"{nft_chain} | grep -F 'iroh-ssh-failsafe'", timeout=120)
+    server.succeed("systemctl is-active --quiet iroh-ssh.service")
+    server.succeed("systemctl start sshd.service")
+    server.wait_until_succeeds(
+        f"test -z \"$({nft_chain} | grep -F 'iroh-ssh-failsafe' || true)\"",
+        timeout=60,
+    )
   '';
 }
