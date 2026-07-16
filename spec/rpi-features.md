@@ -8,6 +8,7 @@
 ## Wifi
 
 * [./features/wifi.md]
+* uses IWD
 
 ### Setup helper
 
@@ -24,6 +25,7 @@
 ## DNS-over-HTTPS
 
 * [./features/doh.md]
+* captive portal handling is not needed
 
 ## Auto upgrade
 
@@ -32,6 +34,7 @@
 
 ## Auto GC
 
+* [./features/gc.md]
 * runs twice daily
 * only the last generation is kept
 
