@@ -52,10 +52,20 @@ regenerate on the booted Pi if needed.
 
 ## 3. Console
 
-HDMI + keyboard: log in as `nixos` (passwordless sudo) and run the
-`nft add rule ...` line above directly. For an unbootable system, edit
-`cmdline.txt` on the FAT boot partition (`systemd.unit=rescue.target`, or
-`init=` pointing at a store path's init).
+The `nixos` password is locked and root has none, so getty login with HDMI +
+keyboard is not possible. Console access goes through `cmdline.txt` on the FAT
+boot partition instead (pull the card, or edit it from section 2's mount):
+
+- `systemd.debug_shell=1` -- root shell on tty9 (Ctrl+Alt+F9) from early boot;
+  run the `nft add rule ...` line above there. Remove the parameter afterwards:
+  the shell is unauthenticated.
+- `systemd.unit=rescue.target systemd.setenv=SYSTEMD_SULOGIN_FORCE=1` -- the
+  sulogin force flag is required because root's password is locked.
+- Unbootable system: `init=` pointing at a store path's init, as before.
+
+For planned console work, set a temporary password over ssh first
+(`sudo passwd nixos`), and lock it again afterwards
+(`sudo usermod -p '!' nixos`).
 
 ## 4. Fresh device bootstrap (no secrets yet)
 
