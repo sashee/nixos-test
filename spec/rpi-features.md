@@ -2,13 +2,12 @@
 
 ## System
 
-* zram swap enabled
+* [./features/system.md]
 * DWARF/BTF disabled in the kernel due to disk space running out when compiling otherwise
 
 ## Wifi
 
-* uses IWD
-* connects automatically to known networks
+* [./features/wifi.md]
 
 ### Setup helper
 
@@ -24,14 +23,11 @@
 
 ## DNS-over-HTTPS
 
-* non-DoH DNS requests are blocked by the firewall
-* a known set of DoH servers are configured
+* [./features/doh.md]
 
 ## Auto upgrade
 
-* runs daily
-* updates the flake inputs and then rebuilds the system
-* switch only on boot, not live
+* [./features/auto-upgrade.md]
 * reboot if a new generation was created
 
 ## Auto GC
@@ -41,37 +37,21 @@
 
 ## Monitoring
 
+* [./features/monitoring.md]
 * runs every 30 minutes
-* reports success:
-    * backups ran
-    * disk is alright
-    * auto-upgrade run successfully in the last 14 days
-    * auto-gc ran successfully in the last 3 days
-    * number of generations is not too big
-* plus a couple of infos: disk usage, last boot time, kernel version, common repo rev + last updated + url
-* remote url is configured outside the store, it is an encrypted credential that is loaded by the systemd unit
-* uses the healthchecks API
 
 ## Backups
 
-* runs daily, based on Restic
-* configuration in the config + credentials encrypted in a directory outside the store that are loaded via systemd
+* [./features/backups.md]
 
 ## Dotfiles
 
-* the nix-utils available to the user's path
+* [./features/dotfiles.md]
 
 ## Iroh SSH
 
-* SSH is listening on port 22
-* firewall denies incoming connections on port 22
-* iroh-based port forwarding exposes port 22, allowing ssh access via iroh
-* it requires the secret key that is loaded using an encrypted credential
-* if the credential is not provided, the service is not started
-* the service auto-restarts
-* only keys are allowed, no passwords
+* [./features/iroh-ssh.md]
 
 ## Firewall
 
-* all inbound connections are dropped by default
-* denied connections are logged with a rate-limiter
+* [./features/firewall.md]

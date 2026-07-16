@@ -1,0 +1,3 @@
+## System
+
+* zram swap enabled
