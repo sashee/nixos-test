@@ -65,7 +65,6 @@ in
     isNormalUser = true;
     extraGroups = [ "wheel" ];
     packages = [ nixUtils ];  # sandboxed nix-utils on the user's PATH only
-    initialPassword = "nixos";
     openssh.authorizedKeys.keys = [
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMLL9PCVcxgn98HQPQWNR618rPF0uxnGDQaUNeDCxumI sashee@sashee-laptop"
     ];
