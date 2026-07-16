@@ -295,8 +295,12 @@ When `prune.ignoreErrors = true`, backup success is preserved even if `restic
 forget --prune` fails on an append-only repository.
 
 `modules/monitoring.nix` runs daily health checks — SMART disk status, restic
-backup age, local disk-space usage, NixOS system-generation count, and
-auto-upgrade age — and reports the result to a Healthchecks-compatible URL. It is
+backup age, local disk-space usage, NixOS system-generation count,
+auto-upgrade age, nix-gc age, and iroh-ssh health (the tunnel service is
+running and the failsafe has not opened firewall port 22 — a missing
+credential also fails this check on purpose: broken remote management is
+exactly what it alerts on) — and reports the result to a Healthchecks-compatible
+URL. It is
 **enabled by default**; when reporting is enabled (also the default), the host
 must set `common.monitoring.report.credentialDirectory` (the directory holding
 the URL credential) or evaluation fails. Disable the whole check with
@@ -315,6 +319,25 @@ network (`services.openssh` is enabled with `mkDefault` and
 **enabled by default**; the host must set
 `common.irohSsh.credentialDirectory` or evaluation fails
 (`common.irohSsh.enable = false` opts out).
+
+A **failsafe** watchdog probes the tunnel end-to-end: it dials the host's own
+listener over iroh (using the public short ticket from the journal and an
+ephemeral key) and checks that sshd answers with its banner — hourly while
+probes succeed, then every 30 seconds after a failure so the 5-minute window
+is actually measured. If the tunnel has not answered for 5 continuous minutes
+— missing or lost credential, crash loop, blocked relay, dead sshd all read
+the same — it opens firewall port 22 at runtime so the operator can still
+ssh in over the local network and repair remote management, and closes it
+within one recheck of the first successful probe. sshd is key-only, so an
+engaged failsafe exposes only the ssh handshake to the local network. This
+also makes first-time provisioning possible over the LAN: the first probe
+runs at boot, so a freshly installed host with no iroh credential yet (a
+traffic-free journal check) has port 22 open minutes after boot until the
+secret lands. The probe inspects nothing about the listener's implementation
+(only the ticket text in the journal), keeping the binary a faithful dumbpipe
+derivative. Tune or disable with
+`common.irohSsh.failsafe.{enable,delaySeconds,probeIntervalSeconds,recheckIntervalSeconds}`;
+the monitoring check reports when the failsafe is engaged.
 
 `iroh-ssh` is wire-compatible with [dumbpipe](https://www.dumbpipe.dev) (same
 ALPN and handshake), reduced to the ssh-tunnel use case and split into one

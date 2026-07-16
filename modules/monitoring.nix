@@ -45,6 +45,7 @@ let
       cfg.tools.gawk
       cfg.tools.gnugrep
       cfg.tools.jq
+      cfg.tools.nftables
       cfg.tools.smartmontools
       cfg.tools.systemd
     ];
@@ -61,6 +62,8 @@ let
       nix_gc_enabled=${lib.escapeShellArg (lib.boolToString cfg.nixGc.enable)}
       nix_gc_automatic_enabled=${lib.escapeShellArg (lib.boolToString config.nix.gc.automatic)}
       generations_enabled=${lib.escapeShellArg (lib.boolToString cfg.generations.enable)}
+      iroh_ssh_enabled=${lib.escapeShellArg (lib.boolToString cfg.irohSsh.enable)}
+      iroh_ssh_firewall_managed=${lib.escapeShellArg (lib.boolToString (config.networking.firewall.enable && config.networking.nftables.enable))}
       restic_backups=(${resticBackupArgs})
       flake_lock=${lib.escapeShellArg (if cfg.flakeLock.path == null then "" else cfg.flakeLock.path)}
       flake_lock_input=${lib.escapeShellArg cfg.flakeLock.input}
@@ -279,6 +282,38 @@ let
         check_unit_recent "nix-gc" "nix-gc.service" "${cfg.nixGc.maxAge}"
       }
 
+      check_iroh_ssh() {
+        if [ "$iroh_ssh_enabled" != "true" ]; then
+          skip "iroh-ssh: disabled"
+          return 0
+        fi
+
+        # A skipped (missing credential) or restart-looping unit reads as
+        # inactive and must alert: it is exactly the broken-remote-management
+        # state monitoring exists to catch. A running-but-unreachable tunnel
+        # is caught via the failsafe rule below: the failsafe watchdog probes
+        # the tunnel end-to-end and opens port 22 when it stops answering.
+        state="$(systemctl is-active iroh-ssh.service || true)"
+        if [ "$state" != "active" ]; then
+          fail "iroh-ssh: iroh-ssh.service is $state"
+          return 0
+        fi
+
+        if [ "$iroh_ssh_firewall_managed" != "true" ]; then
+          ok "iroh-ssh: service running"
+          return 0
+        fi
+
+        # "Port 22 closed" = the failsafe's tagged runtime rule is absent from
+        # the firewall's input-allow chain (there is no static 22-accept).
+        # Capture instead of grep -q to avoid SIGPIPE-under-pipefail traps.
+        if [ -n "$(nft list chain inet nixos-fw input-allow | grep -F 'iroh-ssh-failsafe' || true)" ]; then
+          fail "iroh-ssh: failsafe engaged, port 22 open (tunnel not answering)"
+        else
+          ok "iroh-ssh: service running, port 22 closed"
+        fi
+      }
+
       check_generations() {
         if [ "$generations_enabled" != "true" ]; then
           skip "generations: disabled"
@@ -337,6 +372,7 @@ let
       check_auto_upgrade
       check_nix_gc
       check_generations
+      check_iroh_ssh
 
       log "finished=$(date --iso-8601=seconds)"
 
@@ -417,6 +453,7 @@ in
       gawk = lib.mkPackageOption pkgs "gawk" { };
       gnugrep = lib.mkPackageOption pkgs "gnugrep" { };
       jq = lib.mkPackageOption pkgs "jq" { };
+      nftables = lib.mkPackageOption pkgs "nftables" { };
       smartmontools = lib.mkPackageOption pkgs "smartmontools" { };
       systemd = lib.mkPackageOption pkgs "systemd" { };
     };
@@ -505,7 +542,7 @@ in
 
       maxAge = lib.mkOption {
         type = lib.types.str;
-        default = "3d";
+        default = "14d";
         description = "Maximum age of the last successful nix-gc run. Supports Ns, Nm, Nh, Nd.";
       };
     };
@@ -522,6 +559,18 @@ in
         default = 20;
         description = "Maximum allowed number of NixOS system generations.";
       };
+    };
+
+    irohSsh.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = (config.common ? irohSsh) && config.common.irohSsh.enable;
+      defaultText = lib.literalExpression "config.common.irohSsh.enable";
+      description = ''
+        Whether to check that the iroh SSH tunnel service is running and that
+        its failsafe has not opened firewall port 22. A stopped service fails
+        the check even when the credential is simply missing — a lost
+        credential is exactly the broken-remote-management state to alert on.
+      '';
     };
 
     flakeLock = {

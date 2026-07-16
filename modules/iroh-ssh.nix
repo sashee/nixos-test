@@ -6,6 +6,93 @@ let
   pkg = pkgs.callPackage ../packages/iroh-ssh/package.nix { };
 
   secretPath = "${cfg.credentialDirectory}/iroh-secret";
+
+  # Eval-time gate for the failsafe, same as connectivity-fallback: runtime
+  # nft inserts only make sense when this host runs the nftables firewall.
+  firewallManaged = config.networking.firewall.enable && config.networking.nftables.enable;
+
+  # Marks the failsafe's runtime rule so open/close/monitoring all find it
+  # unambiguously in `nft list chain inet nixos-fw input-allow`.
+  failsafeComment = "iroh-ssh-failsafe";
+
+  failsafeScript = pkgs.writeShellApplication {
+    name = "iroh-ssh-failsafe";
+    runtimeInputs = [ pkg pkgs.nftables pkgs.systemd pkgs.coreutils pkgs.gnugrep pkgs.gnused ];
+    text = ''
+      probe_interval=${toString cfg.failsafe.probeIntervalSeconds}
+      recheck_interval=${toString cfg.failsafe.recheckIntervalSeconds}
+      down=0
+
+      # Liveness is a functional probe, not unit-state inspection: connect
+      # through the tunnel itself (the short ticket is public — node id +
+      # relay urls — and the listener prints it at every start) and expect
+      # sshd's banner back. Four bytes of "SSH-" prove the relay path, the
+      # QUIC handshake, the local forward, and sshd answering — so a missing
+      # credential, a crash loop, a blocked relay, and a dead sshd all read
+      # as the same thing: not ready. Nothing here depends on the listener's
+      # implementation except the ticket-grep pattern below — adjust that if
+      # the listener is ever swapped for stock dumbpipe.
+      probe_ok() {
+        # -b: this boot only. A unit that never started this boot leaves no
+        # ticket, which correctly reads as not-ready.
+        ticket="$(journalctl -b -u iroh-ssh.service -o cat | grep -oE 'endpoint[a-z0-9]+' | tail -n1 || true)"
+        [ -n "$ticket" ] || return 1
+        # sshd speaks first, so nothing needs to be sent. head's early close
+        # SIGPIPEs the connect tool — guard the pipeline; timeout bounds it.
+        banner="$(timeout 15 iroh-ssh-connect "$ticket" </dev/null 2>/dev/null | head -c 4 || true)"
+        [ "$banner" = "SSH-" ]
+      }
+
+      port_is_open() {
+        # Capture instead of grep -q: an early-exit grep can SIGPIPE nft and
+        # turn a found match into a non-zero pipeline under pipefail.
+        [ -n "$(nft list chain inet nixos-fw input-allow | grep -F '${failsafeComment}' || true)" ]
+      }
+
+      open_port() {
+        if ! port_is_open; then
+          nft insert rule inet nixos-fw input-allow tcp dport 22 accept comment '"${failsafeComment}"'
+          echo "iroh-ssh tunnel not answering for $down seconds: opened port 22"
+        fi
+      }
+
+      close_port() {
+        # Delete by handle; `nft -a` prints one rule per line with its handle.
+        nft -a list chain inet nixos-fw input-allow \
+          | sed -En 's/.*comment "${failsafeComment}".*# handle ([0-9]+)$/\1/p' \
+          | while read -r handle; do
+              nft delete rule inet nixos-fw input-allow handle "$handle"
+              echo "iroh-ssh tunnel answering: closed port 22"
+            done
+      }
+
+      # Two-rate loop: while probes succeed there is one iroh connection per
+      # probe_interval (hourly by default); a failure switches to the fast
+      # recheck_interval so the delaySeconds window is actually measurable
+      # and a recovered tunnel closes port 22 promptly. The first probe runs
+      # right away, so a credential-less boot (journal grep only, no relay
+      # traffic) opens port 22 delaySeconds after boot, not an hour later.
+      # Counting iterations is monotonic by construction: wall-clock jumps
+      # (NTP, tests warping `date -s`) must not trip the failsafe early, so
+      # no `date` arithmetic here.
+      while true; do
+        if probe_ok; then
+          down=0
+          close_port
+          sleep "$probe_interval"
+        else
+          down=$((down + recheck_interval))
+          if [ "$down" -ge ${toString cfg.failsafe.delaySeconds} ]; then
+            # Re-checked every recheck while down: a firewall reload
+            # atomically replaces the nixos-fw table, silently dropping the
+            # runtime rule.
+            open_port
+          fi
+          sleep "$recheck_interval"
+        fi
+      done
+    '';
+  };
 in
 {
   options.common.irohSsh = {
@@ -22,6 +109,46 @@ in
         Directory containing the systemd-creds-encrypted iroh secret key.
         Required when enabled; left unset so a host cannot silently forget it.
       '';
+    };
+
+    failsafe = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Open firewall port 22 while the iroh tunnel has not been ready for
+          delaySeconds (missing credential, crash loop, unreachable relay), so
+          the operator can still ssh in over the local network and repair
+          remote management; close it again as soon as the tunnel is ready.
+          Only active when this host runs the nftables firewall.
+        '';
+      };
+
+      delaySeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 300;
+        description = "Continuous not-ready seconds before port 22 is opened.";
+      };
+
+      probeIntervalSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 3600;
+        description = ''
+          Seconds between tunnel probes while the last probe succeeded. Each
+          probe dials the host's own listener over iroh with an ephemeral
+          key, so this is the steady-state relay traffic cadence.
+        '';
+      };
+
+      recheckIntervalSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 30;
+        description = ''
+          Seconds between probes after a failure: measures the delaySeconds
+          window, and bounds how quickly an engaged failsafe closes port 22
+          once the tunnel answers again.
+        '';
+      };
     };
 
   };
@@ -90,6 +217,25 @@ in
         RemoveIPC = true;
         KeyringMode = "private";
         UMask = "0077";
+      };
+    };
+
+    # Failsafe: while the tunnel is not ready, the host would be unreachable
+    # for exactly the repairs that need it, so after delaySeconds of downtime
+    # port 22 opens to the local network (sshd itself is key-only) and closes
+    # the moment the tunnel is ready again. Runs as root (nft needs
+    # CAP_NET_ADMIN); ordered after nftables.service because the nixos-fw
+    # table must exist before rules can be inserted (see connectivity-fallback
+    # for the full rationale on both the ordering and why the rule must live
+    # in nixos-fw's own input-allow chain).
+    systemd.services.iroh-ssh-failsafe = lib.mkIf (cfg.failsafe.enable && firewallManaged) {
+      description = "Open firewall port 22 while the iroh SSH tunnel is down";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "nftables.service" ];
+      serviceConfig = {
+        ExecStart = lib.getExe failsafeScript;
+        Restart = "always";
+        RestartSec = 5;
       };
     };
   };

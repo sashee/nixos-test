@@ -8,8 +8,9 @@
     * sashee: sudo, can only ssh in, can't log in with password
 * graphical
 * never suspend
-* system language is Hungarian
+* system and keyboard language is Hungarian
 * LUKS with boot password to unlock the encrypted main drive
+* bluetooth disabled
 
 ## Wifi
 

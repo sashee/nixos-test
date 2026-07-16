@@ -84,6 +84,12 @@ nixpkgs.lib.nixos.runTest {
     # and its catch-up GC starves the monitoring run under slow TCG emulation.
     nix.gc.automatic = lib.mkForce false;
 
+    # No relay is reachable in this test, so the tunnel could never become
+    # ready: the (correct) [FAIL] would poison the OK run, and the failsafe
+    # would open port 22 mid-test. The check itself is covered by the
+    # dedicated monitoring-iroh-ssh test; the tunnel by tests/iroh-ssh.nix.
+    common.irohSsh.enable = lib.mkForce false;
+
     # Keep the Pi's real 85% disk-space threshold satisfied by giving the VM root fs
     # headroom -- avoids overriding the monitoring config just to make the check pass.
     virtualisation.diskSize = 8192;
@@ -274,6 +280,7 @@ nixpkgs.lib.nixos.runTest {
     platform.wait_until_succeeds("grep -Fxq 'POST /health' /var/lib/monitoring-platform/events.log", timeout=600)
     assert_events(["POST /health/start", "POST /health/log", "POST /health"])
     platform.succeed("grep -F '[SKIP] smart: disabled' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed("grep -F '[SKIP] iroh-ssh: disabled' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F '[OK] restic test: restic-backups-test.service last succeeded' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F '[OK] auto-upgrade: nixos-upgrade.service last succeeded' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F '[OK] disk-space:' /var/lib/monitoring-platform/bodies.log")
