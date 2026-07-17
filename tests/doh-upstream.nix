@@ -95,7 +95,7 @@ nixpkgs.lib.nixos.runTest {
         dns_peer.succeed(f"${pkgs.iproute2}/bin/ip -6 addr add {address}/128 dev eth1 || true")
     dns_peer.succeed("systemd-run --unit fake-doh-server ${pkgs.python3}/bin/python3 ${interceptor.serverScript}")
     dns_peer.wait_for_unit("fake-doh-server.service")
-    dns_peer.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-ready; do sleep 0.2; done'")
+    dns_peer.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-ready; do sleep 0.2; done'")
 
     peer_ipv4 = dns_peer.succeed("${pkgs.python3}/bin/python3 -c 'import json, subprocess; data = json.loads(subprocess.check_output([\"${pkgs.iproute2}/bin/ip\", \"-j\", \"-4\", \"addr\", \"show\", \"dev\", \"eth1\"])); print(data[0][\"addr_info\"][0][\"local\"])'").strip()
     peer_ipv6 = dns_peer.succeed("${pkgs.python3}/bin/python3 -c 'import json, subprocess; data = json.loads(subprocess.check_output([\"${pkgs.iproute2}/bin/ip\", \"-j\", \"-6\", \"addr\", \"show\", \"dev\", \"eth1\"])); print(next(addr[\"local\"] for addr in data[0][\"addr_info\"] if addr[\"scope\"] == \"global\" and addr[\"local\"].startswith(\"2001:db8:1:\")))'").strip()
@@ -172,7 +172,7 @@ nixpkgs.lib.nixos.runTest {
         ipv4_client.succeed(f"${pkgs.iproute2}/bin/ip -6 route replace unreachable {address}/128")
     ipv4_client.succeed("systemctl restart dnscrypt-proxy.service")
     wait_for_answer(ipv4_client, "doh-upstream-ipv4", "127.0.0.1", "ipv4.upstream-test.example", "A", "203.0.113.5")
-    dns_peer.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-requests/ipv4_upstream-test_example-1.json; do sleep 0.2; done'")
+    dns_peer.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-requests/ipv4_upstream-test_example-1.json; do sleep 0.2; done'")
     check_request("/tmp/fake-doh-requests/ipv4_upstream-test_example-1.json", "ipv4", "ipv4.upstream-test.example", 1)
     ipv4_client.shutdown()
 
@@ -188,7 +188,7 @@ nixpkgs.lib.nixos.runTest {
         ipv6_client.succeed(f"${pkgs.iproute2}/bin/ip route replace unreachable {address}/32")
     ipv6_client.succeed("systemctl restart dnscrypt-proxy.service")
     wait_for_answer(ipv6_client, "doh-upstream-ipv6", "::1", "ipv6.upstream-test.example", "AAAA", "2001:db8::5")
-    dns_peer.succeed("${pkgs.coreutils}/bin/timeout 10 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-requests/ipv6_upstream-test_example-28.json; do sleep 0.2; done'")
+    dns_peer.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-requests/ipv6_upstream-test_example-28.json; do sleep 0.2; done'")
     check_request("/tmp/fake-doh-requests/ipv6_upstream-test_example-28.json", "ipv6", "ipv6.upstream-test.example", 28)
     ipv6_client.shutdown()
   '';

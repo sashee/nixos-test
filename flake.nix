@@ -489,23 +489,23 @@
       };
       anyaFeherLaptopMonitoringAutoUpgradeTest = import ./tests/monitoring/auto-upgrade.nix {
         inherit nixpkgs pkgs stateVersion;
-        commonDesktopModule = anyaFeherLaptopSystemModule;
+        commonDesktopModule = anyaFeherLaptopMonitoringNode;
       };
       anyaFeherLaptopMonitoringDiskSpaceTest = import ./tests/monitoring/disk-space.nix {
         inherit nixpkgs pkgs stateVersion;
-        commonDesktopModule = anyaFeherLaptopSystemModule;
+        commonDesktopModule = anyaFeherLaptopMonitoringNode;
       };
       anyaFeherLaptopMonitoringGenerationsTest = import ./tests/monitoring/generations.nix {
         inherit nixpkgs pkgs stateVersion;
-        commonDesktopModule = anyaFeherLaptopSystemModule;
+        commonDesktopModule = anyaFeherLaptopMonitoringNode;
       };
       anyaFeherLaptopMonitoringReportingTest = import ./tests/monitoring/reporting.nix {
         inherit nixpkgs pkgs stateVersion;
-        commonDesktopModule = anyaFeherLaptopSystemModule;
+        commonDesktopModule = anyaFeherLaptopMonitoringNode;
       };
       anyaFeherLaptopMonitoringResticTest = import ./tests/monitoring/restic.nix {
         inherit nixpkgs pkgs stateVersion;
-        commonDesktopModule = anyaFeherLaptopSystemModule;
+        commonDesktopModule = anyaFeherLaptopMonitoringNode;
       };
       # flakeRef must equal the host's common.autoUpgrade.flake: the test sets
       # it too, and equal definitions merge while different ones conflict.
@@ -550,6 +550,20 @@
         imports = [ anyaFeherLaptopSystemModule ];
         virtualisation.cores = lib.mkDefault 2;
         virtualisation.memorySize = lib.mkDefault 4096;
+      };
+      # Node wrapper for the monitoring tests against anya's real config.
+      # - UTC (fix): tests/monitoring/auto-upgrade.nix boots the RTC at 23:00 UTC
+      #   and jumps the clock to 02:05 to clear nixos-upgrade.timer's 2h
+      #   Persistent catch-up window. anya's real Europe/Budapest (UTC+2) makes
+      #   boot already 01:00 local, so 02:05 falls *inside* the catch-up window
+      #   and the overdue upgrade never fires. Pin UTC so the timer arithmetic
+      #   matches the (passing) generic node; monitoring itself is tz-agnostic.
+      # - autologin off: monitoring is headless, so drop the pointless heavy
+      #   Plasma session (desktop coverage lives in the plasma/locale tests).
+      anyaFeherLaptopMonitoringNode = { lib, ... }: {
+        imports = [ anyaFeherLaptopSystemModule ];
+        time.timeZone = lib.mkForce "UTC";
+        services.displayManager.autoLogin.enable = lib.mkForce false;
       };
       anyaFeherLaptopPlasmaFirefoxTest = import ./tests/plasma-firefox.nix {
         inherit nixpkgs pkgs stateVersion;
