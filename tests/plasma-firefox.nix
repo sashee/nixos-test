@@ -1,4 +1,8 @@
-{ nixpkgs, pkgs, commonDesktopModule, qemuDemoUserModule, stateVersion }:
+# `user` (required): the already-configured desktop user whose session is
+# exercised — "demo" for the generic stack (with qemuDemoUserModule), or the
+# host's real user when commonDesktopModule is a host config (then
+# qemuDemoUserModule stays null; the host provides its own autologin).
+{ nixpkgs, pkgs, commonDesktopModule, qemuDemoUserModule ? null, stateVersion, user }:
 
 let
   testHttpServer = pkgs.writeText "plasma-firefox-http-server.py" ''
@@ -44,10 +48,8 @@ nixpkgs.lib.nixos.runTest {
   globalTimeout = 300;
 
   nodes.machine = {
-    imports = [
-      commonDesktopModule
-      qemuDemoUserModule
-    ];
+    imports = [ commonDesktopModule ]
+      ++ nixpkgs.lib.optional (qemuDemoUserModule != null) qemuDemoUserModule;
 
     networking.hostName = "plasma-firefox-test";
     common.autoUpgrade.enable = false;
@@ -61,8 +63,9 @@ nixpkgs.lib.nixos.runTest {
   testScript = ''
     machine.start()
     machine.wait_for_unit("graphical.target")
-    machine.wait_until_succeeds("pgrep -u demo plasmashell")
-    machine.wait_until_succeeds("pgrep -u demo kwin_wayland")
+    machine.wait_until_succeeds("pgrep -u ${user} plasmashell")
+    machine.wait_until_succeeds("pgrep -u ${user} kwin_wayland")
+    uid = machine.succeed("id -u ${user}").strip()
     machine.screenshot("plasma-desktop")
 
     machine.succeed("rm -f /tmp/test-http-ready /tmp/request-firefox /tmp/request-lo-real /tmp/request-lo-wrapped /tmp/request-lo-desktop")
@@ -71,7 +74,7 @@ nixpkgs.lib.nixos.runTest {
     machine.wait_until_succeeds("test -e /tmp/test-http-ready")
     machine.succeed("curl --fail http://127.0.0.1:8000/firefox.html")
 
-    machine.succeed("su - demo -c 'firefox --headless --screenshot /tmp/firefox-page.png http://127.0.0.1:8000/firefox.html >/tmp/firefox.log 2>&1'")
+    machine.succeed("su - ${user} -c 'firefox --headless --screenshot /tmp/firefox-page.png http://127.0.0.1:8000/firefox.html >/tmp/firefox.log 2>&1'")
     machine.succeed("test -s /tmp/firefox-page.png")
     machine.copy_from_vm("/tmp/firefox-page.png")
 
@@ -80,15 +83,15 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.libreoffice-qt6-still}/bin/libreoffice --headless -env:UserInstallation=file:///tmp/lo-real-profile --convert-to pdf --outdir /tmp/lo-real-out http://127.0.0.1:8000/lo-real.html || true")
     machine.wait_until_succeeds("test -e /tmp/request-lo-real")
 
-    machine.succeed("su - demo -c 'XDG_RUNTIME_DIR=/run/user/1000 ${pkgs.coreutils}/bin/timeout 30 /run/current-system/sw/bin/libreoffice --headless -env:UserInstallation=file:///tmp/lo-wrapped-profile --convert-to pdf --outdir /tmp/lo-wrapped-out http://127.0.0.1:8000/lo-wrapped.html || true'")
+    machine.succeed(f"su - ${user} -c 'XDG_RUNTIME_DIR=/run/user/{uid} ${pkgs.coreutils}/bin/timeout 30 /run/current-system/sw/bin/libreoffice --headless -env:UserInstallation=file:///tmp/lo-wrapped-profile --convert-to pdf --outdir /tmp/lo-wrapped-out http://127.0.0.1:8000/lo-wrapped.html || true'")
     machine.succeed("sleep 2")
     machine.fail("test -e /tmp/request-lo-wrapped")
 
-    machine.succeed("pkill -u demo -f libreoffice || true")
+    machine.succeed("pkill -u ${user} -f libreoffice || true")
     machine.succeed("rm -f /tmp/lo-desktop.log")
-    machine.succeed("su - demo -c '(${pkgs.coreutils}/bin/env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus XDG_DATA_DIRS=/run/current-system/sw/share WAYLAND_DISPLAY=wayland-0 ${pkgs.coreutils}/bin/timeout 45 ${pkgs.gtk3}/bin/gtk-launch writer http://127.0.0.1:8000/lo-desktop.html >/tmp/lo-desktop.log 2>&1 || true) &'")
+    machine.succeed(f"su - ${user} -c '(${pkgs.coreutils}/bin/env XDG_RUNTIME_DIR=/run/user/{uid} DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus XDG_DATA_DIRS=/run/current-system/sw/share WAYLAND_DISPLAY=wayland-0 ${pkgs.coreutils}/bin/timeout 45 ${pkgs.gtk3}/bin/gtk-launch writer http://127.0.0.1:8000/lo-desktop.html >/tmp/lo-desktop.log 2>&1 || true) &'")
     machine.wait_until_succeeds("grep -F 'lo-desktop.html' /tmp/lo-desktop.log")
     machine.fail("test -e /tmp/request-lo-desktop")
-    machine.succeed("pkill -u demo -f libreoffice || true")
+    machine.succeed("pkill -u ${user} -f libreoffice || true")
   '';
 }

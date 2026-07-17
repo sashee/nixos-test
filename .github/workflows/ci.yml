@@ -145,13 +145,67 @@ jobs:
         # .#rpi-all-tests aggregate would force one big whole-flake eval.
         run: make run-rpi-tests MAX_JOBS=1
 
+  host-checks:
+    # Per-host check sets (lib.checkSets.<host>): each laptop host's tests run
+    # against its real config in a job parallel to the generic x86 and rpi
+    # suites, like the rpi's own aarch64 set. New host = one matrix entry.
+    strategy:
+      matrix:
+        host: [anya-feher-laptop]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # This job builds incoming flake code; don't leave a token in .git.
+          persist-credentials: false
+
+      - name: Reclaim disk space
+        run: |
+          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
+          # || true so a path missing on the arm64 image is not fatal.
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache \
+            || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
+        with:
+          enable_kvm: true
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Add swap
+        run: |
+          swapon --show || true
+          sudo fallocate -l 8G /mnt/ci-swapfile
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+          swapon --show
+          free -h
+          df -h
+
+      - name: Run host checks (per-check eval, built one at a time)
+        run: make run-host-tests HOST=${{ matrix.host }} MAX_JOBS=1
+
   automerge:
     # DIY auto-merge: main has no branch protection (so update-flake.yml can
     # push to it with the plain GITHUB_TOKEN), which also disables GitHub's
     # native auto-merge. `needs` gives the same semantics: this job only runs
     # when both checks passed. Draft = "don't auto-merge yet". Owner-only so
     # fork PRs (read-only token anyway) are never merged unreviewed.
-    needs: [full-build, rpi]
+    needs: [full-build, rpi, host-checks]
     if: >
       github.event_name == 'pull_request' &&
       !github.event.pull_request.draft &&

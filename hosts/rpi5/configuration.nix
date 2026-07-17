@@ -65,9 +65,7 @@ in
     isNormalUser = true;
     extraGroups = [ "wheel" ];
     packages = [ nixUtils ];  # sandboxed nix-utils on the user's PATH only
-    openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMLL9PCVcxgn98HQPQWNR618rPF0uxnGDQaUNeDCxumI sashee@sashee-laptop"
-    ];
+    openssh.authorizedKeys.keys = [ (import ../../lib/ssh-keys.nix).sashee ];
   };
 
   # Host-specific restic backups (restic module imported above), e.g.:

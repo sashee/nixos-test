@@ -6,7 +6,7 @@ MAX_JOBS := 2
 # so keep EVAL_JOBS * 2 GiB well under available RAM.
 EVAL_JOBS := 3
 
-.PHONY: all-tests test-results qemu-result update-flake run-tests run-rpi-tests run-checks export-rpi-kernel import-rpi-kernel
+.PHONY: all-tests test-results qemu-result host-vm update-flake run-tests run-rpi-tests run-host-tests run-checks export-rpi-kernel import-rpi-kernel
 
 all-tests: test-results
 
@@ -16,14 +16,24 @@ test-results:
 qemu-result:
 	$(NIX) build -L --max-jobs $(MAX_JOBS) "$(FLAKE)#qemu-plasma-result"
 
+# QEMU runner for a laptop host config; run it with ./result/bin/run-<host>-vm
+host-vm:
+	@test -n "$(HOST)" || { echo "usage: make host-vm HOST=<host>" >&2; exit 1; }
+	$(NIX) build -L --max-jobs $(MAX_JOBS) "$(FLAKE)#$(HOST)-vm"
+
 update-flake:
 	$(NIX) flake update
 
 run-tests:
-	$(MAKE) run-checks SYSTEM=x86_64-linux
+	$(MAKE) run-checks SYSTEM=x86_64-linux SET=generic-x86
 
 run-rpi-tests:
 	$(MAKE) run-checks SYSTEM=aarch64-linux
+
+# Per-host check set (lib.checkSets.<host>), run by the host's own CI job.
+run-host-tests:
+	@test -n "$(HOST)" || { echo "usage: make run-host-tests HOST=<host>" >&2; exit 1; }
+	$(MAKE) run-checks SYSTEM=x86_64-linux SET=$(HOST)
 
 # CI: build the patched rpi kernel (the expensive part every rpi check reuses)
 # and pack its closure into a file:// binary cache for upload as a workflow
@@ -54,11 +64,16 @@ import-rpi-kernel:
 # short-lived process, then build the .drvs one by one with a small, eval-free
 # client. Memory stays bounded by the largest single check no matter how many
 # tests are added. Outputs land in results/$(SYSTEM)/<check-name>.
+#
+# SET (optional) names a lib.checkSets.<SET> subset to run; the checks are
+# still addressed as checks.$(SYSTEM).<name> (names are globally unique).
+# Without SET the whole checks.$(SYSTEM) runs (the rpi/aarch64 path).
 run-checks:
-	@test -n "$(SYSTEM)" || { echo "use 'make run-tests' or 'make run-rpi-tests'" >&2; exit 1; }
+	@test -n "$(SYSTEM)" || { echo "use 'make run-tests', 'make run-rpi-tests' or 'make run-host-tests HOST=...'" >&2; exit 1; }
 	set -euo pipefail; \
-	attrs=$$($(NIX) eval --raw "$(FLAKE)#checks.$(SYSTEM)" --apply 'cs: builtins.concatStringsSep "\n" (builtins.attrNames cs)'); \
-	echo "checks.$(SYSTEM):" $$attrs; \
+	names_attr="$(if $(SET),lib.checkSets.$(SET),checks.$(SYSTEM))"; \
+	attrs=$$($(NIX) eval --raw "$(FLAKE)#$$names_attr" --apply 'cs: builtins.concatStringsSep "\n" (builtins.attrNames cs)'); \
+	echo "$$names_attr:" $$attrs; \
 	mkdir -p .drvs/$(SYSTEM) results/$(SYSTEM); \
 	echo "$$attrs" | xargs -P $(EVAL_JOBS) -I NAME -- sh -c "$(NIX) path-info --derivation '$(FLAKE)#checks.$(SYSTEM).NAME' > .drvs/$(SYSTEM)/NAME"; \
 	for name in $$attrs; do \

@@ -1,4 +1,8 @@
-{ nixpkgs, pkgs, commonDesktopModule, qemuDemoUserModule, stateVersion }:
+# `user` (required): the already-configured desktop user whose session is
+# exercised — "demo" for the generic stack (with qemuDemoUserModule), or the
+# host's real user when commonDesktopModule is a host config (then
+# qemuDemoUserModule stays null; the host provides its own autologin).
+{ nixpkgs, pkgs, commonDesktopModule, qemuDemoUserModule ? null, stateVersion, user }:
 
 let
   testHttpServer = pkgs.writeText "locale-firefox-http-server.py" ''
@@ -32,20 +36,20 @@ let
         server.serve_forever()
   '';
 
-  firefoxGuiCommand = "env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus MOZ_ENABLE_WAYLAND=1 firefox http://127.0.0.1:8000/firefox.html >/tmp/firefox-gui.log 2>&1 &";
 in
 nixpkgs.lib.nixos.runTest {
   name = "locale-firefox";
   hostPkgs = pkgs;
   globalTimeout = 420;
 
-  nodes.english = {
-    imports = [
-      commonDesktopModule
-      qemuDemoUserModule
-    ];
+  nodes.english = { lib, ... }: {
+    imports = [ commonDesktopModule ]
+      ++ nixpkgs.lib.optional (qemuDemoUserModule != null) qemuDemoUserModule;
 
     networking.hostName = "locale-english-test";
+    # mkForce: a host config passed as commonDesktopModule may set its own
+    # locale (anya: hu_HU); this node tests the English mapping regardless.
+    common.locale.default = lib.mkForce "en_US.UTF-8";
     common.autoUpgrade.enable = false;
     common.monitoring.enable = false;
     common.irohSsh.enable = false;
@@ -53,10 +57,8 @@ nixpkgs.lib.nixos.runTest {
   };
 
   nodes.hungarian = {
-    imports = [
-      commonDesktopModule
-      qemuDemoUserModule
-    ];
+    imports = [ commonDesktopModule ]
+      ++ nixpkgs.lib.optional (qemuDemoUserModule != null) qemuDemoUserModule;
 
     common.locale.default = "hu_HU.UTF-8";
     common.autoUpgrade.enable = false;
@@ -69,12 +71,15 @@ nixpkgs.lib.nixos.runTest {
   testScript = ''
     def wait_for_desktop(node):
         node.wait_for_unit("graphical.target")
-        node.wait_until_succeeds("pgrep -u demo plasmashell")
-        node.wait_until_succeeds("pgrep -u demo kwin_wayland")
+        node.wait_until_succeeds("pgrep -u ${user} plasmashell")
+        node.wait_until_succeeds("pgrep -u ${user} kwin_wayland")
+
+    def firefox_gui_command(uid):
+        return f"env XDG_RUNTIME_DIR=/run/user/{uid} WAYLAND_DISPLAY=wayland-0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus MOZ_ENABLE_WAYLAND=1 firefox http://127.0.0.1:8000/firefox.html >/tmp/firefox-gui.log 2>&1 &"
 
     def assert_locale(node, system_locale, firefox_locale, expected_langpack):
         node.succeed(f"grep -Fx 'LANG={system_locale}' /etc/locale.conf")
-        node.succeed(f"su - demo -c 'locale' | grep -Fx 'LANG={system_locale}'")
+        node.succeed(f"su - ${user} -c 'locale' | grep -Fx 'LANG={system_locale}'")
         node.succeed(
             "${pkgs.python3}/bin/python3 -c '"
             "import json; "
@@ -94,9 +99,10 @@ nixpkgs.lib.nixos.runTest {
         node.wait_until_succeeds("test -e /tmp/test-http-ready")
 
     def open_firefox_and_screenshot(node, name):
-        node.succeed("su - demo -c '${firefoxGuiCommand}'")
+        uid = node.succeed("id -u ${user}").strip()
+        node.succeed(f"su - ${user} -c '{firefox_gui_command(uid)}'")
         node.wait_until_succeeds("test -e /tmp/request-firefox")
-        node.wait_until_succeeds("pgrep -u demo firefox")
+        node.wait_until_succeeds("pgrep -u ${user} firefox")
         node.succeed("sleep 5")
         node.screenshot(f"{name}-desktop")
 

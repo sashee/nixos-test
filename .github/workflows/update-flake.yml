@@ -164,9 +164,70 @@ jobs:
         # Per-check eval; the .#rpi-all-tests aggregate would force one big eval.
         run: make run-rpi-tests MAX_JOBS=1
 
+  hosts:
+    # Verify each laptop host's check set (lib.checkSets.<host>) against the
+    # UPDATED lock, parallel to the generic x86 and rpi jobs. A nixpkgs bump
+    # that breaks a host config cannot land. New host = one matrix entry.
+    needs: lock
+    strategy:
+      matrix:
+        host: [anya-feher-laptop]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Use updated lock
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: flake-lock
+          path: .
+
+      - name: Reclaim disk space
+        run: |
+          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
+          # || true so a path missing on the arm64 image is not fatal.
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache \
+            || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
+        with:
+          enable_kvm: true
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Add swap
+        run: |
+          swapon --show || true
+          sudo fallocate -l 8G /mnt/ci-swapfile
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+          swapon --show
+          free -h
+          df -h
+
+      - name: Run host checks (per-check eval, built one at a time)
+        run: make run-host-tests HOST=${{ matrix.host }} MAX_JOBS=1
+
   commit:
-    # Only reached if BOTH the x86_64 and aarch64 checks passed.
-    needs: [x86, rpi]
+    # Only reached if the x86_64, aarch64, and per-host checks ALL passed.
+    needs: [x86, rpi, hosts]
     runs-on: ubuntu-latest
 
     steps:
