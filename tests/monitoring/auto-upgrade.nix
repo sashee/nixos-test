@@ -50,7 +50,9 @@ nixpkgs.lib.nixos.runTest {
 
     common.autoUpgrade.enable = true;
     common.irohSsh.enable = false;
-    common.autoUpgrade.flake = "/etc/nixos#laptop";
+    # mkForce: real host modules (anya-feher-laptop) set their own flake ref at
+    # normal priority; the mocked nixos-rebuild ignores it anyway.
+    common.autoUpgrade.flake = lib.mkForce "/etc/nixos#laptop";
 
     common.monitoring = {
       enable = true;

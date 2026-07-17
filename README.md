@@ -109,17 +109,24 @@ flakes/nix settings + GC, auto-upgrade, monitoring, restic scaffolding
 SSH over iroh tunnel for IP-less remote access
 ```
 
-You must add per host:
+Laptop host configs live **in this repository** (`hosts/<name>/configuration.nix`,
+exposed as `common.lib.hosts.<name>`; spec in `spec/<name>.md`), so the shared
+modules, the host specifics, and the VM tests that exercise the real host config
+evolve together. Only the machine-unique state stays on the device:
 
 ```text
-hardware-configuration.nix (generated)
-bootloader, networking.hostName, time.timeZone
-users + passwords
-disk encryption (LUKS), on-disk swap (+ resume for hibernation)
-common.autoUpgrade.flake
-common.monitoring.report.credentialDirectory
-common.irohSsh.credentialDirectory
+hardware-configuration.nix   generated at install (filesystems, LUKS device, microcode kind)
+flake.nix + flake.lock       the stub below
+user passwords               set with `passwd` at install; never in this repo
+encrypted credentials        systemd-creds blobs under /etc/credentials
 ```
+
+The host config in this repo must set: `networking.hostName`, `time.timeZone`,
+locale/keyboard, users (admin keys come from `lib/ssh-keys.nix`; **no password
+options** — see Install below), the bootloader, `common.autoUpgrade.flake`,
+`common.monitoring.report.credentialDirectory`, and
+`common.irohSsh.credentialDirectory`. See
+`hosts/anya-feher-laptop/configuration.nix` for the reference host.
 
 `common.autoUpgrade`, `common.monitoring`, and `common.irohSsh` are **enabled by default**, and
 each fails evaluation if its required argument is missing — `common.autoUpgrade.flake` for upgrades,
@@ -130,84 +137,65 @@ silently ship with upgrades, monitoring, or remote access unconfigured. Opt a ho
 `common.irohSsh.enable = false`, or disable just the monitoring ping with
 `common.monitoring.report.enable = false`.
 
-### 1. Host flake
+### 1. On-device stub flake
 
-Name this repository input `common` and follow its `nixpkgs` so the host and
-common config evaluate against one nixpkgs revision:
+The whole `/etc/nixos` on the laptop is a three-file stub (same shape as the
+Pi's, see `docs/rpi5-rescue.md`): it names this repository `common` and injects
+the generated hardware config into the in-repo host:
 
 ```nix
 {
-  inputs = {
-    common.url = "github:sashee/nixos-test";
-    nixpkgs.follows = "common/nixpkgs";
-  };
+  inputs.common.url = "github:sashee/nixos-test";
 
-  outputs = { nixpkgs, common, ... }: {
-    nixosConfigurations.laptop = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        common.nixosModules.common-desktop
-        ./configuration.nix
-      ];
+  outputs = { common, ... }: {
+    nixosConfigurations.anya-feher-laptop = common.lib.hosts.anya-feher-laptop {
+      modules = [ ./hardware-configuration.nix ];
     };
   };
 }
 ```
 
-### 2. Host `configuration.nix`
-
-```nix
-{ ... }: {
-  imports = [ ./hardware-configuration.nix ];
-
-  boot.loader.systemd-boot.enable = true;
-  boot.loader.efi.canTouchEfiVariables = true;
-
-  networking.hostName = "my-laptop";
-  time.timeZone = "Europe/Budapest";
-  common.locale.default = "en_US.UTF-8";       # override per host if needed
-
-  users.users.sashee = {
-    isNormalUser = true;
-    extraGroups = [ "wheel" "networkmanager" ];
-    hashedPassword = "...";                     # generate with: mkpasswd -m sha-512
-  };
-
-  # Point auto-upgrade at this host's flake output (see the auto-upgrade section).
-  common.autoUpgrade.flake = "/etc/nixos#laptop";
-
-  # Per-machine on-disk swap. Merges with the base zram; zram keeps the higher
-  # priority, so disk swap is only used as overflow.
-  swapDevices = [ { device = "/var/lib/swapfile"; size = 8192; } ];
-
-  system.stateVersion = "26.05";               # match the release you install
-}
-```
+The daily auto-upgrade updates the `common` input and rebuilds, so pushing to
+this repo is how shared *and* host-specific changes reach the machine; only
+hardware changes ever require editing the stub.
 
 Hardware-specific extras live in `hardware-configuration.nix`:
 
-- **Disk encryption** — LUKS goes here, e.g. `boot.initrd.luks.devices.<name>.device`.
-- **Swap partition** instead of a swapfile — use
-  `swapDevices = [ { device = "/dev/disk/by-uuid/<uuid>"; } ];`.
+- **Disk encryption** — `nixos-generate-config` detects an open LUKS mapping
+  under the root filesystem and emits `boot.initrd.luks.devices.<name>.device`
+  itself; verify it is there.
+- **Swap partition / swapfile** — `swapDevices` (merges with the base zram;
+  zram keeps the higher priority, so disk swap is overflow only).
 - **Hibernation** — additionally set `boot.resumeDevice` (and a `resume_offset`
   kernel param when resuming from a swapfile).
 
-### 3. Install
+### 2. Install
 
 Partitioning and formatting are hardware-specific; follow the
-[NixOS manual](https://nixos.org/manual/nixos/stable/#sec-installation) for that
-step. Once the target is mounted at `/mnt`:
+[NixOS manual](https://nixos.org/manual/nixos/stable/#sec-installation). Use
+LUKS2 for the encrypted root — argon2id is its default KDF (`cryptsetup
+luksFormat --type luks2 /dev/<part>`), and format on the target machine so the
+benchmarked unlock cost fits its RAM. Once the target is mounted at `/mnt`:
 
 ```bash
 nixos-generate-config --root /mnt
-# Put flake.nix + configuration.nix in /mnt/etc/nixos and keep the generated
-# hardware-configuration.nix, then install the flake output:
-nixos-install --flake /mnt/etc/nixos#laptop
+# Keep the generated hardware-configuration.nix, add the stub flake.nix next to
+# it, then install the in-repo host:
+nixos-install --flake /mnt/etc/nixos#anya-feher-laptop
+# Passwords are imperative state (users.mutableUsers): set the primary user's
+# now; admin accounts get none and stay key-only ssh.
+nixos-enter --root /mnt -c 'passwd anya'
 reboot
 ```
 
 The installer needs flakes enabled for `--flake`; if they are not on, prepend
 `--option experimental-features 'nix-command flakes'` to `nixos-install`.
+
+After first boot the iroh credential is not provisioned yet, so the tunnel is
+inert; the failsafe opens port 22 on the LAN ~5 minutes after boot. SSH in with
+the admin key, provision the credentials (same commands as `docs/rpi5-rescue.md`
+step 4), and start `iroh-ssh.service` — the failsafe closes port 22 as soon as
+the tunnel answers.
 
 ## Module Contents
 
@@ -437,6 +425,17 @@ QEMU_OPTS="-display gtk,gl=on -device virtio-vga-gl" ./result/bin/run-nixos-qemu
 
 The VM starts Plasma Wayland in a QEMU window and logs in as `demo`
 automatically.
+
+The real laptop host configs boot the same way — e.g. anya-feher-laptop
+(autologin as `anya`, Hungarian locale and keyboard; the lock screen password
+is `anya` in the VM only — the real machine's password is set at install):
+
+```bash
+make host-vm HOST=anya-feher-laptop   # or: nix --extra-experimental-features 'nix-command flakes' build .#anya-feher-laptop-vm
+./result/bin/run-anya-feher-laptop-vm
+```
+
+The same `QEMU_OPTS` variants (GL, TCG) apply to this runner too.
 
 Check rendering inside the VM:
 

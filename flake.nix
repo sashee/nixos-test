@@ -76,6 +76,20 @@
           ./hosts/rpi5/configuration.nix
         ] ++ modules;
       };
+      # Laptop hosts: config lives in-repo; the machine-unique parts (LUKS
+      # device, filesystems) stay on the device in hardware-configuration.nix.
+      # The on-device stub flake builds the deployable system with
+      #   common.lib.hosts.anya-feher-laptop { modules = [ ./hardware-configuration.nix ]; }
+      mkAnyaFeherLaptop = { modules ? [ ] }: nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          ./hosts/anya-feher-laptop/configuration.nix
+          {
+            _module.args.commonDotfiles = dotfiles;
+            _module.args.unstable = unstable;
+          }
+        ] ++ modules;
+      };
       qemuGraphical = nixpkgs.lib.nixosSystem {
         inherit system;
 
@@ -105,14 +119,37 @@
         ];
       };
       qemuVm = qemuGraphical.config.system.build.vm;
+      # The real anya-feher-laptop config bootable in a local QEMU window;
+      # qemu-vm.nix stands in for the on-device hardware config. Upgrade and
+      # monitoring off like qemu-graphical (the VM has no /etc/nixos flake or
+      # credentials); iroh-ssh skips on its missing credential as on first boot.
+      anyaFeherLaptopQemuVm = (mkAnyaFeherLaptop {
+        modules = [
+          "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
+          {
+            common.autoUpgrade.enable = false;
+            common.monitoring.enable = false;
+            # VM-only: anya's real password is imperative state a fresh VM
+            # image doesn't have, which would make the inactivity lock a dead end.
+            users.users.anya.initialPassword = "anya";
+            virtualisation = {
+              cores = 6;
+              graphics = true;
+              memorySize = 8192;
+            };
+          }
+        ];
+      }).config.system.build.vm;
       plasmaFirefoxTest = import ./tests/plasma-firefox.nix {
         inherit nixpkgs pkgs commonDesktopModule qemuDemoUserModule stateVersion;
+        user = "demo";
       };
       commonDesktopTest = import ./tests/common-desktop.nix {
         inherit nixpkgs pkgs commonDesktopModule qemuDemoUserModule stateVersion;
       };
       localeFirefoxTest = import ./tests/locale-firefox.nix {
         inherit nixpkgs pkgs commonDesktopModule qemuDemoUserModule stateVersion;
+        user = "demo";
       };
       firewallTest = import ./tests/firewall.nix {
         inherit nixpkgs pkgs stateVersion;
@@ -203,6 +240,56 @@
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
       };
+      # Like monitoring-nix-gc: a unit test with no host input, run here because
+      # the rpi suite evaluates against a different nixpkgs than the x86 one.
+      monitoringIrohSshTestRpi = import ./tests/monitoring/iroh-ssh.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+      };
+      # Tests that plainly disable common.* toggles conflict with the rpi
+      # config's explicit autoUpgrade.enable = true; the force-off masks both
+      # normal-priority definitions (see connectivityFallbackTestRpi).
+      rpiQuiescedSystemModule = { lib, ... }: {
+        imports = [ rpiSystemModule ];
+        common.autoUpgrade.enable = lib.mkForce false;
+        common.monitoring.enable = lib.mkForce false;
+      };
+      dohUpstreamTestRpi = import ./tests/doh-upstream.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        commonDesktopModule = rpiQuiescedSystemModule;
+        inherit dohStamps;
+      };
+      resticTestRpi = import ./tests/restic.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        commonDesktopModule = rpiQuiescedSystemModule;
+      };
+      # The dotfiles nix-utils suite on the real rpi config and kernel as the
+      # real Pi user: the sandbox cases (userns/seccomp/bubblewrap) are
+      # kernel-dependent, and the Pi runs a custom trimmed kernel.
+      rpiNixUtilsTests = import "${dotfiles}/nix-utils/tests/lib.nix" {
+        pkgs = pkgsRpi;
+        machineModules = [
+          rpiSystemModule
+          {
+            # The suite sets no node hostName; without one the rpi config's
+            # mkDefault ties with the test framework's mkDefault "machine".
+            networking.hostName = "nix-utils-test";
+            system.stateVersion = rpi5Base.config.system.stateVersion;
+            # 2 GiB, not the 4 GiB the generic wiring inherits from
+            # qemu-demo-user.nix: these checks also run on the 4 GiB Pi itself.
+            virtualisation.memorySize = nixpkgs.lib.mkDefault 2048;
+            common.autoUpgrade.enable = nixpkgs.lib.mkForce false;
+            common.monitoring.enable = nixpkgs.lib.mkForce false;
+            common.irohSsh.enable = nixpkgs.lib.mkForce false;
+          }
+        ];
+        user = "nixos";
+      };
       # The REAL rpi system config as the node (exact Pi kernel, which ships
       # mac80211_hwsim -- verified 6.18.34 -- and carries the tpm-crb initrd
       # workaround). Only what cannot work in a VM is disabled: auto-upgrade
@@ -242,8 +329,9 @@
       });
       # All aarch64 (Raspberry Pi 5) checks in one place. Add new rpi tests here;
       # CI builds the aggregate below, so the workflow never needs editing.
-      aarch64TestResults = builtins.mapAttrs (_: dropKvm) {
+      aarch64TestResults = builtins.mapAttrs (_: dropKvm) ({
         doh = dohTestRpi;
+        doh-upstream = dohUpstreamTestRpi;
         auto-upgrade = autoUpgradeTestRpi;
         nix-settings = nixSettingsTestRpi;
         auto-upgrade-reboot = autoUpgradeRebootTestRpi;
@@ -252,9 +340,13 @@
         monitoring = monitoringTestRpi;
         connectivity-fallback = connectivityFallbackTestRpi;
         monitoring-nix-gc = monitoringNixGcTestRpi;
+        monitoring-iroh-ssh = monitoringIrohSshTestRpi;
         firewall = firewallTestRpi;
         iroh-ssh = irohSshTestRpi;
-      };
+        restic = resticTestRpi;
+      } // (nixpkgs.lib.mapAttrs'
+        (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
+        rpiNixUtilsTests));
       rpiAllTests = pkgsRpi.runCommand "rpi-all-tests" { } ''
         mkdir -p $out
         ${nixpkgs.lib.concatStringsSep "\n" (nixpkgs.lib.mapAttrsToList (name: test: "ln -s ${test} $out/${nixpkgs.lib.escapeShellArg name}") aarch64TestResults)}
@@ -335,6 +427,191 @@
         inherit nixpkgs pkgs stateVersion;
         moduleUnderTest = ./modules/connectivity-fallback.nix;
       };
+      # The real anya-feher-laptop host config as a test node (mirrors
+      # rpiSystemModule; plain x86, so no kernel neutralization is needed).
+      # Feature tests run against it so a host-config change that breaks a
+      # feature fails that feature's -anya variant.
+      anyaFeherLaptopSystemModule = { ... }: {
+        imports = [ ./hosts/anya-feher-laptop/configuration.nix ];
+        _module.args.commonDotfiles = dotfiles;
+        _module.args.unstable = unstable;
+        virtualisation.qemu.options = [ (testRtcBase pkgs.coreutils) ];
+      };
+      # Eval-only smoke check: force full evaluation (assertions included) of
+      # the deployable system with a stand-in hardware config, so a broken host
+      # config fails CI instead of the laptop's next auto-upgrade. The context
+      # discard keeps the check from depending on (= building) the system.
+      anyaFeherLaptopEval =
+        let
+          stubHw = {
+            fileSystems."/" = {
+              device = "/dev/disk/by-label/nixos";
+              fsType = "ext4";
+            };
+          };
+          toplevel = (mkAnyaFeherLaptop { modules = [ stubHw ]; }).config.system.build.toplevel;
+        in
+        pkgs.runCommand "anya-feher-laptop-eval" { } ''
+          echo ${nixpkgs.lib.escapeShellArg (builtins.unsafeDiscardStringContext toplevel.drvPath)} > $out
+        '';
+      anyaFeherLaptopTest = import ./tests/anya-feher-laptop.nix {
+        inherit nixpkgs pkgs stateVersion;
+        machineModule = anyaFeherLaptopSystemModule;
+      };
+      anyaFeherLaptopDohTest = import ./tests/doh.nix {
+        inherit nixpkgs pkgs stateVersion;
+        machineModule = { ... }: {
+          imports = [ anyaFeherLaptopSystemModule ];
+          common.autoUpgrade.enable = false;
+          common.monitoring.enable = false;
+          common.irohSsh.enable = false;
+        };
+      };
+      anyaFeherLaptopDohUpstreamTest = import ./tests/doh-upstream.nix {
+        inherit nixpkgs pkgs stateVersion dohStamps;
+        commonDesktopModule = anyaFeherLaptopSystemModule;
+      };
+      anyaFeherLaptopDohCaptiveTest = import ./tests/doh-captive.nix {
+        inherit nixpkgs pkgs stateVersion;
+        commonDesktopModule = anyaFeherLaptopSystemModule;
+      };
+      anyaFeherLaptopFirewallTest = import ./tests/firewall.nix {
+        inherit nixpkgs pkgs stateVersion;
+        machineModule = anyaFeherLaptopSystemModule;
+      };
+      anyaFeherLaptopIrohSshTest = import ./tests/iroh-ssh.nix {
+        inherit nixpkgs pkgs stateVersion dohStamps;
+        machineModule = anyaFeherLaptopSystemModule;
+      };
+      anyaFeherLaptopZramTest = import ./tests/zram.nix {
+        inherit nixpkgs pkgs stateVersion;
+        machineModule = anyaFeherLaptopSystemModule;
+      };
+      anyaFeherLaptopMonitoringAutoUpgradeTest = import ./tests/monitoring/auto-upgrade.nix {
+        inherit nixpkgs pkgs stateVersion;
+        commonDesktopModule = anyaFeherLaptopSystemModule;
+      };
+      anyaFeherLaptopMonitoringDiskSpaceTest = import ./tests/monitoring/disk-space.nix {
+        inherit nixpkgs pkgs stateVersion;
+        commonDesktopModule = anyaFeherLaptopSystemModule;
+      };
+      anyaFeherLaptopMonitoringGenerationsTest = import ./tests/monitoring/generations.nix {
+        inherit nixpkgs pkgs stateVersion;
+        commonDesktopModule = anyaFeherLaptopSystemModule;
+      };
+      anyaFeherLaptopMonitoringReportingTest = import ./tests/monitoring/reporting.nix {
+        inherit nixpkgs pkgs stateVersion;
+        commonDesktopModule = anyaFeherLaptopSystemModule;
+      };
+      anyaFeherLaptopMonitoringResticTest = import ./tests/monitoring/restic.nix {
+        inherit nixpkgs pkgs stateVersion;
+        commonDesktopModule = anyaFeherLaptopSystemModule;
+      };
+      # flakeRef must equal the host's common.autoUpgrade.flake: the test sets
+      # it too, and equal definitions merge while different ones conflict.
+      anyaFeherLaptopAutoUpgradeTest = import ./tests/auto-upgrade-mocked-service.nix {
+        inherit nixpkgs pkgs stateVersion;
+        autoUpgradeModule = ./modules/auto-upgrade.nix;
+        nodeModule = anyaFeherLaptopSystemModule;
+        flakeRef = "/etc/nixos#anya-feher-laptop";
+      };
+      anyaFeherLaptopNixSettingsTest = import ./tests/nix-settings.nix {
+        inherit nixpkgs pkgs stateVersion;
+        extraModule = anyaFeherLaptopSystemModule;
+        gcOptions = "--delete-older-than 14d";
+      };
+      anyaFeherLaptopNixGcRetentionTest = import ./tests/nix-gc-retention.nix {
+        inherit nixpkgs pkgs stateVersion;
+        machineModule = anyaFeherLaptopSystemModule;
+        keptAfterGc = 14;  # spec: generations are kept for 14 days
+      };
+      anyaFeherLaptopNmCaptivePortalTest = import ./tests/nm-captive-portal.nix {
+        inherit nixpkgs pkgs stateVersion;
+        commonDesktopModule = anyaFeherLaptopSystemModule;
+      };
+      anyaFeherLaptopNmCaptivePortalIpv6Test = import ./tests/nm-captive-portal-ipv6.nix {
+        inherit nixpkgs pkgs stateVersion;
+        commonDesktopModule = anyaFeherLaptopSystemModule;
+      };
+      anyaFeherLaptopResticTest = import ./tests/restic.nix {
+        inherit nixpkgs pkgs stateVersion;
+        commonDesktopModule = anyaFeherLaptopSystemModule;
+      };
+      # Spec: "do not reboot automatically, takes effect on next manual reboot" --
+      # same mocked kernel-changing upgrade as the rpi's reboot test, opposite assertion.
+      anyaFeherLaptopAutoUpgradeNoRebootTest = import ./tests/auto-upgrade-reboot.nix {
+        inherit nixpkgs pkgs stateVersion;
+        machineModule = anyaFeherLaptopSystemModule;
+        expectReboot = false;
+      };
+      # The GUI tests run Firefox/LibreOffice in the VM; the generic variants
+      # get this sizing from qemu-demo-user.nix, which host variants don't import.
+      anyaFeherLaptopGuiVm = { lib, ... }: {
+        imports = [ anyaFeherLaptopSystemModule ];
+        virtualisation.cores = lib.mkDefault 2;
+        virtualisation.memorySize = lib.mkDefault 4096;
+      };
+      anyaFeherLaptopPlasmaFirefoxTest = import ./tests/plasma-firefox.nix {
+        inherit nixpkgs pkgs stateVersion;
+        commonDesktopModule = anyaFeherLaptopGuiVm;
+        user = "anya";
+      };
+      anyaFeherLaptopLocaleFirefoxTest = import ./tests/locale-firefox.nix {
+        inherit nixpkgs pkgs stateVersion;
+        commonDesktopModule = anyaFeherLaptopGuiVm;
+        user = "anya";
+      };
+      # Same dotfiles suite as the generic nix-utils checks, on the real host
+      # config as the real primary user (the suite needs no sudo).
+      anyaFeherLaptopNixUtilsTests = import "${dotfiles}/nix-utils/tests/lib.nix" {
+        inherit pkgs;
+        machineModules = [
+          anyaFeherLaptopGuiVm
+          {
+            # The suite sets no node hostName; without one the host config's
+            # mkDefault ties with the test framework's mkDefault "machine".
+            networking.hostName = "nix-utils-test";
+            system.stateVersion = stateVersion;
+            common.autoUpgrade.enable = false;
+            common.monitoring.enable = false;
+            common.irohSsh.enable = false;
+          }
+        ];
+        user = "anya";
+      };
+      # The host's own check set (host-name-prefixed): runs in its own parallel
+      # CI job via `make run-host-tests HOST=anya-feher-laptop`, separate from
+      # the generic x86 tests -- same isolation the rpi set gets from being a
+      # different system. Also merged into checks.x86_64-linux so local
+      # `nix build .#checks...` and `nix flake check` see everything.
+      anyaFeherLaptopChecks = builtins.mapAttrs (_: dropKvm) ({
+        anya-feher-laptop = anyaFeherLaptopTest;
+        anya-feher-laptop-doh = anyaFeherLaptopDohTest;
+        anya-feher-laptop-doh-upstream = anyaFeherLaptopDohUpstreamTest;
+        anya-feher-laptop-doh-captive = anyaFeherLaptopDohCaptiveTest;
+        anya-feher-laptop-firewall = anyaFeherLaptopFirewallTest;
+        anya-feher-laptop-iroh-ssh = anyaFeherLaptopIrohSshTest;
+        anya-feher-laptop-zram = anyaFeherLaptopZramTest;
+        anya-feher-laptop-monitoring-auto-upgrade = anyaFeherLaptopMonitoringAutoUpgradeTest;
+        anya-feher-laptop-monitoring-disk-space = anyaFeherLaptopMonitoringDiskSpaceTest;
+        anya-feher-laptop-monitoring-generations = anyaFeherLaptopMonitoringGenerationsTest;
+        anya-feher-laptop-monitoring-reporting = anyaFeherLaptopMonitoringReportingTest;
+        anya-feher-laptop-monitoring-restic = anyaFeherLaptopMonitoringResticTest;
+        anya-feher-laptop-auto-upgrade = anyaFeherLaptopAutoUpgradeTest;
+        anya-feher-laptop-auto-upgrade-no-reboot = anyaFeherLaptopAutoUpgradeNoRebootTest;
+        anya-feher-laptop-nix-settings = anyaFeherLaptopNixSettingsTest;
+        anya-feher-laptop-nix-gc-retention = anyaFeherLaptopNixGcRetentionTest;
+        anya-feher-laptop-nm-captive-portal = anyaFeherLaptopNmCaptivePortalTest;
+        anya-feher-laptop-nm-captive-portal-ipv6 = anyaFeherLaptopNmCaptivePortalIpv6Test;
+        anya-feher-laptop-restic = anyaFeherLaptopResticTest;
+        anya-feher-laptop-plasma-firefox = anyaFeherLaptopPlasmaFirefoxTest;
+        anya-feher-laptop-locale-firefox = anyaFeherLaptopLocaleFirefoxTest;
+      } // (nixpkgs.lib.mapAttrs'
+        (name: test: nixpkgs.lib.nameValuePair "anya-feher-laptop-nix-utils-${name}" test)
+        anyaFeherLaptopNixUtilsTests)) // {
+        # Eval-only runCommand, not a VM test: no kvm feature to drop.
+        anya-feher-laptop-eval = anyaFeherLaptopEval;
+      };
       testResults = builtins.mapAttrs (_: dropKvm) ({
         auto-upgrade-mocked-service = autoUpgradeMockedServiceTest;
         common-desktop = commonDesktopTest;
@@ -408,6 +685,13 @@
 
       lib.restic = resticLib;
       lib.hosts.rpi5 = mkRpi5;
+      lib.hosts.anya-feher-laptop = mkAnyaFeherLaptop;
+      # Named check sets for the Makefile's run-checks (SET=...): the generic
+      # x86 suite and one set per laptop host, each run by its own CI job.
+      lib.checkSets = {
+        generic-x86 = testResults;
+        anya-feher-laptop = anyaFeherLaptopChecks;
+      };
 
       legacyPackages.${system} = pkgs;
 
@@ -415,7 +699,7 @@
         qemu-graphical = qemuGraphical;
       };
 
-      checks.${system} = testResults;
+      checks.${system} = testResults // anyaFeherLaptopChecks;
       checks.aarch64-linux = aarch64TestResults;
       packages.aarch64-linux.rpi-all-tests = rpiAllTests;
       # The exact patched kernel every rpi check boots (rpiTestKernel pins the
@@ -465,6 +749,7 @@
         nix-settings-driver = nixSettingsTest.driver;
         nix-settings-driver-interactive = nixSettingsTest.driverInteractive;
         qemu-vm = qemuVm;
+        anya-feher-laptop-vm = anyaFeherLaptopQemuVm;
         qemu-plasma-result = qemuPlasmaResult;
         plasma-firefox-driver = plasmaFirefoxTest.driver;
         plasma-firefox-driver-interactive = plasmaFirefoxTest.driverInteractive;

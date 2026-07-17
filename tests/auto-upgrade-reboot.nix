@@ -1,4 +1,9 @@
-{ nixpkgs, pkgs, stateVersion, machineModule }:
+# expectReboot = true  -> asserts the host reboots after a changed upgrade
+#                         (rpi: common.autoUpgrade.rebootOnChange)
+# expectReboot = false -> asserts the host does NOT reboot and the new
+#                         generation is only staged for the next manual reboot
+#                         (laptops: "do not reboot automatically")
+{ nixpkgs, pkgs, stateVersion, machineModule, expectReboot ? true }:
 
 let
   # A fake "upgraded" system: its system toplevel differs from the booted one, so
@@ -16,12 +21,13 @@ let
   '';
 in
 nixpkgs.lib.nixos.runTest {
-  name = "auto-upgrade-reboot";
+  name = "auto-upgrade-${if expectReboot then "reboot" else "no-reboot"}";
   hostPkgs = pkgs;
 
-  # The real rpi system config (incl. common.autoUpgrade.rebootOnChange). The test only
-  # mocks the upgrade itself + the preStart `nix`, so if the config didn't enable
-  # reboot, this test would fail.
+  # The real host system config. The test only mocks the upgrade itself + the
+  # preStart `nix`, so the reboot decision comes from the host's own
+  # common.autoUpgrade.rebootOnChange setting — a host config flipping it makes
+  # its variant fail.
   nodes.machine = { lib, ... }: {
     imports = [ machineModule ];
 
@@ -42,11 +48,20 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("shutdown -c || true")
     machine.fail("test -e /run/systemd/shutdown/scheduled")
 
-    # One upgrade -> new generation differs from booted -> reboot scheduled (the rpi config
-    # sets rebootOnChange; if it didn't, this wait times out and the test fails).
     machine.succeed("systemctl start nixos-upgrade.service")
+  '' + (if expectReboot then ''
+    # New generation differs from booted -> reboot scheduled (the host config
+    # sets rebootOnChange; if it didn't, this wait times out and the test fails).
     machine.wait_until_succeeds("test -e /run/systemd/shutdown/scheduled", timeout=30)
 
     machine.succeed("shutdown -c || true")
-  '';
+  '' else ''
+    # The upgrade completes and stages the new generation, but the machine must
+    # stay up: activation waits for the next manual reboot (operation = "boot").
+    machine.wait_until_succeeds("systemctl show nixos-upgrade.service -p ActiveState --value | grep -F inactive")
+    machine.succeed("systemctl show nixos-upgrade.service -p Result --value | grep -qx success")
+    machine.fail("test -e /run/systemd/shutdown/scheduled")
+    machine.succeed('test "$(readlink -f /nix/var/nix/profiles/system)" = "${fakeTarget}"')
+    machine.succeed('test "$(readlink -f /run/booted-system)" != "${fakeTarget}"')
+  '');
 }
