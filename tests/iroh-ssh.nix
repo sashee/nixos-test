@@ -189,6 +189,10 @@ nixpkgs.lib.nixos.runTest {
         timeout=60,
     )
 
+    # The engagement leaves a timestamp on disk (read by monitoring so a
+    # fallback that recovered before the next run is still reported).
+    first_engaged = int(server.succeed("cat /var/lib/iroh-ssh-failsafe/last-engaged").strip())
+
     # The grace period is honored: the watchdog logs the downtime it counted
     # when opening, so the first opening must not have come earlier than
     # delaySeconds. Log-based, so no racy wall-clock window measuring.
@@ -282,6 +286,10 @@ nixpkgs.lib.nixos.runTest {
     server.succeed("systemctl stop sshd.service")
     server.wait_until_succeeds(f"{nft_chain} | grep -F 'iroh-ssh-failsafe'", timeout=120)
     server.succeed("systemctl is-active --quiet iroh-ssh.service")
+
+    # Each engagement refreshes the on-disk timestamp.
+    second_engaged = int(server.succeed("cat /var/lib/iroh-ssh-failsafe/last-engaged").strip())
+    assert second_engaged > first_engaged, "failsafe did not refresh last-engaged on re-engagement"
     server.succeed("systemctl start sshd.service")
     server.wait_until_succeeds(
         f"test -z \"$({nft_chain} | grep -F 'iroh-ssh-failsafe' || true)\"",

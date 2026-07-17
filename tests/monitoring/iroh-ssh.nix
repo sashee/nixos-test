@@ -2,7 +2,9 @@
 
 # Verifies the iroh-ssh monitoring check: FAIL while the tunnel unit is not
 # active, OK when it is active with firewall port 22 closed, FAIL when the
-# failsafe's port-22 rule is present. The unit is mocked (no relay here) so
+# failsafe's port-22 rule is present, and FAIL (once) when the failsafe
+# engaged and recovered since the previous monitoring run. The unit is mocked
+# (no relay here) so
 # "active" is directly controllable; the real tunnel + failsafe behavior is
 # covered end-to-end by tests/iroh-ssh.nix. Self-contained: report.enable =
 # false, so the monitoring oneshot's own exit code and journal reflect the
@@ -75,5 +77,29 @@ nixpkgs.lib.nixos.runTest {
         )
         machine.fail("systemctl start common-monitoring.service")
         assert "[FAIL] iroh-ssh: failsafe engaged, port 22 open" in monitoring_log()
+
+    with subtest("engaged-and-recovered since last run -> FAIL once, then OK"):
+        # Recover: drop the rule from the previous subtest (nothing else in
+        # this test needs input-allow entries), then let one run establish a
+        # fresh last-run marker.
+        machine.succeed("${pkgs.nftables}/bin/nft flush chain inet nixos-fw input-allow")
+        machine.succeed("systemctl start common-monitoring.service")
+
+        # Simulate the failsafe having engaged after that run (the unit is
+        # disabled here; tests/iroh-ssh.nix covers the real marker write).
+        # sleeps: markers are epoch-seconds, keep the strict > deterministic.
+        machine.succeed(
+            "sleep 2; mkdir -p /var/lib/iroh-ssh-failsafe;"
+            " date +%s > /var/lib/iroh-ssh-failsafe/last-engaged; sleep 2"
+        )
+
+        machine.fail("systemctl start common-monitoring.service")
+        assert "[FAIL] iroh-ssh: failsafe engaged at" in monitoring_log()
+
+        # Reported exactly once: the failing run still advanced the last-run
+        # marker (reporting is off), so the next run is OK again. reset-failed:
+        # this subtest's back-to-back starts trip the unit's start rate limit.
+        machine.succeed("sleep 2; systemctl reset-failed common-monitoring.service; systemctl start common-monitoring.service")
+        assert monitoring_log().count("[OK] iroh-ssh: service running, port 22 closed") >= 3
   '';
 }

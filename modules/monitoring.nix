@@ -68,6 +68,11 @@ let
       flake_lock=${lib.escapeShellArg (if cfg.flakeLock.path == null then "" else cfg.flakeLock.path)}
       flake_lock_input=${lib.escapeShellArg cfg.flakeLock.input}
 
+      # Captured at start, written at end: an engagement that fires while the
+      # checks run compares as after this run and is reported next run.
+      run_started_seconds="$(date +%s)"
+      last_run_marker="${successDir}/common-monitoring.last-run"
+
       cleanup() {
         rm -f "$log_file"
       }
@@ -309,6 +314,25 @@ let
         # Capture instead of grep -q to avoid SIGPIPE-under-pipefail traps.
         if [ -n "$(nft list chain inet nixos-fw input-allow | grep -F 'iroh-ssh-failsafe' || true)" ]; then
           fail "iroh-ssh: failsafe engaged, port 22 open (tunnel not answering)"
+          return 0
+        fi
+
+        # Engaged-and-recovered since the previous run: the failsafe refreshes
+        # this marker (epoch seconds) on every iteration it holds port 22 open
+        # (see modules/iroh-ssh.nix). Missing marker = never engaged, which
+        # also covers hosts with the failsafe disabled. Missing last-run
+        # marker = first run, so a pre-existing engagement is reported once.
+        last_engaged=0
+        if [ -r /var/lib/iroh-ssh-failsafe/last-engaged ]; then
+          last_engaged="$(cat /var/lib/iroh-ssh-failsafe/last-engaged)"
+        fi
+        prev_run=0
+        if [ -r "$last_run_marker" ]; then
+          prev_run="$(cat "$last_run_marker")"
+        fi
+        if [ "$last_engaged" -gt "$prev_run" ]; then
+          engaged_when="$(date -u -d "@$last_engaged" +%Y-%m-%dT%H:%M:%SZ)"
+          fail "iroh-ssh: failsafe engaged at $engaged_when, since the previous monitoring run"
         else
           ok "iroh-ssh: service running, port 22 closed"
         fi
@@ -391,6 +415,17 @@ let
         post_healthchecks ""
       else
         post_healthchecks "/fail"
+      fi
+
+      # Advance only when this run's report went out (or reporting is off):
+      # findings that never reached the operator must not swallow an
+      # engagement -- it re-reports next run instead (duplicates are safe).
+      # mktemp targets the marker's own directory, not $TMPDIR: PrivateTmp
+      # puts /tmp on another filesystem and a cross-fs mv is not atomic.
+      if [ "$report_failed" -eq 0 ]; then
+        tmp="$(mktemp "$last_run_marker.XXXXXX")"
+        printf '%s\n' "$run_started_seconds" > "$tmp"
+        mv -f "$tmp" "$last_run_marker"
       fi
 
       if [ "$checks_failed" -ne 0 ] || [ "$report_failed" -ne 0 ]; then
@@ -570,6 +605,8 @@ in
         its failsafe has not opened firewall port 22. A stopped service fails
         the check even when the credential is simply missing — a lost
         credential is exactly the broken-remote-management state to alert on.
+        Also fails when the failsafe engaged since the previous monitoring
+        run, even if it has already recovered.
       '';
     };
 
@@ -609,6 +646,10 @@ in
           serviceConfig = {
             Type = "oneshot";
             ExecStart = lib.getExe monitorScript;
+            # Writable hole for the last-run marker: ProtectSystem=strict makes
+            # all of /var/lib read-only for this unit (the .last-success
+            # markers are written by the separate record units).
+            StateDirectory = "common-monitoring";
             # The report URL is a systemd-creds-encrypted blob on disk (create with
             # `systemd-creds encrypt --name=<urlCredential> …`); systemd decrypts it into
             # $CREDENTIALS_DIRECTORY at runtime. Encrypted at rest; never in git/the store.
