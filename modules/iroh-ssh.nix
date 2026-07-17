@@ -15,6 +15,12 @@ let
   # unambiguously in `nft list chain inet nixos-fw input-allow`.
   failsafeComment = "iroh-ssh-failsafe";
 
+  # Where the failsafe records the last time it held port 22 open (epoch
+  # seconds). Read by modules/monitoring.nix's check_iroh_ssh so an engagement
+  # that recovered between monitoring runs is still reported. Created via
+  # StateDirectory on the failsafe unit.
+  failsafeStateDir = "/var/lib/iroh-ssh-failsafe";
+
   failsafeScript = pkgs.writeShellApplication {
     name = "iroh-ssh-failsafe";
     runtimeInputs = [ pkg pkgs.nftables pkgs.systemd pkgs.coreutils pkgs.gnugrep pkgs.gnused ];
@@ -49,7 +55,20 @@ let
         [ -n "$(nft list chain inet nixos-fw input-allow | grep -F '${failsafeComment}' || true)" ]
       }
 
+      record_engaged() {
+        # Wall-clock on purpose (unlike the iteration-counted downtime below):
+        # this timestamp only orders reports against monitoring's last run, it
+        # never feeds the open/close decision. Refreshed on every down
+        # iteration, not just on insert, so an engagement overlapping a
+        # monitoring run still shows activity after that run's start and gets
+        # reported by the next one.
+        tmp="$(mktemp '${failsafeStateDir}/last-engaged.XXXXXX')"
+        date +%s > "$tmp"
+        mv -f "$tmp" '${failsafeStateDir}/last-engaged'
+      }
+
       open_port() {
+        record_engaged
         if ! port_is_open; then
           nft insert rule inet nixos-fw input-allow tcp dport 22 accept comment '"${failsafeComment}"'
           echo "iroh-ssh tunnel not answering for $down seconds: opened port 22"
@@ -236,6 +255,7 @@ in
         ExecStart = lib.getExe failsafeScript;
         Restart = "always";
         RestartSec = 5;
+        StateDirectory = "iroh-ssh-failsafe";
       };
     };
   };
