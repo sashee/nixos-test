@@ -318,6 +318,12 @@
         machineModule = rpiSystemModule;
         inherit dohStamps;
       };
+      bootClockTestRpi = import ./tests/boot-clock.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+      };
       # Nix only exposes /dev/kvm in the sandbox based on the daemon's system-features
       # (auto-set from the host's /dev/kvm), NOT a derivation's requiredSystemFeatures.
       # So dropping the kvm *requirement* lets tests schedule on KVM-less builders (the
@@ -344,6 +350,7 @@
         firewall = firewallTestRpi;
         iroh-ssh = irohSshTestRpi;
         restic = resticTestRpi;
+        boot-clock = bootClockTestRpi;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
         rpiNixUtilsTests));
@@ -398,6 +405,14 @@
       autoUpgradeMockedServiceTest = import ./tests/auto-upgrade-mocked-service.nix {
         autoUpgradeModule = ./modules/auto-upgrade.nix;
         flakeRef = "/etc/nixos#laptop";
+        # Run against the real laptop stack (like the rpi/anya variants use their
+        # host configs), not a bare module node -- so it exercises the deployed
+        # config and inherits the laptop-base initrd RTC fix.
+        nodeModule = { ... }: {
+          imports = [ commonDesktopModule ];
+          common.monitoring.enable = false;
+          common.irohSsh.enable = false;
+        };
         inherit nixpkgs pkgs stateVersion;
       };
       zramTest = import ./tests/zram.nix {
@@ -489,23 +504,23 @@
       };
       anyaFeherLaptopMonitoringAutoUpgradeTest = import ./tests/monitoring/auto-upgrade.nix {
         inherit nixpkgs pkgs stateVersion;
-        commonDesktopModule = anyaFeherLaptopMonitoringNode;
+        commonDesktopModule = anyaFeherLaptopDesktopNode;
       };
       anyaFeherLaptopMonitoringDiskSpaceTest = import ./tests/monitoring/disk-space.nix {
         inherit nixpkgs pkgs stateVersion;
-        commonDesktopModule = anyaFeherLaptopMonitoringNode;
+        commonDesktopModule = anyaFeherLaptopDesktopNode;
       };
       anyaFeherLaptopMonitoringGenerationsTest = import ./tests/monitoring/generations.nix {
         inherit nixpkgs pkgs stateVersion;
-        commonDesktopModule = anyaFeherLaptopMonitoringNode;
+        commonDesktopModule = anyaFeherLaptopDesktopNode;
       };
       anyaFeherLaptopMonitoringReportingTest = import ./tests/monitoring/reporting.nix {
         inherit nixpkgs pkgs stateVersion;
-        commonDesktopModule = anyaFeherLaptopMonitoringNode;
+        commonDesktopModule = anyaFeherLaptopDesktopNode;
       };
       anyaFeherLaptopMonitoringResticTest = import ./tests/monitoring/restic.nix {
         inherit nixpkgs pkgs stateVersion;
-        commonDesktopModule = anyaFeherLaptopMonitoringNode;
+        commonDesktopModule = anyaFeherLaptopDesktopNode;
       };
       # flakeRef must equal the host's common.autoUpgrade.flake: the test sets
       # it too, and equal definitions merge while different ones conflict.
@@ -537,6 +552,10 @@
         inherit nixpkgs pkgs stateVersion;
         commonDesktopModule = anyaFeherLaptopSystemModule;
       };
+      anyaFeherLaptopBootClockTest = import ./tests/boot-clock.nix {
+        inherit nixpkgs pkgs stateVersion;
+        machineModule = anyaFeherLaptopSystemModule;
+      };
       # Spec: "do not reboot automatically, takes effect on next manual reboot" --
       # same mocked kernel-changing upgrade as the rpi's reboot test, opposite assertion.
       anyaFeherLaptopAutoUpgradeNoRebootTest = import ./tests/auto-upgrade-reboot.nix {
@@ -544,35 +563,26 @@
         machineModule = anyaFeherLaptopSystemModule;
         expectReboot = false;
       };
-      # The GUI tests run Firefox/LibreOffice in the VM; the generic variants
-      # get this sizing from qemu-demo-user.nix, which host variants don't import.
-      anyaFeherLaptopGuiVm = { lib, ... }: {
+      # The real anya host config with desktop-adequate VM sizing (the generic
+      # variants get this from qemu-demo-user.nix, which host variants don't
+      # import). Purely virtualisation.* resources -- no config change, so the
+      # system under test is still the real config. Used by every anya node that
+      # boots the full autologin desktop under a heavy wait (monitoring, restic,
+      # plasma/locale firefox, nix-utils). Timezone-adaptive tests (fire_timer)
+      # handle anya's Europe/Budapest, so no UTC pin or headless variant.
+      anyaFeherLaptopDesktopNode = { lib, ... }: {
         imports = [ anyaFeherLaptopSystemModule ];
         virtualisation.cores = lib.mkDefault 2;
         virtualisation.memorySize = lib.mkDefault 4096;
       };
-      # Node wrapper for the monitoring tests against anya's real config.
-      # - UTC (fix): tests/monitoring/auto-upgrade.nix boots the RTC at 23:00 UTC
-      #   and jumps the clock to 02:05 to clear nixos-upgrade.timer's 2h
-      #   Persistent catch-up window. anya's real Europe/Budapest (UTC+2) makes
-      #   boot already 01:00 local, so 02:05 falls *inside* the catch-up window
-      #   and the overdue upgrade never fires. Pin UTC so the timer arithmetic
-      #   matches the (passing) generic node; monitoring itself is tz-agnostic.
-      # - autologin off: monitoring is headless, so drop the pointless heavy
-      #   Plasma session (desktop coverage lives in the plasma/locale tests).
-      anyaFeherLaptopMonitoringNode = { lib, ... }: {
-        imports = [ anyaFeherLaptopSystemModule ];
-        time.timeZone = lib.mkForce "UTC";
-        services.displayManager.autoLogin.enable = lib.mkForce false;
-      };
       anyaFeherLaptopPlasmaFirefoxTest = import ./tests/plasma-firefox.nix {
         inherit nixpkgs pkgs stateVersion;
-        commonDesktopModule = anyaFeherLaptopGuiVm;
+        commonDesktopModule = anyaFeherLaptopDesktopNode;
         user = "anya";
       };
       anyaFeherLaptopLocaleFirefoxTest = import ./tests/locale-firefox.nix {
         inherit nixpkgs pkgs stateVersion;
-        commonDesktopModule = anyaFeherLaptopGuiVm;
+        commonDesktopModule = anyaFeherLaptopDesktopNode;
         user = "anya";
       };
       # Same dotfiles suite as the generic nix-utils checks, on the real host
@@ -580,7 +590,7 @@
       anyaFeherLaptopNixUtilsTests = import "${dotfiles}/nix-utils/tests/lib.nix" {
         inherit pkgs;
         machineModules = [
-          anyaFeherLaptopGuiVm
+          anyaFeherLaptopDesktopNode
           {
             # The suite sets no node hostName; without one the host config's
             # mkDefault ties with the test framework's mkDefault "machine".
@@ -618,6 +628,7 @@
         anya-feher-laptop-nm-captive-portal = anyaFeherLaptopNmCaptivePortalTest;
         anya-feher-laptop-nm-captive-portal-ipv6 = anyaFeherLaptopNmCaptivePortalIpv6Test;
         anya-feher-laptop-restic = anyaFeherLaptopResticTest;
+        anya-feher-laptop-boot-clock = anyaFeherLaptopBootClockTest;
         anya-feher-laptop-plasma-firefox = anyaFeherLaptopPlasmaFirefoxTest;
         anya-feher-laptop-locale-firefox = anyaFeherLaptopLocaleFirefoxTest;
       } // (nixpkgs.lib.mapAttrs'

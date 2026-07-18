@@ -46,7 +46,7 @@ nixpkgs.lib.nixos.runTest {
     imports = [ commonDesktopModule ];
 
     networking.hostName = "monitoring-client";
-    boot.initrd.availableKernelModules = [ "rtc_cmos" ];
+    # (rtc_cmos in initrd is provided by laptop-base via commonDesktopModule.)
 
     common.autoUpgrade.enable = true;
     common.irohSsh.enable = false;
@@ -109,8 +109,6 @@ nixpkgs.lib.nixos.runTest {
   };
 
   testScript = ''
-    from datetime import datetime, timedelta
-
     start_all()
 
     client.wait_for_unit("multi-user.target")
@@ -125,14 +123,22 @@ nixpkgs.lib.nixos.runTest {
         events = platform.succeed("cat /var/lib/monitoring-platform/events.log").strip().splitlines()
         assert events == expected, f"unexpected events: {events}"
 
-    test_clock_day = datetime.strptime("${testClockDate}", "%Y-%m-%d").date()
+    def fire_timer(delay_s, margin=120):
+        # A fresh Persistent OnCalendar=daily timer fires at the next LOCAL midnight
+        # plus a machine-seeded offset in [0, RandomizedDelaySec]. Jump the clock
+        # past (next local midnight + full delay), computed in the guest's own
+        # timezone, to fire the real timer deterministically -- re-roll-safe, since
+        # any offset <= delay is then in the past. Returns the target epoch so the
+        # marker-aging jumps below are taken relative to it.
+        slot = int(client.succeed("date -d 'tomorrow 00:00' +%s").strip())
+        target = slot + delay_s + margin
+        for node in [client, platform]:
+            node.succeed(f"date -s @{target}")
+        return target
 
-    def test_timestamp(days, time):
-        return f"{test_clock_day + timedelta(days=days)} {time}"
-
-    def set_time(timestamp, nodes=None):
+    def set_epoch(epoch, nodes=None):
         for node in (nodes or [client, platform]):
-            node.succeed(f"date -s '{timestamp}'")
+            node.succeed(f"date -s @{epoch}")
 
     marker = "/var/lib/common-monitoring/nixos-upgrade.service.last-success"
 
@@ -143,17 +149,17 @@ nixpkgs.lib.nixos.runTest {
     # dropping /start and /log from the log we assert on.
     client.succeed("systemctl stop common-monitoring.timer")
 
-    # Warm up: a jump past nixos-upgrade.timer's 2h randomized-delay window fires the overdue
-    # upgrade; the mocked rebuild succeeds (default) and records the last-success marker. From
-    # here the test flips the mock's outcome via /run/upgrade-status (the fixture lever) and
-    # starts common-monitoring.service by hand to inspect one clean cycle at a time.
-    set_time(test_timestamp(1, "02:05:00"))
+    # Warm up: fire the real nixos-upgrade.timer (RandomizedDelaySec = 2h) by
+    # jumping past its next occurrence. The mocked rebuild succeeds (default) and
+    # its OnSuccess records the last-success marker. From here the test flips the
+    # mock's outcome via /run/upgrade-status and starts common-monitoring.service.
+    upgrade_at = fire_timer(2 * 3600)
     client.wait_until_succeeds(f"test -r {marker}", timeout=120)
 
     # Recent success -> monitoring OK. `systemctl start` blocks on the oneshot until the run
     # finishes, so the platform log holds exactly this one cycle's events.
     reset_platform()
-    set_time(test_timestamp(2, "02:05:00"))
+    set_epoch(upgrade_at + 1 * 86400)  # 1 day later: marker still recent (< 14d)
     client.succeed("systemctl start common-monitoring.service")
     assert_paths(["POST /health/start", "POST /health/log", "POST /health"])
     platform.succeed(r"grep -E '\[OK\] auto-upgrade: nixos-upgrade.service last succeeded at [0-9]{4}-[0-9]{2}-[0-9]{2}T' /var/lib/monitoring-platform/bodies.log")
@@ -165,7 +171,7 @@ nixpkgs.lib.nixos.runTest {
     # oneshot fails -- `systemctl start` propagates that, hence client.fail.
     client.succeed("printf '%s' fail > /run/upgrade-status")
     reset_platform()
-    set_time(test_timestamp(17, "02:05:00"))
+    set_epoch(upgrade_at + 16 * 86400)  # 16 days later: last success now older than 14d
     client.fail("systemctl start common-monitoring.service")
     assert_paths(["POST /health/start", "POST /health/log", "POST /health/fail"])
     platform.succeed("grep -F '[FAIL] auto-upgrade: nixos-upgrade.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")

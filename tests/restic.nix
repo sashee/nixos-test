@@ -202,8 +202,6 @@ nixpkgs.lib.nixos.runTest {
   };
 
   testScript = ''
-    from datetime import datetime, timedelta
-
     start_all()
 
     for node in machines:
@@ -237,14 +235,17 @@ nixpkgs.lib.nixos.runTest {
     # 'repo-secret'); the on-disk creds are systemd-creds-encrypted blobs the services decrypt.
     client.succeed("printf %s repo-secret > /tmp/plain-repo-pw")
 
-    test_clock_day = datetime.strptime("${testClockDate}", "%Y-%m-%d").date()
-
-    def test_timestamp(days, time):
-        return f"{test_clock_day + timedelta(days=days)} {time}"
-
-    def set_time(timestamp, nodes=None):
-        for node in (nodes or [client, backend]):
-            node.succeed(f"date -s '{timestamp}'")
+    def fire_timer(delay_s, margin=120):
+        # A fresh Persistent OnCalendar=daily timer fires at the next LOCAL midnight
+        # plus a machine-seeded offset in [0, RandomizedDelaySec]. Jump the clock
+        # past (next local midnight + full delay), in the guest's own timezone, to
+        # fire the real timer deterministically (re-roll-safe: any offset <= delay
+        # is then in the past).
+        slot = int(client.succeed("date -d 'tomorrow 00:00' +%s").strip())
+        target = slot + delay_s + margin
+        for node in [client, backend]:
+            node.succeed(f"date -s @{target}")
+        return target
 
     backend.wait_for_unit("restic-rest-server.socket")
     backend.wait_for_unit("restic-rest-normal.socket")
@@ -311,9 +312,10 @@ nixpkgs.lib.nixos.runTest {
         write_rest_credentials(name)
         write_payload(name, f"{name} payload")
 
-    client.succeed("systemctl reset-failed restic-backups-timer-rest.service")
-    set_time(test_timestamp(1, "00:01:00"))
-    set_time(test_timestamp(1, "01:05:00"))
+    # Fire the real restic-backups-timer-rest.timer (RandomizedDelaySec = 1h) by
+    # jumping past its next occurrence. Its credentials are provisioned before the
+    # service (ordering), so the timer-driven backup succeeds.
+    fire_timer(3600)
     client.wait_until_succeeds("systemctl show restic-backups-timer-rest.service -p ActiveState --value | grep -F inactive && systemctl show restic-backups-timer-rest.service -p Result --value | grep -F success && journalctl -u restic-backups-timer-rest.service | grep -F 'snapshot '", timeout=120)
     assert service_result("timer-rest") == "success"
     client.succeed("RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY=rest:http://restic-backend:8002/timer-rest ${pkgs.restic}/bin/restic snapshots | grep -F timer-rest")
