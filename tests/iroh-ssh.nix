@@ -108,7 +108,7 @@ nixpkgs.lib.nixos.runTest {
     common.irohSsh.credentialDirectory = "/etc/credentials/iroh-ssh";
     # Short failsafe timings so the no-credential phase reaches the port-22
     # opening quickly and the close-on-recovery lands within one short probe
-    # (production defaults: 5 minutes / hourly / 30 seconds).
+    # (production defaults: 15 minutes / hourly / 30 seconds).
     common.irohSsh.failsafe.delaySeconds = 15;
     common.irohSsh.failsafe.probeIntervalSeconds = 5;
     common.irohSsh.failsafe.recheckIntervalSeconds = 5;
