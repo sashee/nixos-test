@@ -85,8 +85,9 @@ Disable the timer on non-laptop systems with:
 common.autoUpgrade.enable = false;
 ```
 
-`.github/workflows/update-flake.yml` updates `flake.lock` daily, builds
-`.#qemu-plasma-result`, and commits the lock file only when the build succeeds.
+`.github/workflows/update-flake.yml` updates `flake.lock` daily, runs the x86,
+rpi, and per-host check suites one check at a time (the same `make run-*`
+targets CI uses), and commits the lock file only when they all pass.
 Hosts that point a local input at this repository can advance to those validated
 commits when their local upgrade timer updates `/etc/nixos/flake.lock`.
 
@@ -486,46 +487,38 @@ Note the checks use aarch64 `hostPkgs`, so the test driver and QEMU themselves
 run under binfmt user emulation on x86 — correct but slow; expect much longer
 runtimes than CI's native arm64 runner.
 
-## Verified Result
+## Running the tests
 
-Build the combined result with live logs:
+Run the generic x86 suite with live logs, one check at a time (this is what CI
+runs; evaluating every check in a single nix process peaks at ~15 GiB, so each
+check gets its own short-lived eval+build process):
 
 ```bash
-make qemu-result
+make run-tests
 ```
 
-This runs all VM checks and produces the QEMU runner, launch commands, test
-outputs, and selected screenshots:
+Each check's output lands under `results/x86_64-linux/<check-name>`, e.g.:
 
 ```text
-result/bin/run-nixos-qemu-vm
-result/qemu-command
-result/common-desktop-check
-result/doh-check
-result/doh-upstream-check
-result/doh-captive-check
-result/nm-captive-portal-check
-result/firewall-check
-result/locale-firefox-check
-result/plasma-firefox-check
-result/restic-check
-result/test-results/common-desktop
-result/test-results/doh
-result/test-results/doh-upstream
-result/test-results/doh-captive
-result/test-results/nm-captive-portal
-result/test-results/firewall
-result/test-results/locale-firefox
-result/test-results/plasma-firefox
-result/test-results/restic
-result/plasma-desktop.png
-result/firefox-page.png
+results/x86_64-linux/common-desktop
+results/x86_64-linux/doh
+results/x86_64-linux/firewall
+results/x86_64-linux/plasma-firefox/plasma-desktop.png
+results/x86_64-linux/plasma-firefox/firefox-page.png
 ```
 
-The default package is the same verified result:
+The per-host and rpi suites work the same way:
+
+```bash
+make run-host-tests HOST=anya-feher-laptop
+make run-rpi-tests
+```
+
+The default package is the graphical QEMU VM runner (no tests):
 
 ```bash
 nix --extra-experimental-features 'nix-command flakes' build -L
+./result/bin/run-nixos-qemu-vm
 ```
 
 Tests live under `tests/`. Run one test during development by building its check:
@@ -542,45 +535,21 @@ nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-
 nix --extra-experimental-features 'nix-command flakes' build -L .#checks.x86_64-linux.restic
 ```
 
-Run all tests and collect every test output under one result tree:
+Tests always run one at a time — each loop iteration builds a single check, so
+`--max-jobs` (default `auto`) only parallelizes dependency builds within that
+check. On a RAM-constrained machine, serialize those too:
 
 ```bash
-make test-results
-```
-
-The aggregate result is organized by test name:
-
-```text
-result/common-desktop
-result/doh
-result/doh-upstream
-result/doh-captive
-result/nm-captive-portal
-result/firewall
-result/locale-firefox
-result/plasma-firefox
-result/restic
-```
-
-The Makefile uses `--max-jobs 2` so Nix runs at most two test derivations at a
-time. To override that locally:
-
-```bash
-make test-results MAX_JOBS=1
+make run-tests MAX_JOBS=1
 ```
 
 `doh-upstream` is hermetic: it routes `doh-test` default IPv4 traffic through
 `dns-peer`, redirects outbound HTTPS there, and verifies that a local DNS query
 becomes an HTTPS `/dns-query` request to one of the configured DoH hostnames.
 
-Run all checks directly:
-
-```bash
-nix --extra-experimental-features 'nix-command flakes' flake check -L
-```
-
-`flake check` does not create a convenient `./result` symlink. Use
-`.#all-test-results` when you want the collected outputs and screenshots.
+`nix flake check` also works, but it evaluates every check in one nix process
+(~15 GiB peak) and leaves no output symlinks — prefer the `make run-*` targets,
+which keep the collected outputs and screenshots under `results/`.
 
 Build the interactive test driver:
 

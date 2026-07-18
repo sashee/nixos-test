@@ -59,20 +59,17 @@ jobs:
           free -h
           df -h
 
-      - name: Build VM image + shared closure (parallel)
-        run: nix build -L --max-jobs auto .#qemu-vm
-
-      - name: Run VM tests (per-check eval, built one at a time)
-        # NOT .#qemu-plasma-result: instantiating that aggregate forces the
-        # ~15 GiB whole-flake eval that OOMed the runner. The make target
-        # evaluates each check in its own short-lived process instead.
-        run: make run-tests MAX_JOBS=1
+      - name: Run VM tests (eval+run one check at a time)
+        # A single whole-flake eval peaks at ~15 GiB and OOMed the runner; the
+        # make target instead evaluates and runs each check strictly one by
+        # one, each in its own short-lived nix process.
+        run: make run-tests
 
       - name: Upload VM artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: qemu-plasma-result
+          name: plasma-screenshots
           path: |
             results/x86_64-linux/plasma-firefox/plasma-desktop.png
             results/x86_64-linux/plasma-firefox/firefox-page.png
@@ -129,7 +126,7 @@ jobs:
       - name: Build + export rpi kernel
         # The kernel is the ~1-2h part and every rpi check reuses it, so build
         # it first: a later test failure still yields the kernel artifact.
-        run: make export-rpi-kernel MAX_JOBS=1
+        run: make export-rpi-kernel
 
       - name: Upload rpi kernel cache
         # Downloadable file:// binary cache of the patched rpi kernel closure.
@@ -141,9 +138,9 @@ jobs:
           path: rpi-kernel-cache
 
       - name: Build Raspberry Pi 5 checks (aarch64 VM tests, real kernel)
-        # Per-check eval so the evaluator's heap stays bounded; building the
-        # .#rpi-all-tests aggregate would force one big whole-flake eval.
-        run: make run-rpi-tests MAX_JOBS=1
+        # Eval+run one check at a time so the evaluator's heap stays bounded;
+        # a single whole-flake eval would OOM the runner.
+        run: make run-rpi-tests
 
   host-checks:
     # Per-host check sets (lib.checkSets.<host>): each laptop host's tests run
@@ -196,8 +193,8 @@ jobs:
           free -h
           df -h
 
-      - name: Run host checks (per-check eval, built one at a time)
-        run: make run-host-tests HOST=${{ matrix.host }} MAX_JOBS=1
+      - name: Run host checks (eval+run one check at a time)
+        run: make run-host-tests HOST=${{ matrix.host }}
 
   automerge:
     # DIY auto-merge: main has no branch protection (so update-flake.yml can

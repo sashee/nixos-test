@@ -359,10 +359,6 @@
         # outside the dropKvm mapAttrs since it isn't a runTest derivation.
         required-kernel-modules = rpi5Base.config.system.build.requiredKernelModulesCheck;
       };
-      rpiAllTests = pkgsRpi.runCommand "rpi-all-tests" { } ''
-        mkdir -p $out
-        ${nixpkgs.lib.concatStringsSep "\n" (nixpkgs.lib.mapAttrsToList (name: test: "ln -s ${test} $out/${nixpkgs.lib.escapeShellArg name}") aarch64TestResults)}
-      '';
       dohUpstreamTest = import ./tests/doh-upstream.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion dohStamps;
       };
@@ -670,40 +666,6 @@
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
         nixUtilsTests));
-      testResultLinks = nixpkgs.lib.concatStringsSep "\n" (
-        nixpkgs.lib.mapAttrsToList
-          (name: test: "ln -s ${test} $out/${nixpkgs.lib.escapeShellArg name}")
-          testResults
-      );
-      qemuCheckLinks = nixpkgs.lib.concatStringsSep "\n" (
-        nixpkgs.lib.mapAttrsToList
-          (name: _: "ln -s ${allTestResults}/${nixpkgs.lib.escapeShellArg name} $out/${nixpkgs.lib.escapeShellArg "${name}-check"}")
-          testResults
-      );
-      allTestResults = pkgs.runCommand "all-test-results" { } ''
-        mkdir -p $out
-        ${testResultLinks}
-      '';
-      qemuPlasmaResult = pkgs.runCommand "qemu-plasma-result" { } ''
-        mkdir -p $out/bin
-        ln -s ${qemuVm}/bin/run-nixos-qemu-vm $out/bin/run-nixos-qemu-vm
-        ln -s ${allTestResults} $out/test-results
-        ${qemuCheckLinks}
-        cp ${allTestResults}/plasma-firefox/plasma-desktop.png $out/plasma-desktop.png
-        cp ${allTestResults}/plasma-firefox/firefox-page.png $out/firefox-page.png
-
-        cat > $out/qemu-command <<'EOF'
-        ./result/bin/run-nixos-qemu-vm
-
-        # With virtio GL on hosts where QEMU can access the host OpenGL stack:
-        QEMU_OPTS="-display gtk,gl=on -device virtio-vga-gl" ./result/bin/run-nixos-qemu-vm
-
-        # On non-NixOS hosts, use nixGL if the GL command fails:
-        QEMU_OPTS="-display gtk,gl=on -device virtio-vga-gl" nix run --extra-experimental-features 'nix-command flakes' --impure github:nix-community/nixGL -- ./result/bin/run-nixos-qemu-vm
-        EOF
-
-        sed -i 's/^        //' $out/qemu-command
-      '';
     in
     {
       nixosModules = {
@@ -731,7 +693,6 @@
 
       checks.${system} = testResults // anyaFeherLaptopChecks;
       checks.aarch64-linux = aarch64TestResults;
-      packages.aarch64-linux.rpi-all-tests = rpiAllTests;
       # The exact patched kernel every rpi check boots (rpiTestKernel pins the
       # node to this package, so the outPath matches the checks). CI exports its
       # closure as the rpi-kernel-cache artifact; `make import-rpi-kernel` loads
@@ -739,8 +700,7 @@
       packages.aarch64-linux.rpi-test-kernel = rpi5Base.config.boot.kernelPackages.kernel;
 
       packages.${system} = {
-        default = qemuPlasmaResult;
-        all-test-results = allTestResults;
+        default = qemuVm;
         iroh-ssh = pkgs.callPackage ./packages/iroh-ssh/package.nix { };
         auto-upgrade-mocked-service-driver = autoUpgradeMockedServiceTest.driver;
         auto-upgrade-mocked-service-driver-interactive = autoUpgradeMockedServiceTest.driverInteractive;
@@ -780,7 +740,6 @@
         nix-settings-driver-interactive = nixSettingsTest.driverInteractive;
         qemu-vm = qemuVm;
         anya-feher-laptop-vm = anyaFeherLaptopQemuVm;
-        qemu-plasma-result = qemuPlasmaResult;
         plasma-firefox-driver = plasmaFirefoxTest.driver;
         plasma-firefox-driver-interactive = plasmaFirefoxTest.driverInteractive;
         restic-driver = resticTest.driver;
