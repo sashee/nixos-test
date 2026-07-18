@@ -1,0 +1,119 @@
+# Kernel modules the rpi5 relies on. The required-kernel-modules check fails the
+# system build (and thus the nightly auto-upgrade) if any of these is missing from
+# the configured kernel -- builtins satisfy the check, so a module the new kernel
+# builds in is fine. Guards kernel switches (e.g. vendor rpi kernel -> mainline).
+#
+# Snapshot of loaded modules on the live Pi (kernel 6.18.34, 2026-07-18); this is
+# point-in-time, so rarely-used on-demand modules may be absent. Regenerate with:
+#   cut -d' ' -f1 /proc/modules | sort
+# then re-add the hand-added entries at the bottom.
+
+8021q
+842_compress
+842_decompress
+ac97_bus
+aes_ce_blk
+aes_ce_ccm
+aes_ce_cipher
+af_alg
+algif_aead
+algif_hash
+algif_skcipher
+atkbd
+bluetooth
+brcmfmac
+brcmfmac_cyw
+brcmutil
+btbcm
+btqca
+btsdio
+cec
+cfg80211
+dm_mod
+drm_display_helper
+drm_dma_helper
+drm_exec
+ecc
+ecdh_generic
+fuse
+garp
+gf128mul
+ghash_ce
+gpio_keys
+gpu_sched
+hci_uart
+i2c_brcmstb
+libmd5
+libps2
+llc
+lz4_compress
+lz4hc_compress
+mc
+md4
+md5
+mmc_block
+nf_conntrack
+nf_defrag_ipv4
+nf_defrag_ipv6
+nf_log_syslog
+nfnetlink
+nf_reject_ipv4
+nf_reject_ipv6
+nf_tables
+nft_ct
+nft_fib
+nft_fib_inet
+nft_fib_ipv4
+nft_fib_ipv6
+nft_limit
+nft_log
+nft_reject
+nft_reject_inet
+nvmem_rmem
+pisp_be
+polyval_ce
+pwm_fan
+pwrseq_core
+raspberrypi_gpiomem
+raspberrypi_hwmon
+rfkill
+rp1_adc
+rp1_fw
+rp1_mailbox
+rp1_pci
+rp1_pio
+rpi_hevc_dec
+rpmb_core
+sch_fq_codel
+serio
+sm4
+snd
+snd_compress
+snd_pcm
+snd_pcm_dmaengine
+snd_soc_core
+snd_soc_hdmi_codec
+snd_timer
+spi_bcm2835
+spidev
+spl
+stp
+v3d
+v4l2_mem2mem
+vc4
+videobuf2_common
+videobuf2_dma_contig
+videobuf2_memops
+videobuf2_v4l2
+videodev
+vivaldi_fmap
+zfs
+zram
+
+# --- Hand-added: not in the loaded-module snapshot, but required ---
+# Ethernet via the RP1 southbridge; builtin in the vendor kernel so it never
+# shows in /proc/modules, but mainline may build it as a module (or drop it).
+macb
+# The rpi VM tests (connectivity-fallback) emulate WiFi with hwsim on the exact
+# Pi kernel; a kernel without it silently breaks that test setup.
+mac80211_hwsim
