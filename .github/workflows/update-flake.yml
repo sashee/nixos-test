@@ -98,13 +98,10 @@ jobs:
           free -h
           df -h
 
-      - name: Build VM image + shared closure (parallel)
-        run: nix build -L --max-jobs auto .#qemu-vm
-
-      - name: Run VM tests (per-check eval, built one at a time)
-        # NOT .#qemu-plasma-result: instantiating the aggregate forces a
-        # ~15 GiB whole-flake eval that OOMs the 16 GiB runner.
-        run: make run-tests MAX_JOBS=1
+      - name: Run VM tests (eval+run one check at a time)
+        # A single whole-flake eval peaks at ~15 GiB and OOMs the 16 GiB
+        # runner; the make target evaluates and runs each check one by one.
+        run: make run-tests
 
   rpi:
     # Verify the aarch64 Raspberry Pi 5 checks against the UPDATED lock, on a
@@ -161,8 +158,8 @@ jobs:
           df -h
 
       - name: Build Raspberry Pi 5 checks (aarch64 VM tests, real kernel)
-        # Per-check eval; the .#rpi-all-tests aggregate would force one big eval.
-        run: make run-rpi-tests MAX_JOBS=1
+        # Eval+run one check at a time; a whole-flake eval would OOM the runner.
+        run: make run-rpi-tests
 
   hosts:
     # Verify each laptop host's check set (lib.checkSets.<host>) against the
@@ -222,8 +219,8 @@ jobs:
           free -h
           df -h
 
-      - name: Run host checks (per-check eval, built one at a time)
-        run: make run-host-tests HOST=${{ matrix.host }} MAX_JOBS=1
+      - name: Run host checks (eval+run one check at a time)
+        run: make run-host-tests HOST=${{ matrix.host }}
 
   commit:
     # Only reached if the x86_64, aarch64, and per-host checks ALL passed.
