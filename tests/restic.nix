@@ -7,6 +7,14 @@ let
   testClockBase = "${testClockDate}T23:00:00";
 
   pruneOpts = [ "--keep-last 1" ];
+  # kvmclock is an x86-only CPU property: on aarch64 qemu exits at startup with
+  # "Property 'host-arm-cpu.kvmclock' not found", and -cpu host needs KVM, which
+  # the CI arm64 runner lacks (TCG). ARM guests keep the default CPU model;
+  # date -s clock jumps work there without disabling a paravirt clock.
+  cpuTuning = nixpkgs.lib.optionals pkgs.stdenv.hostPlatform.isx86_64 [
+    "-cpu"
+    "host,kvmclock=off"
+  ];
 in
 nixpkgs.lib.nixos.runTest {
   name = "restic";
@@ -55,9 +63,7 @@ nixpkgs.lib.nixos.runTest {
     virtualisation.qemu.options = [
       "-rtc"
       "base=${testClockBase},clock=vm"
-      "-cpu"
-      "host,kvmclock=off"
-    ];
+    ] ++ cpuTuning;
 
     common.restic.backups.append-ignored = resticLib.rest {
       user = "backup-user";
@@ -195,9 +201,7 @@ nixpkgs.lib.nixos.runTest {
     virtualisation.qemu.options = [
       "-rtc"
       "base=${testClockBase},clock=vm"
-      "-cpu"
-      "host,kvmclock=off"
-    ];
+    ] ++ cpuTuning;
     system.stateVersion = stateVersion;
   };
 
