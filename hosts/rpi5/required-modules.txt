@@ -96,7 +96,6 @@ snd_soc_hdmi_codec
 snd_timer
 spi_bcm2835
 spidev
-spl
 stp
 v3d
 v4l2_mem2mem
@@ -107,7 +106,6 @@ videobuf2_memops
 videobuf2_v4l2
 videodev
 vivaldi_fmap
-zfs
 zram
 
 # --- Hand-added: not in the loaded-module snapshot, but required ---
