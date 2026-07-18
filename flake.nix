@@ -353,7 +353,12 @@
         boot-clock = bootClockTestRpi;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
-        rpiNixUtilsTests));
+        rpiNixUtilsTests)) // {
+        # Pure build check, no VM: every module in hosts/rpi5/required-modules.txt
+        # exists in the Pi kernel (see modules/required-kernel-modules.nix). Kept
+        # outside the dropKvm mapAttrs since it isn't a runTest derivation.
+        required-kernel-modules = rpi5Base.config.system.build.requiredKernelModulesCheck;
+      };
       rpiAllTests = pkgsRpi.runCommand "rpi-all-tests" { } ''
         mkdir -p $out
         ${nixpkgs.lib.concatStringsSep "\n" (nixpkgs.lib.mapAttrsToList (name: test: "ln -s ${test} $out/${nixpkgs.lib.escapeShellArg name}") aarch64TestResults)}

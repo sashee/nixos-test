@@ -21,6 +21,7 @@ in
     ../../modules/monitoring.nix
     ../../modules/connectivity-fallback.nix
     ../../modules/iroh-ssh.nix
+    ../../modules/required-kernel-modules.nix
     # Same default-deny inbound firewall as the laptops (nftables backend,
     # allowPing=false + ICMP echo-drop pre-table). The iroh tunnel is unaffected;
     # the wlan0 setup-portal ports are opened at runtime only while setup mode runs.
@@ -98,6 +99,14 @@ in
   # boot.initrd.availableKernelModules on aarch64, so the initrd module closure fails
   # with "modprobe: FATAL: Module tpm-crb not found". The Pi 5 has no TPM, so disable it.
   boot.initrd.systemd.tpm2.enable = false;
+
+  # Fail the build (and so the nightly auto-upgrade) if the configured kernel
+  # is missing any module the Pi uses -- a loud, pre-reboot error when switching
+  # kernels (e.g. to mainline) instead of dead hardware after the upgrade reboot.
+  common.requiredKernelModules = {
+    enable = true;
+    file = ./required-modules.txt;
+  };
 
   boot.kernelPatches = [{
     name = "headless-trim";
