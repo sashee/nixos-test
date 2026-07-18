@@ -145,8 +145,14 @@ in
 
       delaySeconds = lib.mkOption {
         type = lib.types.ints.positive;
-        default = 300;
-        description = "Continuous not-ready seconds before port 22 is opened.";
+        default = 900;
+        description = ''
+          Continuous not-ready seconds before port 22 is opened. Must exceed
+          the self-healing window of a lost relay race at boot: a relay-less
+          ticket makes probes depend on n0 DNS discovery, and dns.iroh.link
+          serves not-found with a 600s negative TTL that LAN resolvers cache
+          (observed ~11 min outage on the rpi5, 2026-07-18).
+        '';
       };
 
       probeIntervalSeconds = lib.mkOption {
