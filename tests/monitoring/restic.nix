@@ -14,7 +14,7 @@ let
     ];
 
     networking.hostName = name;
-    boot.initrd.availableKernelModules = [ "rtc_cmos" ];
+    # (rtc_cmos in initrd is provided by laptop-base via commonDesktopModule.)
     common.autoUpgrade.enable = false;
     common.irohSsh.enable = false;
 
@@ -144,8 +144,6 @@ nixpkgs.lib.nixos.runTest {
   };
 
   testScript = ''
-    from datetime import datetime, timedelta
-
     start_all()
 
     for node in machines:
@@ -166,14 +164,21 @@ nixpkgs.lib.nixos.runTest {
         client.succeed("systemctl show common-monitoring.timer -p RandomizedDelayUSec --value | grep -F '10min'")
         client.succeed("systemctl is-active --quiet common-monitoring.timer")
 
-    def set_time(timestamp, nodes=None):
+    def fire_timer(delay_s, margin=120):
+        # A fresh Persistent OnCalendar=daily timer fires at the next LOCAL midnight
+        # plus a machine-seeded offset in [0, RandomizedDelaySec]. Jump every clock
+        # past (next local midnight + full delay), in the guest timezone, to fire the
+        # real timer on both clients deterministically (re-roll-safe: any per-node
+        # offset <= delay is then in the past).
+        slot = int(good_client.succeed("date -d 'tomorrow 00:00' +%s").strip())
+        target = slot + delay_s + margin
+        for node in [good_client, bad_client, platform]:
+            node.succeed(f"date -s @{target}")
+        return target
+
+    def set_epoch(epoch, nodes=None):
         for node in (nodes or [good_client, bad_client, platform]):
-            node.succeed(f"date -s '{timestamp}'")
-
-    test_clock_day = datetime.strptime("${testClockDate}", "%Y-%m-%d").date()
-
-    def test_timestamp(days, time):
-        return f"{test_clock_day + timedelta(days=days)} {time}"
+            node.succeed(f"date -s @{epoch}")
 
     marker = "/var/lib/common-monitoring/restic-backups-monitored.service.last-success"
 
@@ -192,11 +197,10 @@ nixpkgs.lib.nixos.runTest {
     for client in [good_client, bad_client]:
         client.succeed("systemctl stop common-monitoring.timer")
 
-    # Warm up: a jump past the backup timer's 1h randomized-delay window fires the overdue backup.
-    # good-client succeeds and records its last-success marker; bad-client (wrong backend auth)
-    # fails and records nothing. From here the test starts common-monitoring.service by hand to
-    # inspect one clean cycle at a time.
-    set_time(test_timestamp(1, "01:05:00"))
+    # Warm up: fire the real restic-backups-monitored.timer (RandomizedDelaySec = 1h) on both
+    # clients by jumping past its next occurrence. good-client succeeds and records its
+    # last-success marker; bad-client (wrong backend auth) fails and records nothing.
+    backup_at = fire_timer(3600)
     good_client.wait_until_succeeds(f"test -r {marker}", timeout=120)
     bad_client.fail(f"test -e {marker}")
 
@@ -204,7 +208,7 @@ nixpkgs.lib.nixos.runTest {
     # succeeded, so it reports "no successful run" and exits non-zero. `systemctl start` blocks on
     # each oneshot until it finishes, so the platform log holds exactly these two cycles' events.
     reset_platform()
-    set_time(test_timestamp(2, "01:05:00"))
+    set_epoch(backup_at + 1 * 86400)  # 1 day later: good's last success still recent (< 14d)
     good_client.succeed("systemctl start common-monitoring.service")
     bad_client.fail("systemctl start common-monitoring.service")
     assert_events("good", ["POST /good/start", "POST /good/log", "POST /good"])
@@ -219,7 +223,7 @@ nixpkgs.lib.nixos.runTest {
     # absence of a recent *success* does.
     platform.succeed("systemctl stop restic-rest-auth.socket restic-rest-auth.service")
     reset_platform()
-    set_time(test_timestamp(17, "01:05:00"), [good_client, platform])
+    set_epoch(backup_at + 16 * 86400, [good_client, platform])  # 16 days later: last success older than 14d
     good_client.fail("systemctl start common-monitoring.service")
     assert_events("good", ["POST /good/start", "POST /good/log", "POST /good/fail"])
     platform.succeed("grep -F '[FAIL] restic monitored: restic-backups-monitored.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")
