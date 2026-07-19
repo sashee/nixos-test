@@ -89,6 +89,11 @@ nixpkgs.lib.nixos.runTest {
     dns_peer.succeed("rm -rf /tmp/fake-doh-ready /tmp/fake-doh-requests /tmp/fake-doh-last-probe.json")
     dns_peer.succeed("${pkgs.procps}/bin/sysctl -w net.ipv4.ip_forward=1")
     dns_peer.succeed("${pkgs.procps}/bin/sysctl -w net.ipv6.conf.all.forwarding=1")
+    # On slow (TCG) runners eth1's static addresses can land after
+    # multi-user.target; wait for them so the /32s below never end up first in
+    # eth1's address list (peer_ipv4/peer_ipv6 must pick the on-link address).
+    dns_peer.wait_until_succeeds("${pkgs.iproute2}/bin/ip -4 addr show dev eth1 | grep -q 'inet 192.168.1.'")
+    dns_peer.wait_until_succeeds("${pkgs.iproute2}/bin/ip -6 addr show dev eth1 | grep -q 'inet6 2001:db8:1:'")
     for address in doh_ipv4:
         dns_peer.succeed(f"${pkgs.iproute2}/bin/ip addr add {address}/32 dev eth1 || true")
     for address in doh_ipv6:
@@ -97,7 +102,7 @@ nixpkgs.lib.nixos.runTest {
     dns_peer.wait_for_unit("fake-doh-server.service")
     dns_peer.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-ready; do sleep 0.2; done'")
 
-    peer_ipv4 = dns_peer.succeed("${pkgs.python3}/bin/python3 -c 'import json, subprocess; data = json.loads(subprocess.check_output([\"${pkgs.iproute2}/bin/ip\", \"-j\", \"-4\", \"addr\", \"show\", \"dev\", \"eth1\"])); print(data[0][\"addr_info\"][0][\"local\"])'").strip()
+    peer_ipv4 = dns_peer.succeed("${pkgs.python3}/bin/python3 -c 'import json, subprocess; data = json.loads(subprocess.check_output([\"${pkgs.iproute2}/bin/ip\", \"-j\", \"-4\", \"addr\", \"show\", \"dev\", \"eth1\"])); print(next(addr[\"local\"] for addr in data[0][\"addr_info\"] if addr[\"local\"].startswith(\"192.168.1.\")))'").strip()
     peer_ipv6 = dns_peer.succeed("${pkgs.python3}/bin/python3 -c 'import json, subprocess; data = json.loads(subprocess.check_output([\"${pkgs.iproute2}/bin/ip\", \"-j\", \"-6\", \"addr\", \"show\", \"dev\", \"eth1\"])); print(next(addr[\"local\"] for addr in data[0][\"addr_info\"] if addr[\"scope\"] == \"global\" and addr[\"local\"].startswith(\"2001:db8:1:\")))'").strip()
 
     def check_request(path, family, question, qtype):
