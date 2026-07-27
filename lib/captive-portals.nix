@@ -1,4 +1,14 @@
-# Parse lib/captive-portals.txt into { "<name>" = [ "<addr>" ... ]; }.
+# Parse lib/captive-portals.txt. Exports, in increasing strictness:
+#
+#   byName   { "<name>" = [ "<addr>" ... ]; }          -- the file as written
+#   byFamily { "<name>" = { ipv4 = [...]; ipv6 = [...]; }; }
+#                                                     -- for callers sweeping every entry
+#                                                        (tests/doh-captive.nix); asserts
+#                                                        nothing about either family
+#   ipv4sOf / ipv6sOf  "<name>" -> [ "<addr>" ... ]    -- for callers that require the
+#                                                        family to exist and want a missing
+#                                                        one to fail the build
+#                                                        (tests/nm-captive-portal*.nix)
 #
 # dnscrypt-proxy consumes the text file directly (modules/doh.nix passes it as
 # captive_portals.map_file), so this is only for tests that need to assert what the map
@@ -47,7 +57,7 @@ let
     assert lib.assertMsg (byFamily ? ${name}) "captive-portals.txt: no entry for ${name}";
     byFamily.${name};
 in
-rec {
+{
   inherit byName;
 
   # The whole map split by address family, with NO assertion that either family is present:

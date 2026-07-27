@@ -386,6 +386,17 @@ in
       # 2026-07-27. Fail the build instead.
       { assertion = cfg.connectivityCheck.endpoints != [ ];
         message = "common.connectivityFallback.connectivityCheck.endpoints must not be empty: with no endpoints the check always reports offline and the host reboots in a loop."; }
+      # Same reasoning as above, for the same reason it has to be an eval-time failure: the
+      # endpoints are rendered as "host|port|addr|path" records and read back with
+      # `IFS='|' read`, so a '|' anywhere in a field shifts every field after it. The probe
+      # then dials a target nobody meant, fails, and -- since that happens to every endpoint
+      # -- the host raises the setup AP and reboots every bootGrace+setupTimeout. Nothing at
+      # runtime would look wrong; the records are still well-formed, just not the intended
+      # ones. `port` is types.port (an int) and cannot carry a separator.
+      { assertion = !(lib.any
+          (e: lib.any (s: lib.hasInfix "|" s) [ e.hostname e.addr e.path ])
+          cfg.connectivityCheck.endpoints);
+        message = "common.connectivityFallback.connectivityCheck.endpoints: no field may contain '|' -- it separates the host|port|addr|path records the check script parses, so a '|' shifts the fields, every probe fails against the wrong target, and the host reboots in a loop."; }
     ];
 
     environment.systemPackages = [ cfg.tools.iw ];
