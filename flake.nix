@@ -295,6 +295,15 @@
       # workaround). Only what cannot work in a VM is disabled: auto-upgrade
       # (needs /etc/nixos) and monitoring (needs credentials; 30-min timer would
       # fire mid-test). The rest of the deployed stack stays live.
+      # The probe-semantics regression test on the platform the 2026-07-27 outage actually
+      # happened on. The logic is arch-independent, but the incident was on the Pi, so the
+      # regression test for it runs there too.
+      connectivityFallbackProbeTestRpi = import ./tests/connectivity-fallback-probe.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        moduleUnderTest = ./modules/connectivity-fallback.nix;
+      };
       connectivityFallbackTestRpi = import ./tests/connectivity-fallback.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
@@ -345,6 +354,7 @@
         nix-gc-retention = nixGcRetentionTestRpi;
         monitoring = monitoringTestRpi;
         connectivity-fallback = connectivityFallbackTestRpi;
+        connectivity-fallback-probe = connectivityFallbackProbeTestRpi;
         monitoring-nix-gc = monitoringNixGcTestRpi;
         monitoring-iroh-ssh = monitoringIrohSshTestRpi;
         firewall = firewallTestRpi;
@@ -477,6 +487,9 @@
           echo ${nixpkgs.lib.escapeShellArg (builtins.unsafeDiscardStringContext toplevel.drvPath)} > $out
         '';
       dohStampEncodeTest = import ./tests/doh-stamp-encode.nix {
+        inherit pkgs dohStamps;
+      };
+      dohEndpointsTest = import ./tests/doh-endpoints.nix {
         inherit pkgs dohStamps;
       };
       anyaFeherLaptopTest = import ./tests/anya-feher-laptop.nix {
@@ -702,9 +715,10 @@
       };
 
       checks.${system} = testResults // anyaFeherLaptopChecks // {
-        # Eval-only runCommand (throws on drift), not a VM test: no kvm feature to drop,
-        # and arch-independent since stamps are pure data, so x86_64 only.
+        # Eval-only runCommands (throw on drift), not VM tests: no kvm feature to drop,
+        # and arch-independent since stamps/endpoints are pure data, so x86_64 only.
         doh-stamp-encode = dohStampEncodeTest;
+        doh-endpoints = dohEndpointsTest;
       };
       checks.aarch64-linux = aarch64TestResults;
       # The exact patched kernel every rpi check boots (rpiTestKernel pins the

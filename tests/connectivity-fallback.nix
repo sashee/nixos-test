@@ -99,12 +99,15 @@ let
     srv.serve_forever()
   '';
 
-  # What both the check and the boot-time readiness gate use to reach it.
+  # What both the check and the boot-time readiness gate use to reach it. The query comes
+  # from lib/doh-stamps.nix -- the same value the module's connectivityCheck.dnsQuery
+  # default is built from -- so the gate cannot start probing something the check does not.
+  dnsQuery = (import ../lib/doh-stamps.nix { lib = pkgs.lib; }).dnsQuery;
   probeCurl =
     "curl -s -m 3 -o /dev/null -w '%{http_code}'"
     + " --resolve ${probeHost}:443:192.168.77.1"
     + " -H 'accept: application/dns-message'"
-    + " 'https://${probeHost}/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB'";
+    + " 'https://${probeHost}/dns-query?dns=${dnsQuery}'";
 
   # udhcpc action script for the phone (runs inside the netns): configure the
   # interface from the lease and record the offered options for assertions.

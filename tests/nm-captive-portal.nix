@@ -6,7 +6,13 @@ let
   # from it. Hardcoding it meant that when the real host moved CDN in July 2026 this
   # test kept asserting the dead address instead of catching the change.
   portalMap = import ../lib/captive-portals.nix { lib = pkgs.lib; };
-  portalIp = portalMap.ipv4Of "detectportal.firefox.com";
+  # ALL of them: the client resolves the name through the map and gets the whole set, so
+  # an address the portal node does not own routes to it as gateway and is blackholed
+  # (no forwarding) -- a ~130s TCP timeout for curl and for NM's connectivity check
+  # before it falls back. Only the first is used for the dig sanity gate below.
+  portalIps = portalMap.ipv4sOf "detectportal.firefox.com";
+  portalIp = builtins.head portalIps;
+  portalIpsPy = pkgs.lib.concatMapStringsSep ", " (ip: ''"${ip}"'') portalIps;
 
   # Fake detectportal.firefox.com endpoint. Switches behaviour on /tmp/portal-mode
   # so a single long-running server can play both the "open network" and the
@@ -104,7 +110,8 @@ nixpkgs.lib.nixos.runTest {
     # Stand up the fake portal: it owns the client's gateway address and the
     # impersonated detectportal.firefox.com address, and serves HTTP on both.
     portal.succeed("${pkgs.iproute2}/bin/ip addr add 192.168.1.1/24 dev eth1 || true")
-    portal.succeed("${pkgs.iproute2}/bin/ip addr add ${portalIp}/32 dev eth1 || true")
+    for ip in [${portalIpsPy}]:
+        portal.succeed(f"${pkgs.iproute2}/bin/ip addr add {ip}/32 dev eth1 || true")
     portal.succeed("echo open > /tmp/portal-mode")
     portal.succeed("systemd-run --unit portal-http ${pkgs.python3}/bin/python3 ${portalServer}")
     portal.wait_for_unit("portal-http.service")
