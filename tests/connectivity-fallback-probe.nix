@@ -214,10 +214,22 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("systemctl is-active connectivity-fallback-check.timer")
     machine.fail("systemctl is-active connectivity-fallback-setup.service")
 
+    def check_journal():
+        # Scope the read to the service's CURRENT invocation, so the second subtest cannot
+        # see the first one's verdict. Rotating and vacuuming between runs does not achieve
+        # that: `journalctl --vacuum-time=` drops archived files by their newest entry's
+        # age, so a file rotated moments earlier is younger than any usable bound and
+        # survives with the old lines in it. Same pattern as tests/iroh-ssh.nix and
+        # tests/nix-gc-retention.nix.
+        inv = machine.succeed(
+            "systemctl show -p InvocationID --value connectivity-fallback-check.service"
+        ).strip()
+        return machine.succeed(f"journalctl _SYSTEMD_INVOCATION_ID={inv} -o cat")
+
     with subtest("four broken endpoints do not outvote a healthy one"):
         machine.succeed("systemctl start connectivity-fallback-check.service")
         # NB: not `log` -- that name is the test driver's own logger object.
-        journal = machine.succeed("journalctl -u connectivity-fallback-check.service --no-pager")
+        journal = check_journal()
 
         # Online, and specifically via the trusted endpoint.
         assert "online (via good.probe.test at 127.0.0.1)" in journal, journal
@@ -253,11 +265,12 @@ nixpkgs.lib.nixos.runTest {
         # fails here), a 503 from an impeccable TLS server, a hang, and a TLS-level
         # failure. None of them is connectivity.
         machine.succeed("systemctl stop probe-good.service")
-        machine.succeed("journalctl --rotate && journalctl --vacuum-time=1s")
         machine.succeed("systemctl reset-failed connectivity-fallback-check.service || true")
         machine.succeed("systemctl start connectivity-fallback-check.service")
-        # NB: not `log` -- that name is the test driver's own logger object.
-        journal = machine.succeed("journalctl -u connectivity-fallback-check.service --no-pager")
+        # NB: not `log` -- that name is the test driver's own logger object. Reads only this
+        # run's entries, so the "no 200 anywhere" assertions below cannot be satisfied (or
+        # broken) by the previous subtest's output.
+        journal = check_journal()
 
         assert "entering setup mode" in journal, journal
         assert "online (via" not in journal, journal
