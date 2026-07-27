@@ -176,18 +176,38 @@
       # rtc-pl031 (QEMU virt's RTC) must probe in the initrd so HCTOSYS sets the clock
       # before stage-2 timer units start: left to udev it can land minutes into a TCG
       # boot, and that late clock jump wakes Persistent timers (nix-gc) mid-test.
-      rpiTestKernel = { lib, ... }: {
+      # Kernel pinning only. The -rtc flag lives in rpiTestKernel below rather than here
+      # because virtualisation.qemu.options is a list and QEMU merges -rtc options: a node
+      # that needs `clock=vm` (the icount timing test) would otherwise supply a second
+      # `base=` key alongside this one, and which wins is not defined. That test composes
+      # this module and owns its own -rtc.
+      rpiTestKernelPkg = { lib, ... }: {
         boot.kernelPackages = lib.mkForce rpi5Base.config.boot.kernelPackages;
         boot.kernelPatches = lib.mkForce [ ];
         boot.initrd.kernelModules = [ "pci_host_generic" "rtc-pl031" ];
+      };
+      rpiTestKernel = { ... }: {
+        imports = [ rpiTestKernelPkg ];
         virtualisation.qemu.options = [ (testRtcBase pkgsRpi.coreutils) ];
       };
+      # The nix-utils args mkRpi5 passes via specialArgs; needed by any node that imports
+      # hosts/rpi5/configuration.nix directly.
+      rpiSystemArgs = { inherit dotfiles nixpkgs-unstable; nixpkgs-stable = nixpkgs; };
       # The real rpi system config as a test node (hosts/rpi5 on the rpi kernel, with
       # the nix-utils args mkRpi5 passes via specialArgs). All rpi tests build on this
       # so they exercise the deployed config.
       rpiSystemModule = { ... }: {
         imports = [ ./hosts/rpi5/configuration.nix rpiTestKernel ];
-        _module.args = { inherit dotfiles nixpkgs-unstable; nixpkgs-stable = nixpkgs; };
+        _module.args = rpiSystemArgs;
+      };
+      # The deployed rpi config as a connectivity-test node: only what cannot work in a VM
+      # is disabled (auto-upgrade needs /etc/nixos; monitoring needs credentials and its
+      # 30-min timer would fire mid-test). doh/dnscrypt, the firewall and iroh-ssh stay
+      # live, so the connectivity checks run against the real egress rules.
+      rpiConnectivitySystemModule = { lib, ... }: {
+        imports = [ rpiSystemModule ];
+        common.autoUpgrade.enable = lib.mkForce false;
+        common.monitoring.enable = lib.mkForce false;
       };
       dohTestRpi = import ./tests/doh.nix {
         nixpkgs = nixrpi;
@@ -290,28 +310,45 @@
         ];
         user = "nixos";
       };
-      # The REAL rpi system config as the node (exact Pi kernel, which ships
-      # mac80211_hwsim -- verified 6.18.34 -- and carries the tpm-crb initrd
-      # workaround). Only what cannot work in a VM is disabled: auto-upgrade
-      # (needs /etc/nixos) and monitoring (needs credentials; 30-min timer would
-      # fire mid-test). The rest of the deployed stack stays live.
-      # The probe-semantics regression test on the platform the 2026-07-27 outage actually
-      # happened on. The logic is arch-independent, but the incident was on the Pi, so the
-      # regression test for it runs there too.
+      # The probe-semantics regression test for the 2026-07-27 outage, on the REAL rpi
+      # config (exact Pi kernel, live doh egress rules, live firewall -- so the setup
+      # script's runtime nixos-fw openings are on the path here too). The decision logic
+      # is arch-independent, but the incident was on the Pi and this is the deployed stack
+      # that has to survive a rotted endpoint.
       connectivityFallbackProbeTestRpi = import ./tests/connectivity-fallback-probe.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
-        moduleUnderTest = ./modules/connectivity-fallback.nix;
+        machineModule = rpiConnectivitySystemModule;
       };
+      # The REAL rpi system config as the node (exact Pi kernel, which ships
+      # mac80211_hwsim -- verified 6.18.34 -- and carries the tpm-crb initrd
+      # workaround). The rest of the deployed stack stays live.
       connectivityFallbackTestRpi = import ./tests/connectivity-fallback.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiConnectivitySystemModule;
+      };
+      # Production timer constants under icount time-warp, on the real rpi config. Composes
+      # rpiTestKernelPkg + hosts/rpi5 rather than rpiSystemModule so this node owns the sole
+      # -rtc flag (it needs clock=vm; see rpiTestKernelPkg). irohSsh's failsafe is the one
+      # extra thing forced off: it is wantedBy=multi-user.target with Restart=always and
+      # rechecks every recheckIntervalSeconds=30 once its probe fails, so it would wake the
+      # guest ~30x across the ~950 virtual seconds here and leave no idle gap for the clock
+      # to warp through -- which is the entire mechanism this test measures. iroh-ssh.service
+      # itself needs nothing: ConditionPathExists skips it with no credential.
+      connectivityFallbackTimingTestRpi = import ./tests/connectivity-fallback-timing.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        rtcOption = "-rtc clock=vm,base=$(${pkgsRpi.coreutils}/bin/date -u -d tomorrow +%Y-%m-%dT10:00:00)";
         machineModule = { lib, ... }: {
-          imports = [ rpiSystemModule ];
+          imports = [ ./hosts/rpi5/configuration.nix rpiTestKernelPkg ];
+          _module.args = rpiSystemArgs;
           common.autoUpgrade.enable = lib.mkForce false;
           common.monitoring.enable = lib.mkForce false;
+          common.irohSsh.failsafe.enable = lib.mkForce false;
         };
       };
       firewallTestRpi = import ./tests/firewall.nix {
@@ -355,6 +392,7 @@
         monitoring = monitoringTestRpi;
         connectivity-fallback = connectivityFallbackTestRpi;
         connectivity-fallback-probe = connectivityFallbackProbeTestRpi;
+        connectivity-fallback-timing = connectivityFallbackTimingTestRpi;
         monitoring-nix-gc = monitoringNixGcTestRpi;
         monitoring-iroh-ssh = monitoringIrohSshTestRpi;
         firewall = firewallTestRpi;
@@ -440,24 +478,29 @@
         };
         keptAfterGc = 14;  # --delete-older-than 14d: ~14 days of history kept under daily GC
       };
-      # No real image exists for x86 (the deployed system is aarch64-only), so
-      # this variant runs on a minimal module+firewall node.
+      # No real image exists for x86 (the deployed system is aarch64-only), so the three
+      # x86 connectivity variants run on this minimal module+firewall node. The firewall is
+      # part of it deliberately: the setup script's runtime nixos-fw openings are only
+      # emitted when the nftables firewall is managed, so without it that path is dead code.
+      # The aarch64 variants of all three run on the real rpi config.
+      connectivityFallbackNode = { ... }: {
+        imports = [ ./modules/connectivity-fallback.nix ./modules/firewall.nix ];
+      };
       connectivityFallbackTest = import ./tests/connectivity-fallback.nix {
         inherit nixpkgs pkgs stateVersion;
-        machineModule = { ... }: {
-          imports = [ ./modules/connectivity-fallback.nix ./modules/firewall.nix ];
-        };
+        machineModule = connectivityFallbackNode;
       };
       # Probe decision logic (rotted endpoint among healthy ones, TLS interception),
       # isolated from the radio stack. Regression test for the 2026-07-27 reboot loop.
       connectivityFallbackProbeTest = import ./tests/connectivity-fallback-probe.nix {
         inherit nixpkgs pkgs stateVersion;
-        moduleUnderTest = ./modules/connectivity-fallback.nix;
+        machineModule = connectivityFallbackNode;
       };
       # icount concept test: production timer constants under TCG time-warp.
       connectivityFallbackTimingTest = import ./tests/connectivity-fallback-timing.nix {
         inherit nixpkgs pkgs stateVersion;
-        moduleUnderTest = ./modules/connectivity-fallback.nix;
+        machineModule = connectivityFallbackNode;
+        rtcOption = "-rtc clock=vm,base=$(${pkgs.coreutils}/bin/date -u -d tomorrow +%Y-%m-%dT10:00:00)";
       };
       # The real anya-feher-laptop host config as a test node (mirrors
       # rpiSystemModule; plain x86, so no kernel neutralization is needed).
