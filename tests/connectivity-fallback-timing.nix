@@ -37,26 +37,20 @@ nixpkgs.lib.nixos.runTest {
     common.connectivityFallback = {
       enable = true;
       # eth1 exists in the VM, so the AP-side services come up cleanly; the radio
-      # is mocked as in the main test. bootGrace/setupTimeout stay at PRODUCTION
-      # defaults -- that is the point of this test.
+      # is mocked as in the main test. bootGrace/setupTimeout/connectivityCheck all
+      # stay at PRODUCTION defaults -- that is the point of this test (none of the
+      # 8 default DoH upstreams is reachable in the sandbox, so the machine is
+      # offline). The probe loop is deliberately NOT shortened: a guest blocked on
+      # `curl -m 5` is idle, so icount warps over it for almost no wall time, and
+      # running the real endpoint list is what makes this test cover the check
+      # completing inside its TimeoutStartSec -- past that the check would be
+      # SIGTERMed before it ever reaches `systemctl start ... setup.service`, and an
+      # offline box would silently never enter setup mode.
       #
-      # The probe endpoints are deliberately NOT left at their defaults: the sandbox
-      # has no internet either way, but the default list is 8 endpoints and each
-      # burns connectivityCheck.timeoutSeconds before the next is tried, so the
-      # check would finish ~40 virtual seconds after the timer fired and blow the
-      # timing assertions below (which bound the check's exit at 330s and expect
-      # setup already active at 320s). One unreachable endpoint with a short
-      # timeout keeps this test measuring the timers, which is what it is for.
-      # TEST-NET-1 (RFC 5737) is guaranteed unroutable.
-      connectivityCheck = {
-        endpoints = [
-          {
-            hostname = "timing-probe.invalid";
-            addr = "192.0.2.1";
-          }
-        ];
-        timeoutSeconds = 2;
-      };
+      # Observed loop duration swings between 20s and 42s depending on whether the
+      # build sandbox has an IPv6 route: without one the four v6 endpoints fail
+      # instantly, with one they each burn the full timeoutSeconds. The bound below
+      # accommodates both.
       interface = "eth1";
       tools.iwd = fakeIwctl;
       tools.iw = fakeIw;
@@ -84,32 +78,73 @@ nixpkgs.lib.nixos.runTest {
     t0 = time.monotonic()
 
     with subtest("production OnBootSec=5min fires at its real deadline"):
-        # Guest-side blocking sleep to past the +300s boundary (the setup script
-        # itself sleeps ~3s after the check fires, so probe at 320): while the
-        # guest sleeps, the warp delivers the check timer at exactly 300s. The
-        # status queries ride in the same command -- no idle gap to warp through.
+        # Guest-side blocking sleep past the +300s boundary AND past the probe loop:
+        # while the guest sleeps, the warp delivers the check timer at exactly 300s.
+        # The status queries ride in the same command -- no idle gap to warp through.
+        #
+        # Probe instant = 300 (OnBootSec) + 40 (8 production endpoints x 5s
+        # connectivityCheck.timeoutSeconds, none reachable here) + ~3 (the setup
+        # script's own two sleeps) + margin = 380. Every provider added to
+        # lib/doh-stamps.nix costs 5s of that margin. The next boundary is the
+        # safety-net reboot at ~945s, so there is ample room above.
         out = machine.succeed(
-            "sleep \"$(awk '{d=320-$1; print (d<1)?1:d}' /proc/uptime)\"; "
+            "sleep \"$(awk '{d=380-$1; print (d<1)?1:d}' /proc/uptime)\"; "
             "systemctl is-active connectivity-fallback-setup.service || true; "
+            # One property per call: `systemctl show` with several -p flags gives no
+            # documented output order. Both queries ride in this same command, so there
+            # is still no idle gap for the clock to warp through.
+            "systemctl show connectivity-fallback-check.service "
+            "-p ExecMainStartTimestampMonotonic --value; "
             "systemctl show connectivity-fallback-check.service "
             "-p ExecMainExitTimestampMonotonic --value"
         )
-        state, check_exit_us = out.split()
-        assert state == "active", out
+        state, check_start_us, check_exit_us = out.split()
+        check_start = int(check_start_us) / 1e6
         check_exit = int(check_exit_us) / 1e6
-        assert 295 <= check_exit <= 330, f"check finished at monotonic {check_exit}s"
+        machine.log(
+            f"check ran {check_start:.1f}s..{check_exit:.1f}s monotonic "
+            f"({check_exit - check_start:.1f}s in the probe loop); "
+            f"setup.service is {state}"
+        )
+        assert state == "active", out
+        # Two independent properties, asserted separately so a failure says which one
+        # broke: the monotonic timer fired at its real 300s deadline, and the production
+        # probe loop stays well inside the check service's TimeoutStartSec (120s).
+        #
+        # 60s = 1.5x the 40s ceiling the option defaults imply (8 endpoints x
+        # timeoutSeconds), and half of TimeoutStartSec. Measured loops across runs: 20.0s
+        # (no IPv6 route in the sandbox, the four v6 endpoints fail instantly), 38.9s and
+        # 42.4s (v6 route present, every endpoint burning its full timeout plus ~2s of
+        # process-spawn overhead under TCG). A tighter bound would be measuring runner
+        # speed rather than the property.
+        assert 295 <= check_start <= 305, f"check started at monotonic {check_start}s"
+        probe_loop = check_exit - check_start
+        assert probe_loop <= 60, f"probe loop took {probe_loop}s"
 
     with subtest("production setupTimeout=10min really reboots; warp makes it cheap"):
         # ~600 further virtual seconds with zero driver interaction.
         machine.wait_for_shutdown()
         wall = time.monotonic() - t0
-        virtual = 905 - boot_uptime  # reboot lands at guest uptime ~905s
+        # The safety-net reboot is scheduled (systemd-run --on-active=10min) when the
+        # setup script reaches its last line, ~3s after the check exits -- so derive
+        # the span rather than hardcoding it, since it moves with the probe loop.
+        virtual = (check_exit + 3 + 600) - boot_uptime
         machine.log(
             f"boot reached multi-user at guest uptime {boot_uptime:.0f}s; "
             f"then ~{virtual:.0f}s virtual took {wall:.0f}s wall"
         )
-        # The icount certificate: the virtual span must cost far less wall time
-        # than real time (a non-warping run would need >= `virtual` seconds).
-        assert wall < 300, f"warp too slow: {wall:.0f}s wall for {virtual:.0f}s virtual"
+        # The icount certificate: the virtual span must cost far less wall time than real
+        # time (a non-warping run would need >= `virtual` seconds).
+        #
+        # Expressed as a ratio, not an absolute wall-clock bound. This used to be
+        # `wall < 300`, which was already sitting at 96% of the observed value (288s) and
+        # went to 99% once the production probe loop lengthened the virtual span -- i.e.
+        # it was one slow runner away from flaking while measuring nothing the ratio does
+        # not measure better. The ratio also scales on its own as providers are added to
+        # lib/doh-stamps.nix. Observed here: 0.48.
+        ratio = wall / virtual
+        assert ratio < 0.75, (
+            f"warp too slow: {wall:.0f}s wall for {virtual:.0f}s virtual (ratio {ratio:.2f})"
+        )
   '';
 }

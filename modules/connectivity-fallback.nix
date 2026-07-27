@@ -8,9 +8,8 @@ let
   # resolvers actually in use. mapAttrsToList orders by attribute name, which puts each
   # provider's IPv4 entry before its IPv6 one -- worth keeping, because the rpi5 has no
   # global IPv6 and a v6 attempt is a wasted timeout there.
-  dohEndpoints = lib.mapAttrsToList (_: e: { inherit (e) hostname addr; }) (
-    (import ../lib/doh-stamps.nix { inherit lib; }).endpoints
-  );
+  doh = import ../lib/doh-stamps.nix { inherit lib; };
+  dohEndpoints = lib.mapAttrsToList (_: e: { inherit (e) hostname addr; }) doh.endpoints;
 
   # Whether this host runs the nftables-backed NixOS firewall whose nixos-fw
   # table the setup script must open the AP service ports in.
@@ -334,13 +333,11 @@ in
 
       dnsQuery = lib.mkOption {
         type = lib.types.str;
-        # RFC 8484 GET parameter: base64url, unpadded. Decodes to a standard query for
-        # www.example.com IN A with ID 0 and RD set:
-        #   0000 0100 0001 0000 0000 0000  (header: ID, flags, QDCOUNT=1, no RRs)
-        #   03 "www" 07 "example" 03 "com" 00   (QNAME)
-        #   0001 0001                      (QTYPE=A, QCLASS=IN)
-        # ID 0 is deliberate: it keeps the request cacheable by intermediaries.
-        default = "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB";
+        # See lib/doh-stamps.nix for the byte-level decoding; it lives there so the VM
+        # tests, which build their own probe curl commands, can send the identical query
+        # instead of copying the literal.
+        default = doh.dnsQuery;
+        defaultText = lib.literalExpression "dnsQuery from lib/doh-stamps.nix";
         description = "base64url-encoded DNS query sent to each endpoint.";
       };
 
@@ -348,8 +345,17 @@ in
         type = lib.types.ints.positive;
         default = 5;
         description = ''
-          Per-endpoint curl timeout. Worst case the check takes this times the number of
-          endpoints, so keep the product well under setupTimeout.
+          Per-endpoint curl timeout.
+
+          Worst case the check takes this times the number of endpoints -- 40s at the
+          defaults. Two ceilings sit above that, and the tighter one is not the obvious
+          one: TimeoutStartSec on the check service (120s), past which the probe loop is
+          killed before it reaches the line that starts setup mode, so an offline host
+          would silently stay offline. That is set explicitly rather than left to inherit
+          systemd's 90s default precisely because the consequence is invisible.
+          setupTimeout (10min) is the other ceiling and is never binding.
+          tests/connectivity-fallback-timing.nix runs the real endpoint list under icount
+          and asserts the loop stays inside 60s (42s measured worst case).
         '';
       };
     };
@@ -392,7 +398,16 @@ in
 
     systemd.services.connectivity-fallback-check = {
       description = "Check internet connectivity; enter WiFi setup mode if offline";
-      serviceConfig = { Type = "oneshot"; ExecStart = lib.getExe checkScript; };
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = lib.getExe checkScript;
+        # Explicit rather than inheriting DefaultTimeoutStartSec (90s), because the
+        # consequence of hitting it is silent: the probe loop would be killed before
+        # `systemctl start ... setup.service`, so an offline host would never raise the
+        # setup AP. Must stay comfortably above timeoutSeconds x length endpoints (40s at
+        # the defaults) -- see the timeoutSeconds description.
+        TimeoutStartSec = "120s";
+      };
     };
 
     systemd.timers.connectivity-fallback-check = {

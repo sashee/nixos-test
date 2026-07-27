@@ -71,9 +71,26 @@ rec {
 
   # Escape hatch: a provider that does not fit the uniform shape above -- one publishing a
   # certificate hash, or needing different props or a different path -- can be pasted here
-  # verbatim as `name.stamp = "sdns://...";` and is merged into `stamps` untouched. The
-  # golden test can only vouch for generated entries, so anything added here is on trust.
+  # verbatim as `name.stamp = "sdns://...";` and is merged into `stamps` untouched.
+  #
+  # Anything added here is on trust, and asymmetrically so: it reaches dnscrypt-proxy via
+  # `stamps` but NOT `endpoints`, so it is not golden-tested (tests/doh-stamp-encode.nix
+  # can only vouch for generated entries), not probed by connectivity-fallback, and not
+  # impersonated by tests/doh-interceptor.nix. If you use it, extend those three call
+  # sites too rather than assuming the coverage carries over.
   extraStamps = { };
+
+  # RFC 8484 GET parameter: base64url, unpadded. Decodes to a standard query for
+  # www.example.com IN A with ID 0 and RD set:
+  #   0000 0100 0001 0000 0000 0000  (header: ID, flags, QDCOUNT=1, no RRs)
+  #   03 "www" 07 "example" 03 "com" 00   (QNAME)
+  #   0001 0001                      (QTYPE=A, QCLASS=IN)
+  # ID 0 is deliberate: it keeps the request cacheable by intermediaries.
+  #
+  # Lives here rather than in modules/connectivity-fallback.nix because the VM tests build
+  # their own probe curl commands and have to send the identical query; duplicating the
+  # literal in each is how the two silently drift.
+  dnsQuery = "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB";
 
   # { "cloudflare-ipv4" = { hostname; addr; family; }; ... }
   # Consumed by modules/connectivity-fallback.nix (probe targets) and

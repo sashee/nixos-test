@@ -1,11 +1,18 @@
 { nixpkgs, pkgs, commonDesktopModule, stateVersion }:
 
 let
-  # The IPv6 address the dnscrypt map answers detectportal.firefox.com with, read from
+  # The IPv6 addresses the dnscrypt map answers detectportal.firefox.com with, read from
   # lib/captive-portals.txt so the impersonating node and the assertions cannot drift
   # from it (see the IPv4 variant for why hardcoding it was a liability).
+  #
+  # ALL of them, not just the first: the client gets the whole AAAA set from the map, and
+  # an address the portal node does not own routes to it as gateway and is blackholed (no
+  # forwarding) -- a ~130s TCP timeout for curl and for NM's connectivity check before it
+  # falls back. Only the first is used for the dig sanity gate below.
   portalMap = import ../lib/captive-portals.nix { lib = pkgs.lib; };
-  portalIp6 = portalMap.ipv6Of "detectportal.firefox.com";
+  portalIp6s = portalMap.ipv6sOf "detectportal.firefox.com";
+  portalIp6 = builtins.head portalIp6s;
+  portalIp6sPy = pkgs.lib.concatMapStringsSep ", " (ip: ''"${ip}"'') portalIp6s;
 
   # Fake detectportal.firefox.com endpoint, IPv6 only. Switches behaviour on
   # /tmp/portal-mode so a single long-running server plays both the "open network"
@@ -111,7 +118,8 @@ nixpkgs.lib.nixos.runTest {
     # Stand up the fake portal: it owns the client's IPv6 gateway address and the
     # impersonated detectportal.firefox.com IPv6 address, and serves HTTP on both.
     portal.succeed("${pkgs.iproute2}/bin/ip -6 addr add fd00::1/64 dev eth1 nodad || true")
-    portal.succeed("${pkgs.iproute2}/bin/ip -6 addr add ${portalIp6}/128 dev eth1 nodad || true")
+    for ip in [${portalIp6sPy}]:
+        portal.succeed(f"${pkgs.iproute2}/bin/ip -6 addr add {ip}/128 dev eth1 nodad || true")
     portal.succeed("echo open > /tmp/portal-mode")
     portal.succeed("systemd-run --unit portal-http ${pkgs.python3}/bin/python3 ${portalServer}")
     portal.wait_for_unit("portal-http.service")

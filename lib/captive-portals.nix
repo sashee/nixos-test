@@ -40,24 +40,35 @@ let
 
   isIpv6 = addr: lib.hasInfix ":" addr;
 in
-{
+rec {
   inherit byName;
 
-  # First address of each family, for tests that impersonate one endpoint. First rather
-  # than arbitrary so the choice is stable across edits to the rest of the line.
-  ipv4Of =
+  # Every address of one family. A test that impersonates a name must own ALL of them,
+  # not just one: the client resolves the name through the map and gets the whole set, so
+  # any address left unclaimed routes to the test's gateway node, which does not forward
+  # -- a blackhole that costs curl (and NetworkManager's connectivity check) a ~130s TCP
+  # timeout before it falls back to the next address. detectportal.firefox.com has four
+  # per family since the 2026-07-27 Fastly move, so this stopped being hypothetical.
+  ipv4sOf =
     name:
     let
       v4 = lib.filter (a: !isIpv6 a) (addrsOf name);
     in
     assert lib.assertMsg (v4 != [ ]) "captive-portals.txt: ${name} has no IPv4 address";
-    builtins.head v4;
+    v4;
 
-  ipv6Of =
+  ipv6sOf =
     name:
     let
       v6 = lib.filter isIpv6 (addrsOf name);
     in
     assert lib.assertMsg (v6 != [ ]) "captive-portals.txt: ${name} has no IPv6 address";
-    builtins.head v6;
+    v6;
+
+  # First address of each family, for assertions that only need one representative answer
+  # (e.g. a `dig | grep` sanity gate). First rather than arbitrary so the choice is stable
+  # across edits to the rest of the line. Do NOT use these to decide what a node binds --
+  # see ipv4sOf/ipv6sOf above.
+  ipv4Of = name: builtins.head (ipv4sOf name);
+  ipv6Of = name: builtins.head (ipv6sOf name);
 }
