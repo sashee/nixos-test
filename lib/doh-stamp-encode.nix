@@ -110,7 +110,7 @@ rec {
   # { addr, hostname, path, props } -> "sdns://..."
   #
   # `addr` is the literal the client dials, so IPv6 must arrive already bracketed
-  # ("[2606:4700:4700::1111]"); see stampsFor in lib/doh-stamps.nix, which is the only
+  # ("[2606:4700:4700::1111]"); see entriesFor in lib/doh-stamps.nix, which is the only
   # intended caller and does the bracketing.
   mkDohStamp =
     {

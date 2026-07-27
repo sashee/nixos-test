@@ -102,6 +102,14 @@ nixpkgs.lib.nixos.runTest {
         # script's own two sleeps) + margin = 380. Every provider added to
         # lib/doh-stamps.nix costs 5s of that margin. The next boundary is the
         # safety-net reboot at ~945s, so there is ample room above.
+        #
+        # That target only bites on boots that reach multi-user before ~380s. Above it the
+        # awk clamps to `sleep 1` and the driver simply reads state after boot, which is
+        # the regime the x86 variant is actually in (387s boot measured) -- so the 380 is
+        # inert there and the arithmetic above did not apply to the numbers quoted further
+        # down. Both assertions still hold either way; the number is worth leaving as the
+        # documented deadline rather than tuning, since it is what makes the fast-boot case
+        # synchronize instead of warping past the boundary.
         out = machine.succeed(
             "sleep \"$(awk '{d=380-$1; print (d<1)?1:d}' /proc/uptime)\"; "
             "systemctl is-active connectivity-fallback-setup.service || true; "
