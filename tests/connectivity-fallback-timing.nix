@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion, moduleUnderTest }:
+{ nixpkgs, pkgs, stateVersion, machineModule, rtcOption }:
 
 # Concept test: run the module's PRODUCTION timer constants (bootGrace=5min,
 # setupTimeout=10min -- deliberately NOT overridden here) in seconds of wall time
@@ -13,6 +13,20 @@
 # clock, potentially past the next boundary (the +15min safety reboot). So the
 # script synchronizes with guest-side blocking sleeps and compound one-liners,
 # and never polls across a boundary.
+#
+# machineModule is the system under test: the aarch64 variant passes the REAL rpi config
+# (hosts/rpi5 on the Pi kernel), so the production constants run against the deployed
+# stack. `rtcOption` is a parameter rather than a literal because this node must own the
+# ONLY -rtc flag on the QEMU command line: it needs `clock=vm` (so the RTC follows the
+# virtual clock), and virtualisation.qemu.options is a list, so a node that also picked up
+# the shared `-rtc base=...` helper would emit two -rtc options whose merge order is
+# undefined. The caller therefore supplies the whole flag, including the tomorrow-10:00
+# base every test in this repo uses.
+#
+# Anything that wakes the guest periodically defeats this test: the warp only skips time
+# while the guest is idle. The rpi variant forces off common.irohSsh.failsafe for that
+# reason (see flake.nix) -- worth remembering before adding another polling unit to the
+# node.
 let
   fakeIwctl = pkgs.writeShellScriptBin "iwctl" ''
     echo "iwctl $*" >> /tmp/iwctl.log
@@ -28,7 +42,7 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
 
   nodes.machine = { config, lib, pkgs, ... }: {
-    imports = [ moduleUnderTest ];
+    imports = [ machineModule ];
 
     networking.hostName = "nixos-rpi5";
     networking.wireless.iwd.enable = true;
@@ -62,8 +76,9 @@ nixpkgs.lib.nixos.runTest {
       "-machine accel=tcg"
       # Guest clock from instruction count; warp over idle instead of sleeping.
       "-icount shift=auto,sleep=off"
-      # RTC follows the virtual clock; base per repo convention (see testRtcBase).
-      "-rtc clock=vm,base=$(${pkgs.coreutils}/bin/date -u -d tomorrow +%Y-%m-%dT10:00:00)"
+      # RTC follows the virtual clock; base per repo convention (see testRtcBase). Supplied
+      # by the caller so this stays the only -rtc on the command line (see header).
+      rtcOption
     ];
 
     system.stateVersion = stateVersion;
@@ -132,6 +147,18 @@ nixpkgs.lib.nixos.runTest {
         machine.log(
             f"boot reached multi-user at guest uptime {boot_uptime:.0f}s; "
             f"then ~{virtual:.0f}s virtual took {wall:.0f}s wall"
+        )
+        # The span the ratio below is computed over. A slow boot does not fail this test --
+        # the check still fires at its real 300s deadline and the awk sleep clamps to 1s --
+        # but every virtual second spent booting is one the driver never gets to watch the
+        # warp over, so `virtual` shrinks and the ratio quietly measures less and less. At
+        # some point it measures nothing while still passing. Assert the span explicitly so
+        # that degradation fails loudly instead. Half of setupTimeout is the floor; measured
+        # 529s on x86 (387s boot). If the aarch64 variant trips this, the answer is a faster
+        # node (memory/vCPUs), not a lower floor.
+        assert virtual >= 300, (
+            f"only {virtual:.0f}s of virtual span left after a {boot_uptime:.0f}s boot; "
+            "the icount warp is barely being measured"
         )
         # The icount certificate: the virtual span must cost far less wall time than real
         # time (a non-warping run would need >= `virtual` seconds).

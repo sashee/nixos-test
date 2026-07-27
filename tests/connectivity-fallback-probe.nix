@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion, moduleUnderTest }:
+{ nixpkgs, pkgs, stateVersion, machineModule }:
 
 # Probe semantics for the connectivity check, isolated from the radio stack.
 #
@@ -10,7 +10,7 @@
 # the whole time. The old test suite could not catch it because it only ever mocked the
 # probe as wholly reachable or wholly unreachable, never as responding-but-broken.
 #
-# Three endpoints are served locally, in the order the check tries them:
+# Five endpoints are served locally, in the order the check tries them:
 #
 #   1. broken   -- accepts the connection and closes it without completing TLS. The
 #                  faithful analogue of the endpoint that caused the outage (over HTTPS
@@ -34,6 +34,14 @@
 # logic -- that one rotted endpoint among healthy ones cannot take the machine down, and
 # that TLS interception cannot be mistaken for connectivity. The real network path
 # (station mode, AP mode, DHCP, the portal) is covered by connectivity-fallback.nix.
+#
+# machineModule is the system under test: the aarch64 variant passes the REAL rpi config
+# (hosts/rpi5 on the Pi kernel, with only auto-upgrade and monitoring disabled), so the
+# deployed stack -- dnscrypt, the doh egress rules, the default-deny firewall -- is live
+# while the check runs. That matters beyond fidelity: with the firewall managed, the setup
+# script inserts its runtime nixos-fw openings, so the second subtest exercises that path
+# too. The x86 variant has no real image (aarch64-only) and uses a minimal
+# module+firewall node.
 let
   mkCert = import ./test-cert.nix { inherit pkgs; };
 
@@ -130,7 +138,12 @@ nixpkgs.lib.nixos.runTest {
   nodes.machine =
     { lib, ... }:
     {
-      imports = [ moduleUnderTest ];
+      imports = [ machineModule ];
+
+      # Required, not cosmetic: the rpi config sets networking.hostName with mkDefault and
+      # so does the test framework ("machine"), and two mkDefaults tie rather than one
+      # winning. The other two connectivity tests pin the same value.
+      networking.hostName = "nixos-rpi5";
 
       networking.wireless.iwd.enable = true;
       security.pki.certificateFiles = [ trusted.caFile ];
