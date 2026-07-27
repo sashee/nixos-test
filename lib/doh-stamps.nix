@@ -12,6 +12,15 @@
 # (proto 0x02, props 4, no certificate hash, path /dns-query), so nothing is lost.
 # tests/doh-stamp-encode.nix asserts the generated stamps still match the eight
 # original literals byte for byte.
+#
+# There is deliberately no escape hatch for pasting a hand-written `sdns://` literal
+# alongside the generated ones. A provider that does not fit the uniform shape -- one
+# publishing a certificate hash, or needing different props or a different path -- has to
+# be taught to lib/doh-stamp-encode.nix, because a pasted stamp would reach dnscrypt-proxy
+# via `stamps` while being absent from `endpoints`: not golden-tested, not probed by
+# connectivity-fallback, and not impersonated by tests/doh-interceptor.nix. Both eval
+# guards (tests/doh-stamp-encode.nix and tests/doh-endpoints.nix) pin the full key set of
+# `stamps`, so they reject such an entry anyway.
 { lib }:
 
 let
@@ -69,17 +78,6 @@ rec {
     };
   };
 
-  # Escape hatch: a provider that does not fit the uniform shape above -- one publishing a
-  # certificate hash, or needing different props or a different path -- can be pasted here
-  # verbatim as `name.stamp = "sdns://...";` and is merged into `stamps` untouched.
-  #
-  # Anything added here is on trust, and asymmetrically so: it reaches dnscrypt-proxy via
-  # `stamps` but NOT `endpoints`, so it is not golden-tested (tests/doh-stamp-encode.nix
-  # can only vouch for generated entries), not probed by connectivity-fallback, and not
-  # impersonated by tests/doh-interceptor.nix. If you use it, extend those three call
-  # sites too rather than assuming the coverage carries over.
-  extraStamps = { };
-
   # RFC 8484 GET parameter: base64url, unpadded. Decodes to a standard query for
   # www.example.com IN A with ID 0 and RD set:
   #   0000 0100 0001 0000 0000 0000  (header: ID, flags, QDCOUNT=1, no RRs)
@@ -100,7 +98,7 @@ rec {
   );
 
   # What dnscrypt-proxy's [static] section wants: { "<name>" = { stamp = "sdns://..."; }; }
-  stamps =
-    lib.mapAttrs (_: e: { stamp = enc.mkDohStamp { inherit (e) addr hostname; }; }) endpoints
-    // extraStamps;
+  # Generated from `endpoints` alone, so the two key sets are identical by construction --
+  # which is what tests/doh-endpoints.nix asserts and connectivity-fallback relies on.
+  stamps = lib.mapAttrs (_: e: { stamp = enc.mkDohStamp { inherit (e) addr hostname; }; }) endpoints;
 }

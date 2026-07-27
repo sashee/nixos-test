@@ -732,6 +732,15 @@
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
         nixUtilsTests));
+      # Eval-only runCommands (throw on drift), not VM tests: no kvm feature to drop, and
+      # arch-independent since stamps/endpoints are pure data, so x86_64 only. These must
+      # be part of the generic-x86 checkSet and not only of checks.${system}: the
+      # Makefile's run-checks builds a checkSet name by name, so a check outside one is
+      # never evaluated by CI.
+      evalChecks = {
+        doh-stamp-encode = dohStampEncodeTest;
+        doh-endpoints = dohEndpointsTest;
+      };
     in
     {
       nixosModules = {
@@ -747,7 +756,7 @@
       # Named check sets for the Makefile's run-checks (SET=...): the generic
       # x86 suite and one set per laptop host, each run by its own CI job.
       lib.checkSets = {
-        generic-x86 = testResults;
+        generic-x86 = testResults // evalChecks;
         anya-feher-laptop = anyaFeherLaptopChecks;
       };
 
@@ -757,12 +766,7 @@
         qemu-graphical = qemuGraphical;
       };
 
-      checks.${system} = testResults // anyaFeherLaptopChecks // {
-        # Eval-only runCommands (throw on drift), not VM tests: no kvm feature to drop,
-        # and arch-independent since stamps/endpoints are pure data, so x86_64 only.
-        doh-stamp-encode = dohStampEncodeTest;
-        doh-endpoints = dohEndpointsTest;
-      };
+      checks.${system} = testResults // evalChecks // anyaFeherLaptopChecks;
       checks.aarch64-linux = aarch64TestResults;
       # The exact patched kernel every rpi check boots (rpiTestKernel pins the
       # node to this package, so the outPath matches the checks). CI exports its
