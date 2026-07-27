@@ -3,9 +3,12 @@
 # Impersonates the deployed DoH upstreams so a stock dnscrypt-proxy client's DNS
 # queries are answered by a test-controlled server. The caller supplies a single
 # `respond(query, meta) -> bytes` Python function ("DNS request in, DNS response
-# out"); this module owns the stamp decoding, the test CA + leaf cert, and the
-# TLS DoH server, and hands back the decoded provider IPs/domains, the cert
-# paths, and a systemd service builder for the interceptor node.
+# out"); this module owns the test CA + leaf cert and the TLS DoH server, and hands
+# back the provider IPs/domains, the cert paths, and a systemd service builder for
+# the interceptor node.
+#
+# `dohStamps` is lib/doh-stamps.nix evaluated -- i.e. `{ providers, endpoints, stamps }`
+# -- and only `.providers` is used here.
 #
 # Used by tests/doh-upstream.nix and tests/iroh-ssh.nix.
 { pkgs, dohStamps, readyFile ? "/tmp/doh-interceptor-ready", respond, name ? "doh-interceptor" }:
@@ -13,36 +16,18 @@
 let
   lib = pkgs.lib;
 
-  # Decode the deployed DoH stamps to the upstream provider IPs/hostnames, so
-  # the test hijacks exactly the addresses dnscrypt-proxy dials.
-  stampsJson = pkgs.writeText "doh-stamps.json" (builtins.toJSON dohStamps);
-  decodeStampsScript = pkgs.writeText "decode-stamps.py" ''
-import base64, json, sys
-stamps = json.loads(open(sys.argv[1]).read())
-def decode(s):
-    raw = s.removeprefix("sdns://"); raw += "=" * (-len(raw) % 4)
-    raw = base64.urlsafe_b64decode(raw)
-    alen = raw[9]; addr = raw[10:10+alen] if alen else None
-    pos = 11 + alen; hlen = raw[pos]
-    hostname = raw[pos+1:pos+1+hlen].decode()
-    ip = None
-    if addr:
-        d = addr.decode("ascii")
-        ip = d.strip("[]") if d.startswith("[") else (d if "." in d else None)
-    family = "ipv4" if ip and "." in ip else "ipv6" if ip else "unknown"
-    return {"hostname": hostname, "ip": ip, "family": family}
-print(json.dumps({k: decode(v["stamp"]) for k, v in stamps.items()}))
-  '';
-  decodedStamps = builtins.fromJSON (builtins.readFile (pkgs.runCommand "${name}-decode-doh-stamps" {
-    nativeBuildInputs = [ pkgs.python3 ];
-    inherit stampsJson decodeStampsScript;
-    preferLocalBuild = true;
-  } ''
-    ${pkgs.python3}/bin/python3 ${decodeStampsScript} ${stampsJson} > $out
-  ''));
-  dohDomains = lib.unique (lib.mapAttrsToList (_: v: v.hostname) decodedStamps);
-  dohIpv4 = lib.unique (lib.filter (x: x != null) (lib.mapAttrsToList (_: v: if v.family == "ipv4" then v.ip else null) decodedStamps));
-  dohIpv6 = lib.unique (lib.filter (x: x != null) (lib.mapAttrsToList (_: v: if v.family == "ipv6" then v.ip else null) decodedStamps));
+  # The upstream provider IPs/hostnames dnscrypt-proxy dials, so the test hijacks exactly
+  # those. Read straight off the components in lib/doh-stamps.nix -- which is also where
+  # the `sdns://` stamps dnscrypt actually consumes are generated from, so the two cannot
+  # drift. This used to decode the stamps with a Python helper via import-from-derivation;
+  # since the components became the source of truth there is nothing left to decode, and
+  # dropping the IFD keeps evaluation buildless (it sat on the checks.aarch64-linux path).
+  providers = dohStamps.providers;
+  dohDomains = lib.unique (lib.mapAttrsToList (_: p: p.hostname) providers);
+  dohIpv4 = lib.unique (lib.mapAttrsToList (_: p: p.v4) providers);
+  # Unbracketed: these are used as bare addresses (interface config, socket binds),
+  # unlike the bracketed dial targets inside a stamp.
+  dohIpv6 = lib.unique (lib.filter (x: x != null) (lib.mapAttrsToList (_: p: p.v6 or null) providers));
 
   # A test CA + leaf for the DoH provider hostnames only. The stock nodes trust
   # this CA so dnscrypt-proxy accepts the fake upstream. (Other impersonated

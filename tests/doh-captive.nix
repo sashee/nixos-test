@@ -1,5 +1,12 @@
 { nixpkgs, pkgs, commonDesktopModule, stateVersion }:
 
+let
+  # Expected answers are read from lib/captive-portals.txt rather than written out here.
+  # These assertions used to hardcode the addresses, so when detectportal.firefox.com
+  # moved CDN in July 2026 they went on asserting the dead address -- pinning the bug
+  # instead of catching it.
+  portalMap = import ../lib/captive-portals.nix { lib = pkgs.lib; };
+in
 nixpkgs.lib.nixos.runTest {
   name = "doh-captive";
   hostPkgs = pkgs;
@@ -45,15 +52,15 @@ nixpkgs.lib.nixos.runTest {
         raise Exception(f"{name} {qtype} did not resolve to {expected} via {server}")
 
     # Mapped names resolve to their static IPs despite there being no upstream.
-    wait_mapped("captive.apple.com", "A", "17.253.109.201")
-    wait_mapped("detectportal.firefox.com", "A", "34.107.221.82")
-    wait_mapped("dns.msftncsi.com", "AAAA", "fd3e:4f5a:5b81::1")
-    wait_mapped("ipv4only.arpa", "A", "192.0.0.170")
+    wait_mapped("captive.apple.com", "A", "${portalMap.ipv4Of "captive.apple.com"}")
+    wait_mapped("detectportal.firefox.com", "A", "${portalMap.ipv4Of "detectportal.firefox.com"}")
+    wait_mapped("dns.msftncsi.com", "AAAA", "${portalMap.ipv6Of "dns.msftncsi.com"}")
+    wait_mapped("ipv4only.arpa", "A", "${portalMap.ipv4Of "ipv4only.arpa"}")
 
     # The dnscrypt listener answers over the IPv6 loopback too, and AAAA records
     # from the map resolve there: query ::1 directly.
-    wait_mapped("detectportal.firefox.com", "AAAA", "2600:1901:0:38d7::", server="::1")
-    wait_mapped("ipv6.msftconnecttest.com", "AAAA", "2a01:111:2003::52", server="::1")
+    wait_mapped("detectportal.firefox.com", "AAAA", "${portalMap.ipv6Of "detectportal.firefox.com"}", server="::1")
+    wait_mapped("ipv6.msftconnecttest.com", "AAAA", "${portalMap.ipv6Of "ipv6.msftconnecttest.com"}", server="::1")
 
     # A name that is not in the map gets no successful answer, because no upstream
     # is reachable. This proves the map is the only thing answering: dnscrypt

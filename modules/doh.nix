@@ -1,7 +1,7 @@
 { lib, ... }:
 
 let
-  dohStamps = import ../lib/doh-stamps.nix;
+  doh = import ../lib/doh-stamps.nix { inherit lib; };
 in
 
 {
@@ -13,7 +13,7 @@ in
         "127.0.0.1:53"
         "[::1]:53"
       ];
-      server_names = builtins.attrNames dohStamps;
+      server_names = builtins.attrNames doh.stamps;
       ipv4_servers = true;
       ipv6_servers = true;
       dnscrypt_servers = false;
@@ -22,7 +22,10 @@ in
       require_nolog = false;
       require_nofilter = true;
       cache = true;
-      static = dohStamps;
+      # Stamps are generated from the readable components in lib/doh-stamps.nix; the
+      # props bits they carry are load-bearing here, since require_nofilter below
+      # filters the pool on them.
+      static = doh.stamps;
       # Answer OS/browser connectivity-check names from a static map so captive
       # portals can be detected and their login pages reached even while the DoH
       # upstreams are blocked. Passed as a Nix path so toJSON copies it to the
@@ -43,6 +46,16 @@ in
     # too — captive.apple.com is IPv4-only and would fail there. Its /success.txt
     # returns the body "success\n"; NM does a prefix match, so "success" matches.
     # A redirect/different body flips NM to the "portal" state.
+    #
+    # This probe must stay on plaintext HTTP: portal detection works precisely because a
+    # portal can hijack cleartext. Over HTTPS the interception fails at TLS and NM reports
+    # LIMITED/NONE instead of PORTAL, so the login page is never offered -- which is why
+    # this cannot reuse the DoH-upstream probe that connectivity-fallback now uses.
+    #
+    # Kept on detectportal rather than moved to gstatic after the 2026-07-27 rot incident:
+    # gstatic's answers are geo-load-balanced and rotated across three different addresses
+    # within an hour when checked, so pinning it in lib/captive-portals.txt would create a
+    # fresh instance of that same bug, while Fastly returns a stable dual-stack set.
     networkmanager.settings.connectivity = {
       uri = "http://detectportal.firefox.com/success.txt";
       response = "success";

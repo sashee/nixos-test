@@ -2,6 +2,18 @@
 # login pages are reachable when DoH upstreams are blocked. Served at all times,
 # so IPs must be the real current endpoints. Base list from dnscrypt-proxy's
 # example-captive-portals.txt (v2.1.15); detectportal.firefox.com added locally.
+#
+# "Served at all times" is a trap worth spelling out: because these answers never
+# consult real DNS, a stale entry is invisible from any host running this config --
+# every machine echoes the pinned address back instead of the truth. Verify from a
+# resolver that is NOT using this map, e.g.
+#   curl -s -H 'accept: application/dns-json' \
+#     'https://dns.google/resolve?name=detectportal.firefox.com&type=A'
+# and confirm the address actually serves the expected body before committing.
+# On 2026-07-27 the stale detectportal pin below rebooted the rpi5 every 15m23s for
+# ~16 hours: connectivity-fallback probed it, got an empty reply, and concluded the
+# device was offline. See modules/connectivity-fallback.nix -- that check no longer
+# depends on this file.
 
 captive.apple.com               17.253.109.201, 17.253.113.202
 connectivitycheck.gstatic.com   64.233.162.94, 64.233.164.94, 64.233.165.94, 64.233.177.94, 64.233.185.94, 74.125.132.94, 74.125.136.94, 74.125.20.94, 74.125.21.94, 74.125.28.94
@@ -11,4 +23,11 @@ dns.msftncsi.com                131.107.255.255, fd3e:4f5a:5b81::1
 www.msftconnecttest.com         13.107.4.52
 ipv6.msftconnecttest.com        2a01:111:2003::52
 ipv4only.arpa                   192.0.0.170, 192.0.0.171
-detectportal.firefox.com        34.107.221.82, 2600:1901:0:38d7::
+# Fastly (CNAME mozilla.map.fastly.net) as of 2026-07-27. This host has changed CDN at
+# least twice -- Akamai, then Google Cloud (34.107.221.82, which now accepts TCP and
+# serves nothing), now Fastly -- and Mozilla declined to publish a stable anycast IP when
+# asked (Bugzilla 1363651). Re-verify with:
+#   curl -H 'Host: detectportal.firefox.com' http://<ip>/success.txt   # -> "success"
+# All four IPv4 addresses were verified that way. The AAAA set comes from authoritative
+# DNS but is unverified: neither the rpi5 nor the dev box has global IPv6.
+detectportal.firefox.com        151.101.1.91, 151.101.65.91, 151.101.129.91, 151.101.193.91, 2a04:4e42::347, 2a04:4e42:200::347, 2a04:4e42:400::347, 2a04:4e42:600::347

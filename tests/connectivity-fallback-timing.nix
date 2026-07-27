@@ -37,9 +37,26 @@ nixpkgs.lib.nixos.runTest {
     common.connectivityFallback = {
       enable = true;
       # eth1 exists in the VM, so the AP-side services come up cleanly; the radio
-      # is mocked as in the main test. bootGrace/setupTimeout/connectivityCheck
-      # stay at PRODUCTION defaults -- that is the point of this test (the default
-      # check URL is unreachable in the sandbox, so the machine is offline).
+      # is mocked as in the main test. bootGrace/setupTimeout stay at PRODUCTION
+      # defaults -- that is the point of this test.
+      #
+      # The probe endpoints are deliberately NOT left at their defaults: the sandbox
+      # has no internet either way, but the default list is 8 endpoints and each
+      # burns connectivityCheck.timeoutSeconds before the next is tried, so the
+      # check would finish ~40 virtual seconds after the timer fired and blow the
+      # timing assertions below (which bound the check's exit at 330s and expect
+      # setup already active at 320s). One unreachable endpoint with a short
+      # timeout keeps this test measuring the timers, which is what it is for.
+      # TEST-NET-1 (RFC 5737) is guaranteed unroutable.
+      connectivityCheck = {
+        endpoints = [
+          {
+            hostname = "timing-probe.invalid";
+            addr = "192.0.2.1";
+          }
+        ];
+        timeoutSeconds = 2;
+      };
       interface = "eth1";
       tools.iwd = fakeIwctl;
       tools.iw = fakeIw;
