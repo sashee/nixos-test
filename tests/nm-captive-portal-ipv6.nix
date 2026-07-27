@@ -1,6 +1,12 @@
 { nixpkgs, pkgs, commonDesktopModule, stateVersion }:
 
 let
+  # The IPv6 address the dnscrypt map answers detectportal.firefox.com with, read from
+  # lib/captive-portals.txt so the impersonating node and the assertions cannot drift
+  # from it (see the IPv4 variant for why hardcoding it was a liability).
+  portalMap = import ../lib/captive-portals.nix { lib = pkgs.lib; };
+  portalIp6 = portalMap.ipv6Of "detectportal.firefox.com";
+
   # Fake detectportal.firefox.com endpoint, IPv6 only. Switches behaviour on
   # /tmp/portal-mode so a single long-running server plays both the "open network"
   # and the "captive portal" roles without a restart. Binds an AF_INET6 socket so
@@ -105,7 +111,7 @@ nixpkgs.lib.nixos.runTest {
     # Stand up the fake portal: it owns the client's IPv6 gateway address and the
     # impersonated detectportal.firefox.com IPv6 address, and serves HTTP on both.
     portal.succeed("${pkgs.iproute2}/bin/ip -6 addr add fd00::1/64 dev eth1 nodad || true")
-    portal.succeed("${pkgs.iproute2}/bin/ip -6 addr add 2600:1901:0:38d7::/128 dev eth1 nodad || true")
+    portal.succeed("${pkgs.iproute2}/bin/ip -6 addr add ${portalIp6}/128 dev eth1 nodad || true")
     portal.succeed("echo open > /tmp/portal-mode")
     portal.succeed("systemd-run --unit portal-http ${pkgs.python3}/bin/python3 ${portalServer}")
     portal.wait_for_unit("portal-http.service")
@@ -118,7 +124,7 @@ nixpkgs.lib.nixos.runTest {
     # Sanity gates: the dnscrypt map resolves the AAAA over IPv6 and the peer is
     # reachable over IPv6. These isolate any later failure to NM's connectivity
     # logic rather than DNS or routing.
-    client.wait_until_succeeds("${pkgs.dig}/bin/dig @::1 detectportal.firefox.com AAAA +short 2>/dev/null | grep -q '2600:1901:0:38d7::'")
+    client.wait_until_succeeds("${pkgs.dig}/bin/dig @::1 detectportal.firefox.com AAAA +short 2>/dev/null | grep -q '${portalIp6}'")
     client.wait_until_succeeds("${pkgs.curl}/bin/curl -6 -s http://detectportal.firefox.com/success.txt | grep -q success")
 
     # Open network: the success body matches the configured response -> full.

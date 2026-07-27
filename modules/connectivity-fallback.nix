@@ -3,6 +3,15 @@
 let
   cfg = config.common.connectivityFallback;
 
+  # The host's own DoH upstreams, as components (see lib/doh-stamps.nix). Same source of
+  # truth dnscrypt-proxy's stamps are generated from, so the probe cannot drift from the
+  # resolvers actually in use. mapAttrsToList orders by attribute name, which puts each
+  # provider's IPv4 entry before its IPv6 one -- worth keeping, because the rpi5 has no
+  # global IPv6 and a v6 attempt is a wasted timeout there.
+  dohEndpoints = lib.mapAttrsToList (_: e: { inherit (e) hostname addr; }) (
+    (import ../lib/doh-stamps.nix { inherit lib; }).endpoints
+  );
+
   # Whether this host runs the nftables-backed NixOS firewall whose nixos-fw
   # table the setup script must open the AP service ports in.
   firewallManaged = config.networking.firewall.enable && config.networking.nftables.enable;
@@ -167,15 +176,55 @@ let
     '';
   };
 
+  # One "host|port|addr|path" record per probe target, fed to the loop below on stdin.
+  # Generated rather than looped in Nix so the script stays readable in the journal.
+  endpointRecords = lib.concatMapStrings (
+    e: "${e.hostname}|${toString e.port}|${e.addr}|${e.path}\n"
+  ) cfg.connectivityCheck.endpoints;
+
   checkScript = pkgs.writeShellApplication {
     name = "connectivity-fallback-check";
     runtimeInputs = [ cfg.tools.curl cfg.tools.iproute2 cfg.tools.systemd cfg.tools.coreutils ];
     text = ''
       # Probe general internet reachability; do NOT bind to the wifi interface.
-      if curl -s -m 5 -o /dev/null ${lib.escapeShellArg cfg.connectivityCheck.url}; then
-        echo "connectivity-fallback: online, nothing to do"
-        exit 0
-      fi
+      #
+      # The targets are this host's own DoH resolvers (see connectivityCheck.endpoints).
+      # Three properties matter, and a plain HTTP canary has none of them:
+      #
+      #  * --resolve pins the address from the stamp, so the probe needs no DNS at all:
+      #    it cannot be answered from lib/captive-portals.txt, and it still works when
+      #    dnscrypt-proxy itself is wedged.
+      #  * TLS certificate validation *is* the captive-portal test. A portal cannot
+      #    present a valid cert for these hostnames, so interception fails closed and
+      #    reads as offline -- which is correct, since a portal means not-online.
+      #  * There are four independent operators, so one provider's outage cannot make
+      #    this host tear down its own network.
+      #
+      # Requiring HTTP 200 (not merely "something answered") means a real DNS answer came
+      # back, so this proves the whole path the box depends on: TCP 443, TLS, and a
+      # working upstream resolver.
+      query=${lib.escapeShellArg cfg.connectivityCheck.dnsQuery}
+      timeout=${toString cfg.connectivityCheck.timeoutSeconds}
+      code=""
+
+      probe() {
+        code="$(curl -s -m "$timeout" -o /dev/null -w '%{http_code}' \
+          --resolve "$1:$2:$3" \
+          -H 'accept: application/dns-message' \
+          "https://$1:$2$4?dns=$query" || true)"
+        [ "$code" = "200" ]
+      }
+
+      while IFS='|' read -r host port addr path; do
+        [ -n "$host" ] || continue
+        if probe "$host" "$port" "$addr" "$path"; then
+          echo "connectivity-fallback: online (via $host at $addr), nothing to do"
+          exit 0
+        fi
+        echo "connectivity-fallback: probe failed for $host at $addr (HTTP $code)"
+      done <<'CONNECTIVITY_FALLBACK_ENDPOINTS'
+      ${endpointRecords}CONNECTIVITY_FALLBACK_ENDPOINTS
+
       echo "connectivity-fallback: no connectivity; entering setup mode"
       systemctl start --no-block connectivity-fallback-setup.service
     '';
@@ -236,10 +285,73 @@ in
       title = lib.mkOption { type = lib.types.str; default = "Wi-Fi setup"; description = "Portal page title."; };
     };
 
-    connectivityCheck.url = lib.mkOption {
-      type = lib.types.str;
-      default = "http://detectportal.firefox.com/success.txt";
-      description = "URL curled to decide whether the device is online.";
+    connectivityCheck = {
+      endpoints = lib.mkOption {
+        type = lib.types.listOf (
+          lib.types.submodule {
+            options = {
+              hostname = lib.mkOption {
+                type = lib.types.str;
+                description = "Hostname used for TLS validation and the Host header.";
+              };
+              addr = lib.mkOption {
+                type = lib.types.str;
+                description = ''
+                  Literal address to dial, passed to `curl --resolve`, so no DNS lookup
+                  happens. IPv6 must be bracketed, e.g. "[2606:4700:4700::1111]".
+                '';
+              };
+              port = lib.mkOption {
+                type = lib.types.port;
+                default = 443;
+                description = "Port to dial. Must match the URL's port for --resolve to apply.";
+              };
+              path = lib.mkOption {
+                type = lib.types.str;
+                default = "/dns-query";
+                description = "Request path; the DoH query is appended as ?dns=...";
+              };
+            };
+          }
+        );
+        default = dohEndpoints;
+        defaultText = lib.literalExpression "the host's DoH upstreams from lib/doh-stamps.nix";
+        description = ''
+          Endpoints probed to decide whether the device is online. The device is online as
+          soon as any one of them answers HTTP 200; setup mode is entered only when every
+          one fails.
+
+          These default to the host's own DoH resolvers rather than a third-party HTTP
+          canary. On 2026-07-27 the previous default
+          (`http://detectportal.firefox.com/success.txt`) rebooted the rpi5 every 15m23s
+          for ~16 hours: Mozilla migrated that host to Fastly, the pinned address in
+          lib/captive-portals.txt went stale, and because that map answers at all times the
+          box could never learn otherwise -- so a single rotted third-party pin was able to
+          make a healthy machine tear down its own network. A DoH upstream cannot rot
+          unnoticed, because if it does this host has no DNS at all.
+        '';
+      };
+
+      dnsQuery = lib.mkOption {
+        type = lib.types.str;
+        # RFC 8484 GET parameter: base64url, unpadded. Decodes to a standard query for
+        # www.example.com IN A with ID 0 and RD set:
+        #   0000 0100 0001 0000 0000 0000  (header: ID, flags, QDCOUNT=1, no RRs)
+        #   03 "www" 07 "example" 03 "com" 00   (QNAME)
+        #   0001 0001                      (QTYPE=A, QCLASS=IN)
+        # ID 0 is deliberate: it keeps the request cacheable by intermediaries.
+        default = "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB";
+        description = "base64url-encoded DNS query sent to each endpoint.";
+      };
+
+      timeoutSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 5;
+        description = ''
+          Per-endpoint curl timeout. Worst case the check takes this times the number of
+          endpoints, so keep the product well under setupTimeout.
+        '';
+      };
     };
 
     tools = {
@@ -263,6 +375,11 @@ in
         message = "common.connectivityFallback manages the radio via iwd; disable NetworkManager."; }
       { assertion = builtins.stringLength cfg.ap.ssid >= 8;
         message = "common.connectivityFallback.ap.ssid must be >= 8 chars (reused as WPA2 passphrase)."; }
+      # An empty list makes every check conclude "offline", which means an AP and a reboot
+      # every bootGrace+setupTimeout, forever -- the exact failure this module caused on
+      # 2026-07-27. Fail the build instead.
+      { assertion = cfg.connectivityCheck.endpoints != [ ];
+        message = "common.connectivityFallback.connectivityCheck.endpoints must not be empty: with no endpoints the check always reports offline and the host reboots in a loop."; }
     ];
 
     environment.systemPackages = [ cfg.tools.iw ];

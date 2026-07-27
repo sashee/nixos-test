@@ -62,7 +62,7 @@
           "nix-utils-${name}-driver-interactive" = test.driverInteractive;
         })
         nixUtilsTests;
-      dohStamps = import ./lib/doh-stamps.nix;
+      dohStamps = import ./lib/doh-stamps.nix { lib = nixpkgs.lib; };
       resticLib = import ./lib/restic.nix { lib = nixpkgs.lib; };
       mkRpi5 = { modules ? [ ] }: nixos-raspberrypi.lib.nixosSystem {
         trustCaches = false;
@@ -438,6 +438,12 @@
           imports = [ ./modules/connectivity-fallback.nix ./modules/firewall.nix ];
         };
       };
+      # Probe decision logic (rotted endpoint among healthy ones, TLS interception),
+      # isolated from the radio stack. Regression test for the 2026-07-27 reboot loop.
+      connectivityFallbackProbeTest = import ./tests/connectivity-fallback-probe.nix {
+        inherit nixpkgs pkgs stateVersion;
+        moduleUnderTest = ./modules/connectivity-fallback.nix;
+      };
       # icount concept test: production timer constants under TCG time-warp.
       connectivityFallbackTimingTest = import ./tests/connectivity-fallback-timing.nix {
         inherit nixpkgs pkgs stateVersion;
@@ -470,6 +476,9 @@
         pkgs.runCommand "anya-feher-laptop-eval" { } ''
           echo ${nixpkgs.lib.escapeShellArg (builtins.unsafeDiscardStringContext toplevel.drvPath)} > $out
         '';
+      dohStampEncodeTest = import ./tests/doh-stamp-encode.nix {
+        inherit pkgs dohStamps;
+      };
       anyaFeherLaptopTest = import ./tests/anya-feher-laptop.nix {
         inherit nixpkgs pkgs stateVersion;
         machineModule = anyaFeherLaptopSystemModule;
@@ -661,6 +670,7 @@
         plasma-firefox = plasmaFirefoxTest;
         restic = resticTest;
         connectivity-fallback = connectivityFallbackTest;
+        connectivity-fallback-probe = connectivityFallbackProbeTest;
         connectivity-fallback-timing = connectivityFallbackTimingTest;
         zram = zramTest;
       } // (nixpkgs.lib.mapAttrs'
@@ -691,7 +701,11 @@
         qemu-graphical = qemuGraphical;
       };
 
-      checks.${system} = testResults // anyaFeherLaptopChecks;
+      checks.${system} = testResults // anyaFeherLaptopChecks // {
+        # Eval-only runCommand (throws on drift), not a VM test: no kvm feature to drop,
+        # and arch-independent since stamps are pure data, so x86_64 only.
+        doh-stamp-encode = dohStampEncodeTest;
+      };
       checks.aarch64-linux = aarch64TestResults;
       # The exact patched kernel every rpi check boots (rpiTestKernel pins the
       # node to this package, so the outPath matches the checks). CI exports its

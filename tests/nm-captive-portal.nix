@@ -1,6 +1,13 @@
 { nixpkgs, pkgs, commonDesktopModule, stateVersion }:
 
 let
+  # The address the dnscrypt map answers detectportal.firefox.com with, read from
+  # lib/captive-portals.txt so the impersonating node and the assertions cannot drift
+  # from it. Hardcoding it meant that when the real host moved CDN in July 2026 this
+  # test kept asserting the dead address instead of catching the change.
+  portalMap = import ../lib/captive-portals.nix { lib = pkgs.lib; };
+  portalIp = portalMap.ipv4Of "detectportal.firefox.com";
+
   # Fake detectportal.firefox.com endpoint. Switches behaviour on /tmp/portal-mode
   # so a single long-running server can play both the "open network" and the
   # "captive portal" roles without a restart.
@@ -97,7 +104,7 @@ nixpkgs.lib.nixos.runTest {
     # Stand up the fake portal: it owns the client's gateway address and the
     # impersonated detectportal.firefox.com address, and serves HTTP on both.
     portal.succeed("${pkgs.iproute2}/bin/ip addr add 192.168.1.1/24 dev eth1 || true")
-    portal.succeed("${pkgs.iproute2}/bin/ip addr add 34.107.221.82/32 dev eth1 || true")
+    portal.succeed("${pkgs.iproute2}/bin/ip addr add ${portalIp}/32 dev eth1 || true")
     portal.succeed("echo open > /tmp/portal-mode")
     portal.succeed("systemd-run --unit portal-http ${pkgs.python3}/bin/python3 ${portalServer}")
     portal.wait_for_unit("portal-http.service")
@@ -109,7 +116,7 @@ nixpkgs.lib.nixos.runTest {
     # Sanity gates: the dnscrypt map resolves the name and the peer is reachable.
     # These isolate any later failure to NM's connectivity logic rather than DNS
     # or routing.
-    client.wait_until_succeeds("${pkgs.dig}/bin/dig @127.0.0.1 detectportal.firefox.com +short 2>/dev/null | grep -q 34.107.221.82")
+    client.wait_until_succeeds("${pkgs.dig}/bin/dig @127.0.0.1 detectportal.firefox.com +short 2>/dev/null | grep -q ${portalIp}")
     client.wait_until_succeeds("${pkgs.curl}/bin/curl -s http://detectportal.firefox.com/success.txt | grep -q success")
 
     # Open network: the success body matches the configured response -> full.

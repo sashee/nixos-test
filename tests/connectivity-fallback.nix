@@ -61,6 +61,51 @@ let
     rsn_pairwise=CCMP
   '';
 
+  # The check probes DoH upstreams over HTTPS with a pinned address (see
+  # connectivityCheck.endpoints), so the stand-in for "the internet" has to be a TLS
+  # server with a certificate the machine trusts. It lives only in the home netns, so
+  # the machine is offline by construction until it joins HomeNet -- same property the
+  # old plain-HTTP health URL had, plus real certificate validation on the path.
+  mkCert = import ./test-cert.nix { inherit pkgs; };
+  probeHost = "home-doh.probe.test";
+  probeCerts = mkCert {
+    name = "connectivity-fallback-probe";
+    sans = [ probeHost ];
+  };
+
+  probeServer = pkgs.writeText "home-doh.py" ''
+    import http.server, ssl, sys
+
+    cert, key = sys.argv[1], sys.argv[2]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            return
+
+        def do_GET(self):
+            body = b"\x00\x00"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/dns-message")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = http.server.ThreadingHTTPServer(("192.168.77.1", 443), Handler)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    srv.serve_forever()
+  '';
+
+  # What both the check and the boot-time readiness gate use to reach it.
+  probeCurl =
+    "curl -s -m 3 -o /dev/null -w '%{http_code}'"
+    + " --resolve ${probeHost}:443:192.168.77.1"
+    + " -H 'accept: application/dns-message'"
+    + " 'https://${probeHost}/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB'";
+
   # udhcpc action script for the phone (runs inside the netns): configure the
   # interface from the lease and record the offered options for assertions.
   udhcpcScript = pkgs.writeShellScript "phone-udhcpc-script" ''
@@ -117,7 +162,8 @@ nixpkgs.lib.nixos.runTest {
           --dhcp-leasefile=/tmp/home-dnsmasq.leases \
           --dhcp-range=192.168.77.10,192.168.77.50,255.255.255.0,1h
         ${pkgs.systemd}/bin/systemd-run --unit=home-health ip netns exec home \
-          ${pkgs.python3}/bin/python3 -m http.server 80 --bind 192.168.77.1
+          ${pkgs.python3}/bin/python3 ${probeServer} \
+          ${probeCerts.certFile} ${probeCerts.keyFile}
       '';
     };
     # Boot #2 determinism: "home router up" is not "machine online" -- iwd still
@@ -136,7 +182,7 @@ nixpkgs.lib.nixos.runTest {
       serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
       script = ''
         for _ in $(seq 1 120); do
-          if curl -s -m 2 -o /dev/null http://192.168.77.1/health; then exit 0; fi
+          if [ "$(${probeCurl})" = "200" ]; then exit 0; fi
           sleep 1
         done
         exit 0
@@ -155,11 +201,22 @@ nixpkgs.lib.nixos.runTest {
     # would add a second, racing DHCP client.
     networking.wireless.iwd.enable = true;
 
+    # Trust the CA behind the stand-in DoH endpoint. Only this CA is added, so the
+    # machine's verdict still depends on real certificate validation.
+    security.pki.certificateFiles = [ probeCerts.caFile ];
+
     common.connectivityFallback = {
       enable = true;
       # Only served from the "home network" netns -- offline by construction
-      # until the machine joins HomeNet.
-      connectivityCheck.url = "http://192.168.77.1/health";
+      # until the machine joins HomeNet. Single endpoint on purpose: this test is
+      # about the AP/portal/reboot flow, and multi-endpoint probe semantics are
+      # covered by connectivity-fallback-probe.nix.
+      connectivityCheck.endpoints = [
+        {
+          hostname = probeHost;
+          addr = "192.168.77.1";
+        }
+      ];
       # Shortened (see header); safe on slow boots because nothing driver-side
       # races the timer (see the slow-boot proofing note above). setupTimeout
       # must outlast boot #1's whole phone choreography (scan/associate/DHCP/
@@ -350,9 +407,11 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed("systemctl stop fakeportal fakedns")
 
     with subtest("boot #2: natural timer fires online -> no setup mode"):
+        # Matches the endpoint the check names in its verdict, so this also proves the
+        # probe went to the intended target rather than passing for some other reason.
         machine.wait_until_succeeds(
             "journalctl -u connectivity-fallback-check.service "
-            "| grep -q 'online, nothing to do'",
+            "| grep -q 'online (via ${probeHost} at 192.168.77.1), nothing to do'",
             timeout=180,
         )
         machine.succeed(
