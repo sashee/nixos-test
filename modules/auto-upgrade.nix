@@ -81,6 +81,23 @@ in
       flags = [
         "--print-build-logs"
         "--commit-lock-file"
+        # Bound build concurrency for the unattended upgrade only; an interactive
+        # nixos-rebuild still uses every core. On the 4 GB Pi this is the only lever that
+        # limits build memory: `cgroup_disable=memory` is on the rpi kernel cmdline, so
+        # there is no memory cgroup and MemoryHigh=/MemoryMax= are inert, and swap is
+        # zram (compressed RAM, not extra capacity). A 2026-07-20 upgrade was OOM-killed
+        # with two 1.1 GiB rustc plus the evaluator's retained ~2 GiB heap.
+        #   --cores 1     -> NIX_BUILD_CORES=1, which nixpkgs' cargo build hook passes as
+        #                    `-j`, so Rust crates compile one at a time.
+        #   --max-jobs 1  -> one derivation at a time, so the kernel and the locally built
+        #                    Rust packages cannot pile up together.
+        # Substitutions are unaffected (max-substitution-jobs/http-connections are
+        # separate), so download-only nights are as fast as before; a from-source kernel
+        # bump goes from ~4h to ~11h, which is acceptable for an unattended nightly.
+        "--cores"
+        "1"
+        "--max-jobs"
+        "1"
       ];
       operation = "boot";
       randomizedDelaySec = "2h";

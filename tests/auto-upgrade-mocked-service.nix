@@ -95,6 +95,10 @@ nixpkgs.lib.nixos.runTest {
       case "$second" in *"--print-build-logs"*) ;; *) exit 1 ;; esac
       case "$second" in *"--commit-lock-file"*) ;; *) exit 1 ;; esac
       case "$second" in *"--upgrade"*) ;; *) exit 1 ;; esac
+      # Concurrency caps: the unattended upgrade must stay bounded on low-RAM hosts (see
+      # the flags comment in modules/auto-upgrade.nix). Pinned so they cannot silently drop.
+      case "$second" in *"--cores 1"*) ;; *) exit 1 ;; esac
+      case "$second" in *"--max-jobs 1"*) ;; *) exit 1 ;; esac
     """)
   '';
 }
