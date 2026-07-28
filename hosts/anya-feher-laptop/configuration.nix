@@ -7,6 +7,14 @@
 # without reboot). No restic backups yet; monitoring skips that check.
 { lib, ... }:
 
+let
+  # One source of truth for both consumers of the layout list below:
+  # services.xserver.xkb.* (00-keyboard.conf / localed / SDDM greeter) and
+  # /etc/xdg/kxkbrc (kwin_wayland, via the KDE config cascade).
+  xkbLayout = "hu,us";
+  xkbVariant = ",colemak";
+in
+
 {
   imports = [ ../../modules/common-desktop.nix ];
 
@@ -16,16 +24,30 @@
 
   time.timeZone = "Europe/Budapest";
 
-  # System and keyboard language is Hungarian. xkb covers the SDDM greeter and
-  # X/localed defaults; kwin_wayland (the Plasma session) takes its default from
-  # the KDE config cascade, so ship /etc/xdg/kxkbrc as the system-wide default.
+  # System language and the primary keyboard layout are Hungarian; us(colemak) is
+  # a second xkb group so anya can toggle. The switch is deliberately Plasma's own
+  # (the system-tray keyboard indicator, which appears by itself once a second
+  # layout exists, plus the "Switch to Next Keyboard Layout" global shortcut)
+  # rather than an xkb grp:*_toggle option, so it stays rebindable from System
+  # Settings and cannot fire by accident while typing.
+  #
+  # xkb covers the SDDM greeter and X/localed defaults; kwin_wayland (the Plasma
+  # session) takes its default from the KDE config cascade, so ship
+  # /etc/xdg/kxkbrc as the system-wide default. console.keyMap stays
+  # single-valued Hungarian: the vconsole and the initrd LUKS passphrase prompt
+  # have one keymap and no switcher.
   common.locale.default = "hu_HU.UTF-8";
-  services.xserver.xkb.layout = "hu";
+  services.xserver.xkb.layout = xkbLayout;
+  services.xserver.xkb.variant = xkbVariant;
   console.keyMap = "hu";
+  # DisplayNames: us(colemak) would otherwise show as an indistinguishable "us".
   environment.etc."xdg/kxkbrc".text = ''
     [Layout]
-    LayoutList=hu
     Use=true
+    LayoutList=${xkbLayout}
+    VariantList=${xkbVariant}
+    DisplayNames=,col
+    ShowLayoutIndicator=true
   '';
 
   # Generic UEFI boot; the disk layout itself is in hardware-configuration.nix.
