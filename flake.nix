@@ -330,6 +330,16 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiConnectivitySystemModule;
       };
+      # The DNS-outage reboot failsafe on the REAL rpi config -- the valuable variant: the
+      # deployed dnscrypt, the DoH egress rules that make a loopback-only probe the only
+      # workable one, and the default-deny firewall are all live.
+      connectivityWatchdogTestRpi = import ./tests/connectivity-watchdog.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiConnectivitySystemModule;
+        inherit dohStamps;
+      };
       # Production timer constants under icount time-warp, on the real rpi config. Composes
       # rpiTestKernelPkg + hosts/rpi5 rather than rpiSystemModule so this node owns the sole
       # -rtc flag (it needs clock=vm; see rpiTestKernelPkg). irohSsh's failsafe is the one
@@ -349,6 +359,11 @@
           common.autoUpgrade.enable = lib.mkForce false;
           common.monitoring.enable = lib.mkForce false;
           common.irohSsh.failsafe.enable = lib.mkForce false;
+          # Its 1h timer cannot fire inside this test's ~950 virtual seconds, so this is
+          # belt-and-braces rather than a fix -- but the whole test rests on the guest
+          # being idle between the two boundaries it measures, so a unit that wakes it up
+          # is exactly the thing to keep off this node (see the header note).
+          common.connectivityWatchdog.enable = lib.mkForce false;
         };
       };
       firewallTestRpi = import ./tests/firewall.nix {
@@ -392,6 +407,7 @@
         monitoring = monitoringTestRpi;
         connectivity-fallback = connectivityFallbackTestRpi;
         connectivity-fallback-trigger = connectivityFallbackTriggerTestRpi;
+        connectivity-watchdog = connectivityWatchdogTestRpi;
         connectivity-fallback-timing = connectivityFallbackTimingTestRpi;
         monitoring-nix-gc = monitoringNixGcTestRpi;
         monitoring-iroh-ssh = monitoringIrohSshTestRpi;
@@ -502,6 +518,21 @@
         inherit nixpkgs pkgs stateVersion;
         machineModule = connectivityFallbackNode;
         rtcOption = "-rtc clock=vm,base=$(${pkgs.coreutils}/bin/date -u -d tomorrow +%Y-%m-%dT10:00:00)";
+      };
+      # The DNS-outage reboot failsafe on x86: the real desktop host config (which already
+      # imports modules/doh.nix, so dnscrypt-proxy and its cache are the deployed ones)
+      # with the watchdog module added and switched on. The feature ships only on the rpi,
+      # so this variant exists for fast local feedback; the aarch64 variant against
+      # hosts/rpi5 is the one that covers the deployed target.
+      connectivityWatchdogTest = import ./tests/connectivity-watchdog.nix {
+        inherit nixpkgs pkgs stateVersion dohStamps;
+        machineModule = { ... }: {
+          imports = [ commonDesktopModule ./modules/connectivity-watchdog.nix ];
+          common.autoUpgrade.enable = false;
+          common.monitoring.enable = false;
+          common.irohSsh.enable = false;
+          common.connectivityWatchdog.enable = true;
+        };
       };
       # The real anya-feher-laptop host config as a test node (mirrors
       # rpiSystemModule; plain x86, so no kernel neutralization is needed).
@@ -728,6 +759,7 @@
         restic = resticTest;
         connectivity-fallback = connectivityFallbackTest;
         connectivity-fallback-trigger = connectivityFallbackTriggerTest;
+        connectivity-watchdog = connectivityWatchdogTest;
         connectivity-fallback-timing = connectivityFallbackTimingTest;
         zram = zramTest;
       } // (nixpkgs.lib.mapAttrs'
