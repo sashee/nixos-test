@@ -12,6 +12,7 @@
 * system and keyboard language is Hungarian
 * LUKS with boot password to unlock the encrypted main drive
 * bluetooth disabled
+* keyboard layout: Hungarian default, easy switch to Colemak
 
 ## Wifi
 

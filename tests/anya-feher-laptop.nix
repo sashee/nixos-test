@@ -29,9 +29,35 @@ nixpkgs.lib.nixos.runTest {
     machine.wait_until_succeeds("pgrep -u anya plasmashell")
     machine.wait_until_succeeds("pgrep -u anya kwin_wayland")
 
-    # Hungarian keyboard: console keymap, X/greeter layout, Plasma session default
+    # Hungarian primary layout with Colemak as a switchable second group. The
+    # console/LUKS keymap stays Hungarian-only: the vconsole has no switcher.
     machine.succeed("grep -iq 'KEYMAP=hu' /etc/vconsole.conf")
-    machine.succeed("grep -q 'LayoutList=hu' /etc/xdg/kxkbrc")
+    machine.succeed("grep -q 'XkbLayout\" \"hu,us\"' /etc/X11/xorg.conf.d/00-keyboard.conf")
+    machine.succeed("grep -q 'XkbVariant\" \",colemak\"' /etc/X11/xorg.conf.d/00-keyboard.conf")
+    machine.succeed("grep -q '^LayoutList=hu,us$' /etc/xdg/kxkbrc")
+    machine.succeed("grep -q '^VariantList=,colemak$' /etc/xdg/kxkbrc")
+
+    # ... and the Plasma session actually picked both up: ask kwin over anya's
+    # session bus. pgrep'ing kwin_wayland above does not yet mean it has claimed
+    # org.kde.KWin, hence the wait on the first call.
+    uid = machine.succeed("id -u anya").strip()
+
+    def kwin_layouts(method):
+        return (
+            f"su - anya -c 'XDG_RUNTIME_DIR=/run/user/{uid} "
+            f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus "
+            f"${pkgs.dbus}/bin/dbus-send --print-reply --dest=org.kde.KWin "
+            f"/Layouts org.kde.KeyboardLayouts.{method}'"
+        )
+
+    machine.wait_until_succeeds(kwin_layouts("getLayoutsList"))
+    listing = machine.succeed(kwin_layouts("getLayoutsList"))
+    assert "hu" in listing and "colemak" in listing.lower(), listing
+
+    # Hungarian is the default group, and switching lands on Colemak
+    assert machine.succeed(kwin_layouts("getLayout")).strip().split()[-1] == "0"
+    machine.succeed(kwin_layouts("switchToNextLayout"))
+    assert machine.succeed(kwin_layouts("getLayout")).strip().split()[-1] == "1"
 
     # Hungarian system language
     machine.succeed("grep -q 'LANG=hu_HU.UTF-8' /etc/locale.conf")
