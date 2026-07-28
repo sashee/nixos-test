@@ -204,7 +204,7 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed("test -r /run/connectivity-watchdog/last-success")
         # No reboot was ever contemplated.
         assert count("rebooting") == 0, watchdog_journal()
-        machine.succeed("test ! -e /var/lib/connectivity-watchdog/last-reboot")
+        assert count("rebooting") == 0, watchdog_journal()
 
     with subtest("every probe asks a fresh name, so nothing can come from cache"):
         names = probe_names()
@@ -222,7 +222,52 @@ nixpkgs.lib.nixos.runTest {
         dohpeer.succeed(f"rm -f {SERVFAIL_FLAG}")
         base_ok = count(OK)
         wait_for_more(OK, base_ok, timeout=180)
-        machine.succeed("test ! -e /var/lib/connectivity-watchdog/last-reboot")
+        assert count("rebooting") == 0, watchdog_journal()
+
+    with subtest("a dead resolver, not just a dead upstream, is a failure"):
+        # The upstream stays healthy here; dnscrypt-proxy itself goes away, so 127.0.0.1:53
+        # refuses the connection and dig exits 9 with no response to parse. That is the ONLY
+        # path exercising the `|| true` on the dig pipeline -- without it pipefail+errexit
+        # would kill the script here, the unit would merely go `failed`, and the reboot
+        # would never come. "Wedged dnscrypt" is one of the failures this module exists for,
+        # and stopping the upstream alone never produces it (dnscrypt stays up to SERVFAIL).
+        base = count("probe failed (status=no-response)")
+        machine.succeed("systemctl stop dnscrypt-proxy.service")
+        wait_for_more("probe failed (status=no-response)", base, timeout=${toString (8 * interval)})
+        assert count("rebooting") == 0, watchdog_journal()
+        base_ok = count(OK)
+        machine.succeed("systemctl start dnscrypt-proxy.service")
+        wait_for_more(OK, base_ok, timeout=180)
+
+    with subtest("a forward clock step is not an outage"):
+        # The age is monotonic (uptime), never the wall clock. If it were an epoch diff, the
+        # step below would instantly read as an hour without DNS -- past the 600s threshold
+        # -- and the next firing would reboot a box whose only problem was that NTP fixed
+        # its clock. A Pi 5 with no RTC battery does exactly that on every boot.
+        #
+        # +1h, not +1d: it dwarfs the threshold while staying inside the same guest day as
+        # the testRtcBase 10:00 clock, so no nix-gc slot (03:15/15:15) or auto-upgrade
+        # window is crossed and no test certificate leaves its validity period.
+        machine.succeed("date -s '+1 hour'")
+        base = count("probe failed")
+        dohpeer.succeed("systemctl stop fake-doh.service")
+        wait_for_more("probe failed", base, timeout=${toString (8 * interval)})
+        assert count("rebooting") == 0, watchdog_journal()
+        # Every reported age must still be uptime-scale, i.e. nowhere near the stepped hour.
+        since = max(
+            int(line.split("s of ")[0].split()[-1])
+            for line in watchdog_journal().splitlines() if f"s of {AFTER}s without DNS" in line
+        )
+        assert since < 3600, f"since={since} looks like a wall-clock diff, not uptime"
+        # Restore well before AFTER seconds of failure accumulate, so this subtest does not
+        # bleed into the reboot the next ones are about.
+        dohpeer.succeed("systemctl start fake-doh.service")
+        dohpeer.succeed(
+            "${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c "
+            "'until test -e /tmp/fake-doh-ready; do sleep 0.2; done'"
+        )
+        base_ok = count(OK)
+        wait_for_more(OK, base_ok, timeout=180)
 
     with subtest("upstream gone: failures accumulate but stay below the threshold"):
         base = count("probe failed")
@@ -245,9 +290,16 @@ nixpkgs.lib.nixos.runTest {
         # state that would reboot again immediately if the age were kept across boots.
         machine.start()
         machine.wait_for_unit("multi-user.target")
-        # The previous boot really did reboot for this reason, and said so durably.
-        machine.succeed("test -s /var/lib/connectivity-watchdog/last-reboot")
-        recorded = int(machine.succeed("cat /var/lib/connectivity-watchdog/last-reboot").strip())
+        # The previous boot rebooted itself, and for this reason. Read from the PREVIOUS
+        # boot's journal rather than a breadcrumb file: journald is persistent by default,
+        # so this ties the reboot to the watchdog's own recorded decision -- and the module
+        # deliberately writes no file, because a failed write under errexit would cancel the
+        # very reboot it was documenting.
+        prev = machine.succeed(
+            "journalctl -b -1 -u connectivity-watchdog.service -o cat || true"
+        )
+        assert "; rebooting" in prev, prev
+        recorded = int(prev.split("no DNS for ")[1].split("s;")[0])
         assert recorded >= AFTER, recorded
 
         wait_for_more(BELOW, 0, timeout=${toString (8 * interval)})

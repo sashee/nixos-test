@@ -8,11 +8,6 @@ let
   runtimeDir = "connectivity-watchdog";
   marker = "/run/${runtimeDir}/last-success";
 
-  # Purely for post-mortem: a reboot loop is otherwise invisible if journald is volatile.
-  # NEVER read by the decision -- reintroducing cross-boot state would undo the
-  # loop-breaker described below.
-  rebootLog = "/var/lib/${runtimeDir}/last-reboot";
-
   # Hardcoded, not options, because neither will ever change and each would be a footgun:
   #
   #  * The resolver must be the host's own. modules/doh.nix rejects port 53 to anything but
@@ -113,8 +108,14 @@ let
         exit 0
       fi
 
+      # Nothing but the log line and the reboot. There is deliberately no breadcrumb file:
+      # journald is persistent by default (services.journald.storage), so this verdict is
+      # already readable after the reboot via `journalctl -b -1 -u connectivity-watchdog`.
+      # A file would also be actively harmful here -- written under errexit immediately
+      # before the reboot, a failed redirect on a full or read-only /var would abort the
+      # script and cancel the reboot, disabling the failsafe in precisely the degraded
+      # conditions it exists for (this box has a documented SD disk-full history).
       echo "connectivity-watchdog: no DNS for ''${since}s; rebooting"
-      printf '%s\n' "$since" > "${rebootLog}"
       systemctl reboot
     '';
   };
@@ -150,8 +151,9 @@ in
         How often to probe (OnBootSec and OnUnitActiveSec on the timer).
 
         Bounds how late the reboot can be: the host reboots within afterSeconds + interval
-        of DNS breaking. Probing far more often than that buys nothing, since the decision
-        is about a whole day.
+        + AccuracySec (1m) of DNS breaking. Probing far more often than that buys nothing,
+        since the decision is about a whole day -- and the loose AccuracySec is deliberate,
+        letting systemd coalesce this with other timers instead of waking the box alone.
       '';
     };
 
@@ -164,14 +166,30 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # Without a local resolver every probe fails, so the host reboots every afterSeconds
+    # forever while its network is perfectly fine -- the same shape as the 2026-07-27
+    # bootloop, and just as invisible from the box itself. dnscrypt-proxy specifically,
+    # not merely "something on 127.0.0.1": the probe's whole rationale rests on what it is
+    # (a forwarding proxy with a question-keyed cache and no DNSSEC validation, spreading
+    # queries over four independent operators). A validating resolver with RFC 8198
+    # aggressive NSEC would answer random labels from cache and quietly defeat the probe --
+    # see the comment on `name` above. This assertion is what stops one being substituted.
+    assertions = [
+      {
+        assertion = config.services.dnscrypt-proxy.enable;
+        message = "common.connectivityWatchdog probes 127.0.0.1 for DNS and expects dnscrypt-proxy to answer it (modules/doh.nix). Without it every probe fails and the host reboots every common.connectivityWatchdog.afterSeconds forever, on a healthy network.";
+      }
+    ];
+
     systemd.services.connectivity-watchdog = {
       description = "Reboot if DNS resolution has been failing for too long";
       serviceConfig = {
         Type = "oneshot";
         ExecStart = lib.getExe probe;
         RuntimeDirectory = runtimeDir;
+        # Preserved across invocations on purpose: this oneshot's whole state is the marker
+        # in there, and the default (remove when the unit stops) would wipe it every run.
         RuntimeDirectoryPreserve = true;
-        StateDirectory = runtimeDir;
         # dig's own budget is +time=5 x +tries=2 per address family; leave room for both
         # plus process spawn, but stay well under `interval` so runs cannot pile up.
         TimeoutStartSec = "60s";
