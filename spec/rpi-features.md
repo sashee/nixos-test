@@ -12,7 +12,7 @@
 
 ### Setup helper
 
-* if there is no internet after 5 minutes of boot then it enters setup mode
+* if there is no wifi connection after 5 minutes of boot then it enters setup mode
 * in setup mode:
     * automatically reboots after 10 minutes
     * starts a Wifi network where the password is the same as the ssid

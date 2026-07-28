@@ -1,7 +1,8 @@
 { nixpkgs, pkgs, stateVersion, machineModule }:
 
 # The whole setup-helper story on a REAL radio stack (mac80211_hwsim), nothing
-# mocked but the internet itself. The machine runs the real iwd; the module's
+# mocked at all: the check reads association state straight from the kernel, and
+# hwsim gives us a real one. The machine runs the real iwd; the module's
 # generated .ap profile must actually start a WPA2 AP. A "phone" lives in a
 # network namespace holding the second hwsim radio AND one end of a veth pair:
 #   * over the veth ("the LAN") it plays a wired neighbor for the station-mode
@@ -16,14 +17,14 @@
 # power-cycle the VM); /var/lib/iwd sits on a persistent disk so credentials
 # survive like on an SD card. Across three boots this covers: provisioning,
 # psk persistence + iwd auto-joining the submitted network (check passes, setup
-# never re-enters), the natural OnBootSec timer in both the online no-op and
-# the offline self-heal directions, and the real safety-net reboot.
+# never re-enters), the natural OnBootSec timer in both the associated no-op and
+# the unassociated self-heal directions, and the real safety-net reboot.
 #
 # Slow-boot proofing (a KVM-less CI runner boots this under TCG, where
 # multi-user can take longer than bootGrace): the check timer is never disarmed
 # and the driver never races it. Everything the check's outcome depends on is
 # guest-side and ordered ahead of the timer (the boot-time home-router unit, the
-# test-wait-online gate for the provisioned boot, and the module's own
+# test-wait-associated gate for the provisioned boot, and the module's own
 # After=iwd/nftables), so the timer may fire before the driver gets a single
 # command in and every phase still holds.
 #
@@ -61,54 +62,6 @@ let
     rsn_pairwise=CCMP
   '';
 
-  # The check probes DoH upstreams over HTTPS with a pinned address (see
-  # connectivityCheck.endpoints), so the stand-in for "the internet" has to be a TLS
-  # server with a certificate the machine trusts. It lives only in the home netns, so
-  # the machine is offline by construction until it joins HomeNet -- same property the
-  # old plain-HTTP health URL had, plus real certificate validation on the path.
-  mkCert = import ./test-cert.nix { inherit pkgs; };
-  probeHost = "home-doh.probe.test";
-  probeCerts = mkCert {
-    name = "connectivity-fallback-probe";
-    sans = [ probeHost ];
-  };
-
-  probeServer = pkgs.writeText "home-doh.py" ''
-    import http.server, ssl, sys
-
-    cert, key = sys.argv[1], sys.argv[2]
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, *a):
-            return
-
-        def do_GET(self):
-            body = b"\x00\x00"
-            self.send_response(200)
-            self.send_header("Content-Type", "application/dns-message")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    srv = http.server.ThreadingHTTPServer(("192.168.77.1", 443), Handler)
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(cert, key)
-    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
-    srv.serve_forever()
-  '';
-
-  # What both the check and the boot-time readiness gate use to reach it. The query comes
-  # from lib/doh-stamps.nix -- the same value the module's connectivityCheck.dnsQuery
-  # default is built from -- so the gate cannot start probing something the check does not.
-  dnsQuery = (import ../lib/doh-stamps.nix { lib = pkgs.lib; }).dnsQuery;
-  probeCurl =
-    "curl -s -m 3 -o /dev/null -w '%{http_code}'"
-    + " --resolve ${probeHost}:443:192.168.77.1"
-    + " -H 'accept: application/dns-message'"
-    + " 'https://${probeHost}/dns-query?dns=${dnsQuery}'";
-
   # udhcpc action script for the phone (runs inside the netns): configure the
   # interface from the lease and record the offered options for assertions.
   udhcpcScript = pkgs.writeShellScript "phone-udhcpc-script" ''
@@ -142,9 +95,9 @@ nixpkgs.lib.nixos.runTest {
     # test driver): on a slow (TCG) boot the check timer can fire before the
     # driver gets a single command in, so anything the check's outcome depends on
     # must be ready guest-side, ordered ahead of the timer. Boot #1: beacons but
-    # the machine has no credentials yet -> offline. Boot #2: the machine joins
-    # with the portal-written psk -> online. Boot #3: the driver plants the
-    # marker on the persistent disk during boot #2 -> no home wifi -> offline.
+    # the machine has no credentials yet -> unassociated. Boot #2: the machine
+    # joins with the portal-written psk -> associated. Boot #3: the driver plants
+    # the marker on the persistent disk during boot #2 -> no home wifi at all.
     systemd.services.home-router = {
       wantedBy = [ "multi-user.target" ];
       unitConfig.ConditionPathExists = "!/var/lib/iwd/test-no-home-router";
@@ -164,39 +117,36 @@ nixpkgs.lib.nixos.runTest {
           --interface=wlan2 --bind-interfaces \
           --dhcp-leasefile=/tmp/home-dnsmasq.leases \
           --dhcp-range=192.168.77.10,192.168.77.50,255.255.255.0,1h
-        ${pkgs.systemd}/bin/systemd-run --unit=home-health ip netns exec home \
-          ${pkgs.python3}/bin/python3 ${probeServer} \
-          ${probeCerts.certFile} ${probeCerts.keyFile}
       '';
     };
-    # Boot #2 determinism: "home router up" is not "machine online" -- iwd still
-    # has to scan/associate/DHCP after boot. When this boot is expected to come
-    # up provisioned (psk present, no boot-#3 marker), hold the check timer until
-    # the health URL is actually reachable; bounded so a genuine regression fails
-    # the online assertion instead of hanging the boot. Skipped on boot #1 (no
-    # psk) and boot #3 (marker), where being offline is the point.
-    systemd.services.test-wait-online = {
+    # Boot #2 determinism: "home router up" is not "machine associated" -- iwd
+    # still has to scan and join after boot. When this boot is expected to come up
+    # provisioned (psk present, no boot-#3 marker), hold the check timer until
+    # wlan0 really is on HomeNet; bounded so a genuine regression fails the
+    # association assertion instead of hanging the boot. Skipped on boot #1 (no
+    # psk) and boot #3 (marker), where being unassociated is the point.
+    systemd.services.test-wait-associated = {
       wantedBy = [ "multi-user.target" ];
       unitConfig = {
         ConditionPathExists = [ "/var/lib/iwd/HomeNet.psk" "!/var/lib/iwd/test-no-home-router" ];
         RequiresMountsFor = [ "/var/lib/iwd" ];
       };
-      path = [ pkgs.curl pkgs.coreutils ];
+      path = [ pkgs.iw pkgs.gnugrep pkgs.coreutils ];
       serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
       script = ''
         for _ in $(seq 1 120); do
-          if [ "$(${probeCurl})" = "200" ]; then exit 0; fi
+          if iw dev wlan0 link | grep -q 'SSID: HomeNet'; then exit 0; fi
           sleep 1
         done
         exit 0
       '';
     };
     # The check must never race guest-side state: hold the timer until the home
-    # router is up and (on provisioned boots) the machine is actually online. An
-    # already-elapsed OnBootSec then fires immediately when the timer starts.
+    # router is up and (on provisioned boots) the machine has actually joined it.
+    # An already-elapsed OnBootSec then fires immediately when the timer starts.
     systemd.timers.connectivity-fallback-check.after = [
       "home-router.service"
-      "test-wait-online.service"
+      "test-wait-associated.service"
     ];
 
     # DHCP on wlan0 after joining is dhcpcd's job (networking.useDHCP default),
@@ -204,22 +154,8 @@ nixpkgs.lib.nixos.runTest {
     # would add a second, racing DHCP client.
     networking.wireless.iwd.enable = true;
 
-    # Trust the CA behind the stand-in DoH endpoint. Only this CA is added, so the
-    # machine's verdict still depends on real certificate validation.
-    security.pki.certificateFiles = [ probeCerts.caFile ];
-
     common.connectivityFallback = {
       enable = true;
-      # Only served from the "home network" netns -- offline by construction
-      # until the machine joins HomeNet. Single endpoint on purpose: this test is
-      # about the AP/portal/reboot flow, and multi-endpoint probe semantics are
-      # covered by connectivity-fallback-probe.nix.
-      connectivityCheck.endpoints = [
-        {
-          hostname = probeHost;
-          addr = "192.168.77.1";
-        }
-      ];
       # Shortened (see header); safe on slow boots because nothing driver-side
       # races the timer (see the slow-boot proofing note above). setupTimeout
       # must outlast boot #1's whole phone choreography (scan/associate/DHCP/
@@ -366,7 +302,6 @@ nixpkgs.lib.nixos.runTest {
     with subtest("boot #2: the boot-time home router is up"):
         machine.wait_for_unit("home-router.service")
         machine.wait_for_unit("home-ap.service")
-        machine.wait_for_unit("home-health.service")
         machine.wait_until_succeeds("test -e /sys/class/net/wlan1")
         make_phone_ns()
 
@@ -381,8 +316,8 @@ nixpkgs.lib.nixos.runTest {
     with subtest("boot #2, station mode: AP ports are firewalled even with listeners bound"):
         # Runs on boot #2 because station mode no longer exists on boot #1 (the
         # natural timer takes it to setup mode), and the port-80 listener would
-        # collide with the portal there. The online check firing mid-subtest is
-        # harmless -- it starts nothing.
+        # collide with the portal there. The check firing mid-subtest is harmless
+        # -- wlan0 is associated, so it starts nothing.
         machine.succeed(
             "systemd-run --unit=fakeportal ${pkgs.python3}/bin/python3 "
             "-m http.server 80"
@@ -409,12 +344,12 @@ nixpkgs.lib.nixos.runTest {
         machine.fail("ip netns exec phone host -T -t A -W 2 foo.example 192.168.99.1")
         machine.succeed("systemctl stop fakeportal fakedns")
 
-    with subtest("boot #2: natural timer fires online -> no setup mode"):
-        # Matches the endpoint the check names in its verdict, so this also proves the
-        # probe went to the intended target rather than passing for some other reason.
+    with subtest("boot #2: natural timer fires associated -> no setup mode"):
+        # Names the interface and the BSSID line the check read, so this proves the
+        # verdict came from wlan0's real association rather than from some other path.
         machine.wait_until_succeeds(
             "journalctl -u connectivity-fallback-check.service "
-            "| grep -q 'online (via ${probeHost} at 192.168.77.1), nothing to do'",
+            "| grep -q 'wlan0 associated (Connected to .*), nothing to do'",
             timeout=180,
         )
         machine.succeed(
@@ -424,7 +359,10 @@ nixpkgs.lib.nixos.runTest {
     with subtest("boot #2: home wifi dies -> setup re-opens the firewall; safety net reboots"):
         # Plant the marker (persistent disk) so boot #3 has no home wifi either.
         machine.succeed("touch /var/lib/iwd/test-no-home-router")
-        machine.succeed("systemctl stop home-ap home-dhcp home-health")
+        # Killing hostapd takes the association itself away, which is exactly the
+        # signal the check now reads -- no stand-in service in between.
+        machine.succeed("systemctl stop home-ap home-dhcp")
+        machine.wait_until_succeeds("! iw dev wlan0 link | grep -q 'SSID: HomeNet'")
         machine.succeed("systemctl start connectivity-fallback-check.service")
         machine.wait_for_unit("connectivity-fallback-setup.service")
         rules = machine.succeed("nft list chain inet nixos-fw input-allow")

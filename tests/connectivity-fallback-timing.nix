@@ -32,8 +32,18 @@ let
     echo "iwctl $*" >> /tmp/iwctl.log
     exit 0
   '';
+  # `link` must answer "Not connected." explicitly rather than staying silent. The check
+  # treats a NON-ZERO exit from iw as "the radio is unusable, do not enter setup mode"
+  # (see modules/connectivity-fallback.nix), so a fake that failed -- or that a future
+  # `set -o pipefail`-ish change made fail -- would swallow the trigger, and the
+  # safety-net-reboot assertion below would never fire while the test still looked like
+  # it was exercising the production constants. Other subcommands (`iw reg set`, from the
+  # setup script) just get logged.
   fakeIw = pkgs.writeShellScriptBin "iw" ''
     echo "iw $*" >> /tmp/iw.log
+    if [ "''${3-}" = "link" ]; then
+      echo "Not connected."
+    fi
     exit 0
   '';
 in
@@ -51,20 +61,15 @@ nixpkgs.lib.nixos.runTest {
     common.connectivityFallback = {
       enable = true;
       # eth1 exists in the VM, so the AP-side services come up cleanly; the radio
-      # is mocked as in the main test. bootGrace/setupTimeout/connectivityCheck all
-      # stay at PRODUCTION defaults -- that is the point of this test (none of the
-      # 8 default DoH upstreams is reachable in the sandbox, so the machine is
-      # offline). The probe loop is deliberately NOT shortened: a guest blocked on
-      # `curl -m 5` is idle, so icount warps over it for almost no wall time, and
-      # running the real endpoint list is what makes this test cover the check
-      # completing inside its TimeoutStartSec -- past that the check would be
-      # SIGTERMed before it ever reaches `systemctl start ... setup.service`, and an
-      # offline box would silently never enter setup mode.
-      #
-      # Observed loop duration swings between 20s and 42s depending on whether the
-      # build sandbox has an IPv6 route: without one the four v6 endpoints fail
-      # instantly, with one they each burn the full timeoutSeconds. The bound below
-      # accommodates both.
+      # is mocked as in the main test. bootGrace/setupTimeout/association all stay at
+      # PRODUCTION defaults -- that is the point of this test. The sampling loop is
+      # deliberately NOT shortened: a guest blocked on `sleep 10` is idle, so icount
+      # warps over it for almost no wall time, and running the real sample count is
+      # what makes this test cover the check completing inside its TimeoutStartSec --
+      # past that the check would be SIGTERMed before it ever reaches
+      # `systemctl start ... setup.service`, and a host with no wifi would silently
+      # never enter setup mode. TimeoutStartSec is derived from the same two options,
+      # so this is the test that the derivation leaves usable headroom.
       interface = "eth1";
       tools.iwd = fakeIwctl;
       tools.iw = fakeIw;
@@ -93,15 +98,15 @@ nixpkgs.lib.nixos.runTest {
     t0 = time.monotonic()
 
     with subtest("production OnBootSec=5min fires at its real deadline"):
-        # Guest-side blocking sleep past the +300s boundary AND past the probe loop:
+        # Guest-side blocking sleep past the +300s boundary AND past the sampling loop:
         # while the guest sleeps, the warp delivers the check timer at exactly 300s.
         # The status queries ride in the same command -- no idle gap to warp through.
         #
-        # Probe instant = 300 (OnBootSec) + 40 (8 production endpoints x 5s
-        # connectivityCheck.timeoutSeconds, none reachable here) + ~3 (the setup
-        # script's own two sleeps) + margin = 380. Every provider added to
-        # lib/doh-stamps.nix costs 5s of that margin. The next boundary is the
-        # safety-net reboot at ~945s, so there is ample room above.
+        # Probe instant = 300 (OnBootSec) + 50 (the production sampling window:
+        # (association.samples - 1) x association.intervalSeconds) + ~3 (the setup
+        # script's own two sleeps) + margin = 380. Raising either association option
+        # eats that margin. The next boundary is the safety-net reboot at ~955s, so
+        # there is ample room above.
         #
         # That target only bites on boots that reach multi-user before ~380s. Above it the
         # awk clamps to `sleep 1` and the driver simply reads state after boot, which is
@@ -126,23 +131,24 @@ nixpkgs.lib.nixos.runTest {
         check_exit = int(check_exit_us) / 1e6
         machine.log(
             f"check ran {check_start:.1f}s..{check_exit:.1f}s monotonic "
-            f"({check_exit - check_start:.1f}s in the probe loop); "
+            f"({check_exit - check_start:.1f}s in the sampling loop); "
             f"setup.service is {state}"
         )
         assert state == "active", out
         # Two independent properties, asserted separately so a failure says which one
         # broke: the monotonic timer fired at its real 300s deadline, and the production
-        # probe loop stays well inside the check service's TimeoutStartSec (120s).
+        # sampling loop takes the time the options say it should while staying inside the
+        # check service's derived TimeoutStartSec (window + 30s).
         #
-        # 60s = 1.5x the 40s ceiling the option defaults imply (8 endpoints x
-        # timeoutSeconds), and half of TimeoutStartSec. Measured loops across runs: 20.0s
-        # (no IPv6 route in the sandbox, the four v6 endpoints fail instantly), 38.9s and
-        # 42.4s (v6 route present, every endpoint burning its full timeout plus ~2s of
-        # process-spawn overhead under TCG). A tighter bound would be measuring runner
-        # speed rather than the property.
+        # Bounded on BOTH sides. The upper bound is the TimeoutStartSec headroom. The
+        # lower bound is the one that carries weight: the whole point of sampling is that
+        # a momentary flap cannot trigger setup mode, and a check that returned in 2s
+        # would have skipped the waiting entirely while every other assertion here still
+        # passed. Expected 50s ((6 - 1) x 10s); the slack absorbs process-spawn overhead
+        # under TCG and systemd's 1s AccuracySec.
         assert 295 <= check_start <= 305, f"check started at monotonic {check_start}s"
-        probe_loop = check_exit - check_start
-        assert probe_loop <= 60, f"probe loop took {probe_loop}s"
+        sampling_loop = check_exit - check_start
+        assert 45 <= sampling_loop <= 70, f"sampling loop took {sampling_loop}s"
 
     with subtest("production setupTimeout=10min really reboots; warp makes it cheap"):
         # ~600 further virtual seconds with zero driver interaction.
@@ -150,7 +156,7 @@ nixpkgs.lib.nixos.runTest {
         wall = time.monotonic() - t0
         # The safety-net reboot is scheduled (systemd-run --on-active=10min) when the
         # setup script reaches its last line, ~3s after the check exits -- so derive
-        # the span rather than hardcoding it, since it moves with the probe loop.
+        # the span rather than hardcoding it, since it moves with the sampling loop.
         virtual = (check_exit + 3 + 600) - boot_uptime
         machine.log(
             f"boot reached multi-user at guest uptime {boot_uptime:.0f}s; "
@@ -173,10 +179,10 @@ nixpkgs.lib.nixos.runTest {
         #
         # Expressed as a ratio, not an absolute wall-clock bound. This used to be
         # `wall < 300`, which was already sitting at 96% of the observed value (288s) and
-        # went to 99% once the production probe loop lengthened the virtual span -- i.e.
+        # went to 99% once the production check loop lengthened the virtual span -- i.e.
         # it was one slow runner away from flaking while measuring nothing the ratio does
-        # not measure better. The ratio also scales on its own as providers are added to
-        # lib/doh-stamps.nix. Observed here: 0.48.
+        # not measure better. The ratio also scales on its own if the sampling window
+        # grows. Observed here: 0.48.
         ratio = wall / virtual
         assert ratio < 0.75, (
             f"warp too slow: {wall:.0f}s wall for {virtual:.0f}s virtual (ratio {ratio:.2f})"

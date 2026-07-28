@@ -3,10 +3,10 @@
 # Components are the source of truth and the `sdns://` stamps are derived from them
 # (lib/doh-stamp-encode.nix). It used to be the other way round -- eight opaque base64
 # blobs -- which meant nobody could tell which resolvers were configured without running
-# a decoder, and any consumer needing the address or hostname had to decode them.
-# modules/connectivity-fallback.nix needs exactly that to probe these upstreams, so the
-# data now lives in the form both consumers want, while dnscrypt-proxy still gets the
-# stamps it demands (its [static] section accepts nothing else).
+# a decoder, and any consumer needing the address or hostname had to decode them
+# (tests/doh-interceptor.nix needs exactly that). So the data now lives in the form its
+# readers want, while dnscrypt-proxy still gets the stamps it demands (its [static]
+# section accepts nothing else).
 #
 # Every stamp this repo has used is identical apart from the address and hostname
 # (proto 0x02, props 4, no certificate hash, path /dns-query), so nothing is lost.
@@ -17,8 +17,8 @@
 # alongside the generated ones. A provider that does not fit the uniform shape -- one
 # publishing a certificate hash, or needing different props or a different path -- has to
 # be taught to lib/doh-stamp-encode.nix, because a pasted stamp would reach dnscrypt-proxy
-# via `stamps` while being absent from `endpoints`: not golden-tested, not probed by
-# connectivity-fallback, and not impersonated by tests/doh-interceptor.nix. Both eval
+# via `stamps` while being absent from `endpoints`: not golden-tested and not impersonated
+# by tests/doh-interceptor.nix. Both eval
 # guards (tests/doh-stamp-encode.nix and tests/doh-endpoints.nix) pin the full key set of
 # `stamps`, so they reject such an entry anyway.
 { lib }:
@@ -26,8 +26,8 @@
 let
   enc = import ./doh-stamp-encode.nix { inherit lib; };
 
-  # IPv6 literals are bracketed everywhere they are used as a dial target: inside the
-  # stamp, and in `curl --resolve host:443:[addr]`.
+  # IPv6 literals are bracketed everywhere they are used as a dial target, starting with
+  # the stamp itself. tests/doh-endpoints.nix pins that.
   bracket = addr: "[${addr}]";
 
   # One provider -> two entries, "<name>-ipv4" and "<name>-ipv6". The resulting attribute
@@ -78,27 +78,15 @@ rec {
     };
   };
 
-  # RFC 8484 GET parameter: base64url, unpadded. Decodes to a standard query for
-  # www.example.com IN A with ID 0 and RD set:
-  #   0000 0100 0001 0000 0000 0000  (header: ID, flags, QDCOUNT=1, no RRs)
-  #   03 "www" 07 "example" 03 "com" 00   (QNAME)
-  #   0001 0001                      (QTYPE=A, QCLASS=IN)
-  # ID 0 is deliberate: it keeps the request cacheable by intermediaries.
-  #
-  # Lives here rather than in modules/connectivity-fallback.nix because the VM tests build
-  # their own probe curl commands and have to send the identical query; duplicating the
-  # literal in each is how the two silently drift.
-  dnsQuery = "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB";
-
   # { "cloudflare-ipv4" = { hostname; addr; family; }; ... }
-  # Consumed by modules/connectivity-fallback.nix (probe targets) and
-  # tests/doh-interceptor.nix (the addresses a test must impersonate).
+  # Consumed by tests/doh-interceptor.nix (the addresses a test must impersonate) and,
+  # via `stamps` below, by modules/doh.nix.
   endpoints = lib.foldl' (acc: name: acc // entriesFor name providers.${name}) { } (
     builtins.attrNames providers
   );
 
   # What dnscrypt-proxy's [static] section wants: { "<name>" = { stamp = "sdns://..."; }; }
   # Generated from `endpoints` alone, so the two key sets are identical by construction --
-  # which is what tests/doh-endpoints.nix asserts and connectivity-fallback relies on.
+  # which is what tests/doh-endpoints.nix asserts and tests/doh-interceptor.nix relies on.
   stamps = lib.mapAttrs (_: e: { stamp = enc.mkDohStamp { inherit (e) addr hostname; }; }) endpoints;
 }
