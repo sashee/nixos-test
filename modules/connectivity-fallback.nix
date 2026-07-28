@@ -344,6 +344,14 @@ in
 
     systemd.services.connectivity-fallback-check = {
       description = "Check WiFi association; enter WiFi setup mode if not associated";
+      # Ordered after iwd like the setup service below, for a narrower reason: OnBootSec
+      # is monotonic from KERNEL boot, so it does not wait for userspace. On a boot slow
+      # enough that iwd has not started by bootGrace, the check would otherwise sample a
+      # radio nobody is managing, read "not associated" every time, and raise the AP on a
+      # host that would have joined a network seconds later. `After=` only (no Wants=), so
+      # this cannot pull iwd into a transaction that does not already have it -- which is
+      # what keeps the timing test working, where iwd is deliberately left unwanted.
+      after = [ "iwd.service" ];
       serviceConfig = {
         Type = "oneshot";
         ExecStart = lib.getExe checkScript;
