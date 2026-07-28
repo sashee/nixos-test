@@ -38,6 +38,11 @@ let
       # Indeterminate beats wrong: if the probe cannot run at all, decide nothing. Rebooting
       # every ${toString cfg.afterSeconds}s would fix no missing binary. Same rule as the
       # `iw` fail-safe in connectivity-fallback.nix.
+      #
+      # Narrower than it looks: writeShellApplication pins tools.dig on PATH, so this cannot
+      # fire on a system that merely lacks dnsutils. What it catches is tools.dig overridden
+      # with a package that ships no `dig` -- without it errexit would kill the script at the
+      # probe below and the unit would just go `failed`, which is silent in the same way.
       if ! command -v dig >/dev/null; then
         echo "connectivity-watchdog: dig unavailable; NOT deciding"
         exit 0
@@ -97,11 +102,21 @@ let
       # rather than merely guarded against, because a freshly booted box cannot have
       # accumulated enough age to qualify. An absent marker means no success since boot,
       # so the current uptime is itself the correct age.
+      #
+      # Content-checked, not merely `-r`. An empty or truncated marker would expand to
+      # `$(( now -  ))`, and under errexit that syntax error KILLS the script before the
+      # reboot below -- disabling the failsafe exactly as a `failed` unit would, and for the
+      # same reason the dig pipeline needs its `|| true`. Falling back to the uptime is the
+      # safe direction: an unusable marker carries no evidence of a success, which is what
+      # the absent-marker branch already assumes.
+      last=""
       if [ -r "${marker}" ]; then
-        since=$(( now - $(cat "${marker}") ))
-      else
-        since="$now"
+        last="$(cat "${marker}")"
       fi
+      case "$last" in
+        "" | *[!0-9]*) since="$now" ;;
+        *) since=$(( now - last )) ;;
+      esac
 
       if [ "$since" -lt ${toString cfg.afterSeconds} ]; then
         echo "connectivity-watchdog: ''${since}s of ${toString cfg.afterSeconds}s without DNS; nothing to do"
@@ -151,9 +166,28 @@ in
         How often to probe (OnBootSec and OnUnitActiveSec on the timer).
 
         Bounds how late the reboot can be: the host reboots within afterSeconds + interval
-        + AccuracySec (1m) of DNS breaking. Probing far more often than that buys nothing,
-        since the decision is about a whole day -- and the loose AccuracySec is deliberate,
-        letting systemd coalesce this with other timers instead of waking the box alone.
+        + accuracySec of DNS breaking. Probing far more often than that buys nothing, since
+        the decision is about a whole day.
+      '';
+    };
+
+    accuracySec = lib.mkOption {
+      type = lib.types.str;
+      default = "1m";
+      description = ''
+        AccuracySec on the timer. Loose by default on purpose: it lets systemd coalesce this
+        probe with other timers instead of waking the box alone for it, and 1m of jitter is
+        noise against a threshold of a day.
+
+        Must not exceed `interval`. systemd places the expiry anywhere in
+        [elapse, elapse + accuracySec], at a host-stable position synchronized across local
+        timer units -- effectively a grid of this size. An interval that is not a multiple of
+        it therefore does not mean what it says: every nominal elapse lands between grid
+        points and is pushed to the next one, so the real cadence is accuracySec. At the
+        production 1h/1m the interval is an exact multiple and firings land on grid points
+        with no drift; it is the shortened intervals in tests/connectivity-watchdog.nix that
+        need this turned down, and before it existed that test's 20s interval was silently a
+        60s one.
       '';
     };
 
@@ -201,7 +235,7 @@ in
       timerConfig = {
         OnBootSec = cfg.interval;
         OnUnitActiveSec = cfg.interval;
-        AccuracySec = "1m";
+        AccuracySec = cfg.accuracySec;
         # No Persistent: catching up on missed runs after downtime is meaningless when the
         # whole question is "how long has this boot been without DNS".
         Unit = "connectivity-watchdog.service";
