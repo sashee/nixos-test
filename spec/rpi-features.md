@@ -43,6 +43,11 @@
 * [./features/monitoring.md]
 * runs every 30 minutes
 
+## Auto-reboot
+
+* every hour it tries to resolve a DNS address
+* if it hasn't succeeded in 24 hours then reboot
+
 ## Backups
 
 * [./features/backups.md]

@@ -20,6 +20,7 @@ in
     ../../modules/auto-upgrade.nix
     ../../modules/monitoring.nix
     ../../modules/connectivity-fallback.nix
+    ../../modules/connectivity-watchdog.nix
     ../../modules/iroh-ssh.nix
     ../../modules/required-kernel-modules.nix
     # Same default-deny inbound firewall as the laptops (nftables backend,
@@ -102,6 +103,12 @@ in
 
   networking.wireless.iwd.enable = true;
   common.connectivityFallback.enable = true;
+  # The other half of the connectivity story: connectivityFallback only reacts to "not
+  # associated to any wifi", because its remedy is new credentials. This one covers
+  # associated-but-the-stack-is-wedged (brcmfmac firmware halt, wedged dnscrypt, an IPv4LL
+  # lease) by rebooting after a day with no DNS at all -- on a headless box with no LAN
+  # access that is otherwise a trip to the device.
+  common.connectivityWatchdog.enable = true;
   # SSH over iroh (see modules/iroh-ssh.nix): sshd is reached through the tunnel's
   # outbound connection, so no inbound port is needed. Secret provisioned out-of-band:
   #   iroh-ssh-generate-secret | systemd-creds encrypt --name=iroh-secret - /etc/credentials/iroh-ssh/iroh-secret
