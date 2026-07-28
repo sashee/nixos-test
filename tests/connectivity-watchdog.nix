@@ -37,7 +37,14 @@ let
   # box would reboot again immediately, turning the loop-breaker subtest into a loop.
   # Measured TCG boots in this repo run 250-390s, hence 600.
   afterSeconds = 600;
+  # Every `n * interval` timeout below is derived from this, so it has to be the REAL cadence.
+  # That is what accuracySec is for: systemd places a timer's expiry anywhere in
+  # [elapse, elapse + AccuracySec], on a grid of that size, so the production 1m would floor
+  # the cadence here at 60s and every bound below would be 3x looser than it reads (a later
+  # "this test is slow, halve the interval" would then tighten the timeouts while changing
+  # nothing about the firing rate). 1s makes the shortening real.
   interval = 20;
+  accuracySec = "1s";
 
   interceptor = import ./doh-interceptor.nix {
     inherit pkgs dohStamps;
@@ -99,7 +106,7 @@ nixpkgs.lib.nixos.runTest {
 
     common.connectivityWatchdog = {
       enable = true;
-      inherit afterSeconds;
+      inherit afterSeconds accuracySec;
       interval = "${toString interval}s";
     };
 
@@ -203,7 +210,6 @@ nixpkgs.lib.nixos.runTest {
         wait_for_more(OK, 2, timeout=${toString (12 * interval)})
         machine.succeed("test -r /run/connectivity-watchdog/last-success")
         # No reboot was ever contemplated.
-        assert count("rebooting") == 0, watchdog_journal()
         assert count("rebooting") == 0, watchdog_journal()
 
     with subtest("every probe asks a fresh name, so nothing can come from cache"):

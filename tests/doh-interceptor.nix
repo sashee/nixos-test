@@ -10,7 +10,7 @@
 # `dohStamps` is lib/doh-stamps.nix evaluated -- i.e. `{ providers, endpoints, stamps }`
 # -- and only `.providers` is used here.
 #
-# Used by tests/doh-upstream.nix and tests/iroh-ssh.nix.
+# Used by tests/doh-upstream.nix, tests/iroh-ssh.nix and tests/connectivity-watchdog.nix.
 { pkgs, dohStamps, readyFile ? "/tmp/doh-interceptor-ready", respond, name ? "doh-interceptor" }:
 
 let
