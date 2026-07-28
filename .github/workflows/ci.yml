@@ -227,6 +227,12 @@ jobs:
           # BASE_SHA guards main moving under us, --match-head-commit guards
           # a push to the PR branch after tests started (checked atomically
           # by the merge API itself).
+          #
+          # The two races are not equally bad. A push to the PR branch also
+          # starts a fresh CI run whose own automerge does the merge, so this
+          # run has nothing left to do: notice + exit 0, no red run, no email.
+          # main moving is different -- nothing re-triggers CI for this PR, so
+          # it stays a hard error asking for a rebase.
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
@@ -235,4 +241,29 @@ jobs:
             echo "::error::main moved since CI ran ($BASE_SHA -> $current_main); update the PR branch to re-run CI against current main"
             exit 1
           fi
-          gh pr merge "$PR" --rebase --repo ${{ github.repository }} --match-head-commit "$HEAD_SHA"
+
+          state=$(gh pr view "$PR" --repo ${{ github.repository }} --json state --jq .state)
+          if [ "$state" != "OPEN" ]; then
+            echo "::notice::skipping automerge: PR #$PR is $state (already handled elsewhere)"
+            exit 0
+          fi
+
+          # Cheap up-front check for the common case, so the usual path does
+          # not depend on GitHub's error wording. --match-head-commit below
+          # still covers the narrow window between this check and the merge.
+          current_head=$(gh pr view "$PR" --repo ${{ github.repository }} --json headRefOid --jq .headRefOid)
+          if [ "$current_head" != "$HEAD_SHA" ]; then
+            echo "::notice::skipping automerge: PR #$PR was pushed after CI started ($HEAD_SHA -> $current_head); the run for the new head will merge it"
+            exit 0
+          fi
+
+          if out=$(gh pr merge "$PR" --rebase --repo ${{ github.repository }} --match-head-commit "$HEAD_SHA" 2>&1); then
+            echo "$out"
+            exit 0
+          fi
+          echo "$out"
+          if grep -qF 'Head branch was modified' <<<"$out"; then
+            echo "::notice::skipping automerge: PR #$PR was pushed after CI started (head no longer $HEAD_SHA); the run for the new head will merge it"
+            exit 0
+          fi
+          exit 1
