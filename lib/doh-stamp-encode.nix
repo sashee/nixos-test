@@ -3,8 +3,8 @@
 # dnscrypt-proxy's [static] section accepts only `sdns://` stamps, but a stamp for a
 # DoH server carries nothing except an address, a hostname and a path -- so we keep the
 # readable components as the source of truth (lib/doh-stamps.nix) and derive the stamps
-# here. That way the probe in modules/connectivity-fallback.nix can reuse the address
-# and hostname without decoding anything.
+# here. That way anything else needing the address or hostname -- tests/doh-interceptor.nix
+# impersonates both -- can reuse them without decoding anything.
 #
 # Encoding, not decoding, is what makes this possible in pure Nix: a stamp's props
 # field is 8 mostly-zero bytes, and a Nix string cannot hold NUL

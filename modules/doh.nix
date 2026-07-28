@@ -49,8 +49,10 @@ in
     #
     # This probe must stay on plaintext HTTP: portal detection works precisely because a
     # portal can hijack cleartext. Over HTTPS the interception fails at TLS and NM reports
-    # LIMITED/NONE instead of PORTAL, so the login page is never offered -- which is why
-    # this cannot reuse the DoH-upstream probe that connectivity-fallback now uses.
+    # LIMITED/NONE instead of PORTAL, so the login page is never offered. (NM runs on the
+    # laptops only; the rpi5's connectivity-fallback deliberately probes nothing at all --
+    # it reads local wifi association state, since that is the only thing its setup AP can
+    # repair.)
     #
     # Kept on detectportal rather than moved to gstatic after the 2026-07-27 rot incident:
     # gstatic's answers are geo-load-balanced and rotated across three different addresses

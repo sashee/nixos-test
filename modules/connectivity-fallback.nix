@@ -3,13 +3,9 @@
 let
   cfg = config.common.connectivityFallback;
 
-  # The host's own DoH upstreams, as components (see lib/doh-stamps.nix). Same source of
-  # truth dnscrypt-proxy's stamps are generated from, so the probe cannot drift from the
-  # resolvers actually in use. mapAttrsToList orders by attribute name, which puts each
-  # provider's IPv4 entry before its IPv6 one -- worth keeping, because the rpi5 has no
-  # global IPv6 and a v6 attempt is a wasted timeout there.
-  doh = import ../lib/doh-stamps.nix { inherit lib; };
-  dohEndpoints = lib.mapAttrsToList (_: e: { inherit (e) hostname addr; }) doh.endpoints;
+  # How long the check spends deciding, in seconds: the first sample is taken
+  # immediately, so only the gaps between samples cost time.
+  associationWindow = (cfg.association.samples - 1) * cfg.association.intervalSeconds;
 
   # Whether this host runs the nftables-backed NixOS firewall whose nixos-fw
   # table the setup script must open the AP service ports in.
@@ -175,56 +171,60 @@ let
     '';
   };
 
-  # One "host|port|addr|path" record per probe target, fed to the loop below on stdin.
-  # Generated rather than looped in Nix so the script stays readable in the journal.
-  endpointRecords = lib.concatMapStrings (
-    e: "${e.hostname}|${toString e.port}|${e.addr}|${e.path}\n"
-  ) cfg.connectivityCheck.endpoints;
-
   checkScript = pkgs.writeShellApplication {
     name = "connectivity-fallback-check";
-    runtimeInputs = [ cfg.tools.curl cfg.tools.iproute2 cfg.tools.systemd cfg.tools.coreutils ];
+    runtimeInputs = [ cfg.tools.iw cfg.tools.systemd cfg.tools.coreutils ];
     text = ''
-      # Probe general internet reachability; do NOT bind to the wifi interface.
+      # Decide on LOCAL wifi association state, and on nothing else.
       #
-      # The targets are this host's own DoH resolvers (see connectivityCheck.endpoints).
-      # Three properties matter, and a plain HTTP canary has none of them:
+      # The only thing setup mode can repair is missing or wrong credentials, so
+      # "not associated to any network" is the only condition it should react to.
+      # Reachability of anything beyond the AP is deliberately NOT consulted: an ISP
+      # outage, a blocked upstream or a rebooting router are all indistinguishable from
+      # working wifi as far as this module's remedy is concerned, and treating them as
+      # failures makes a healthy machine tear down its own network. On 2026-07-27 that
+      # cost ~16 hours: the check probed a third-party HTTP canary
+      # (detectportal.firefox.com), Mozilla moved it to another CDN, the address pinned
+      # in lib/captive-portals.txt went stale, and the box rebooted every 15m23s while
+      # its internet worked the whole time. Widening the probe to several DoH upstreams
+      # narrowed that blast radius but kept the shape of the bug: the verdict still hung
+      # on remote state that can rot. Association state cannot. It is read straight from
+      # the kernel and needs no DNS, no TLS and no egress.
       #
-      #  * --resolve pins the address from the stamp, so the probe needs no DNS at all:
-      #    it cannot be answered from lib/captive-portals.txt, and it still works when
-      #    dnscrypt-proxy itself is wedged.
-      #  * TLS certificate validation *is* the captive-portal test. A portal cannot
-      #    present a valid cert for these hostnames, so interception fails closed and
-      #    reads as offline -- which is correct, since a portal means not-online.
-      #  * There are four independent operators, so one provider's outage cannot make
-      #    this host tear down its own network.
-      #
-      # Requiring HTTP 200 (not merely "something answered") means a real DNS answer came
-      # back, so this proves the whole path the box depends on: TCP 443, TLS, and a
-      # working upstream resolver.
-      query=${lib.escapeShellArg cfg.connectivityCheck.dnsQuery}
-      timeout=${toString cfg.connectivityCheck.timeoutSeconds}
-      code=""
+      # `iw` (nl80211) rather than `iwctl`: the kernel's view does not depend on iwd's
+      # D-Bus being up, and iwd being wedged is precisely a moment we must not misread.
+      iface=${lib.escapeShellArg cfg.interface}
+      samples=${toString cfg.association.samples}
+      interval=${toString cfg.association.intervalSeconds}
+      # Held in a variable rather than written as $'\n' inline: bash does not reliably
+      # apply ANSI-C quoting to the pattern of ''${var%%pat} inside double quotes.
+      nl=$'\n'
 
-      probe() {
-        code="$(curl -s -m "$timeout" -o /dev/null -w '%{http_code}' \
-          --resolve "$1:$2:$3" \
-          -H 'accept: application/dns-message' \
-          "https://$1:$2$4?dns=$query" || true)"
-        [ "$code" = "200" ]
-      }
-
-      while IFS='|' read -r host port addr path; do
-        [ -n "$host" ] || continue
-        if probe "$host" "$port" "$addr" "$path"; then
-          echo "connectivity-fallback: online (via $host at $addr), nothing to do"
+      # Sampled rather than read once. Association flaps -- a roam, a scan, a driver
+      # hiccup -- and a single unlucky reading at the OnBootSec deadline would otherwise
+      # cost an AP and a reboot. Any one association in the window means connected.
+      for i in $(seq 1 "$samples"); do
+        if ! link="$(iw dev "$iface" link 2>&1)"; then
+          # The radio itself is unusable (missing device, wrong interface name, driver
+          # gone). Setup mode needs this very device to beacon, so entering it cannot
+          # help -- it would only reboot the host every bootGrace+setupTimeout, which is
+          # the failure mode this module keeps re-learning. Fail safe: stay put, loudly.
+          echo "connectivity-fallback: cannot query $iface ($link); NOT entering setup mode"
           exit 0
         fi
-        echo "connectivity-fallback: probe failed for $host at $addr (HTTP $code)"
-      done <<'CONNECTIVITY_FALLBACK_ENDPOINTS'
-      ${endpointRecords}CONNECTIVITY_FALLBACK_ENDPOINTS
+        case "$link" in
+          "Connected to "*)
+            # First line only: `iw ... link` follows it with SSID/freq/signal detail,
+            # and the journal line these tests grep for has to be a single line.
+            echo "connectivity-fallback: $iface associated (''${link%%"$nl"*}), nothing to do"
+            exit 0
+            ;;
+        esac
+        echo "connectivity-fallback: $iface not associated (sample $i/$samples)"
+        [ "$i" = "$samples" ] || sleep "$interval"
+      done
 
-      echo "connectivity-fallback: no connectivity; entering setup mode"
+      echo "connectivity-fallback: $iface not associated for ${toString associationWindow}s; entering setup mode"
       systemctl start --no-block connectivity-fallback-setup.service
     '';
   };
@@ -284,78 +284,30 @@ in
       title = lib.mkOption { type = lib.types.str; default = "Wi-Fi setup"; description = "Portal page title."; };
     };
 
-    connectivityCheck = {
-      endpoints = lib.mkOption {
-        type = lib.types.listOf (
-          lib.types.submodule {
-            options = {
-              hostname = lib.mkOption {
-                type = lib.types.str;
-                description = "Hostname used for TLS validation and the Host header.";
-              };
-              addr = lib.mkOption {
-                type = lib.types.str;
-                description = ''
-                  Literal address to dial, passed to `curl --resolve`, so no DNS lookup
-                  happens. IPv6 must be bracketed, e.g. "[2606:4700:4700::1111]".
-                '';
-              };
-              port = lib.mkOption {
-                type = lib.types.port;
-                default = 443;
-                description = "Port to dial. Must match the URL's port for --resolve to apply.";
-              };
-              path = lib.mkOption {
-                type = lib.types.str;
-                default = "/dns-query";
-                description = "Request path; the DoH query is appended as ?dns=...";
-              };
-            };
-          }
-        );
-        default = dohEndpoints;
-        defaultText = lib.literalExpression "the host's DoH upstreams from lib/doh-stamps.nix";
+    association = {
+      samples = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 6;
         description = ''
-          Endpoints probed to decide whether the device is online. The device is online as
-          soon as any one of them answers HTTP 200; setup mode is entered only when every
-          one fails.
+          How many times the check reads the interface's association state before
+          concluding the device is not on a network. Any single association ends the
+          check as connected.
 
-          These default to the host's own DoH resolvers rather than a third-party HTTP
-          canary. On 2026-07-27 the previous default
-          (`http://detectportal.firefox.com/success.txt`) rebooted the rpi5 every 15m23s
-          for ~16 hours: Mozilla migrated that host to Fastly, the pinned address in
-          lib/captive-portals.txt went stale, and because that map answers at all times the
-          box could never learn otherwise -- so a single rotted third-party pin was able to
-          make a healthy machine tear down its own network. A DoH upstream cannot rot
-          unnoticed, because if it does this host has no DNS at all.
+          More than one because association flaps: a roam, a background scan or a driver
+          hiccup can make a momentary reading say "not connected" on a host that is fine,
+          and the price of believing it is an AP plus a reboot. The default spends 50s
+          (see intervalSeconds) deciding -- roughly what the old DoH probe loop occupied,
+          so the surrounding timer budget is unchanged.
         '';
       };
 
-      dnsQuery = lib.mkOption {
-        type = lib.types.str;
-        # See lib/doh-stamps.nix for the byte-level decoding; it lives there so the VM
-        # tests, which build their own probe curl commands, can send the identical query
-        # instead of copying the literal.
-        default = doh.dnsQuery;
-        defaultText = lib.literalExpression "dnsQuery from lib/doh-stamps.nix";
-        description = "base64url-encoded DNS query sent to each endpoint.";
-      };
-
-      timeoutSeconds = lib.mkOption {
+      intervalSeconds = lib.mkOption {
         type = lib.types.ints.positive;
-        default = 5;
+        default = 10;
         description = ''
-          Per-endpoint curl timeout.
-
-          Worst case the check takes this times the number of endpoints -- 40s at the
-          defaults. Two ceilings sit above that, and the tighter one is not the obvious
-          one: TimeoutStartSec on the check service (120s), past which the probe loop is
-          killed before it reaches the line that starts setup mode, so an offline host
-          would silently stay offline. That is set explicitly rather than left to inherit
-          systemd's 90s default precisely because the consequence is invisible.
-          setupTimeout (10min) is the other ceiling and is never binding.
-          tests/connectivity-fallback-timing.nix runs the real endpoint list under icount
-          and asserts the loop stays inside 60s (42s measured worst case).
+          Delay between association samples. The check's worst-case duration is
+          (samples - 1) x this, and TimeoutStartSec on the check service is derived from
+          it, so the two cannot drift apart.
         '';
       };
     };
@@ -367,7 +319,6 @@ in
       python3 = lib.mkPackageOption pkgs "python3" { };
       iproute2 = lib.mkPackageOption pkgs "iproute2" { };
       nftables = lib.mkPackageOption pkgs "nftables" { };
-      curl = lib.mkPackageOption pkgs "curl" { };
       coreutils = lib.mkPackageOption pkgs "coreutils" { };
       systemd = lib.mkPackageOption pkgs "systemd" { };
     };
@@ -381,22 +332,6 @@ in
         message = "common.connectivityFallback manages the radio via iwd; disable NetworkManager."; }
       { assertion = builtins.stringLength cfg.ap.ssid >= 8;
         message = "common.connectivityFallback.ap.ssid must be >= 8 chars (reused as WPA2 passphrase)."; }
-      # An empty list makes every check conclude "offline", which means an AP and a reboot
-      # every bootGrace+setupTimeout, forever -- the exact failure this module caused on
-      # 2026-07-27. Fail the build instead.
-      { assertion = cfg.connectivityCheck.endpoints != [ ];
-        message = "common.connectivityFallback.connectivityCheck.endpoints must not be empty: with no endpoints the check always reports offline and the host reboots in a loop."; }
-      # Same reasoning as above, for the same reason it has to be an eval-time failure: the
-      # endpoints are rendered as "host|port|addr|path" records and read back with
-      # `IFS='|' read`, so a '|' anywhere in a field shifts every field after it. The probe
-      # then dials a target nobody meant, fails, and -- since that happens to every endpoint
-      # -- the host raises the setup AP and reboots every bootGrace+setupTimeout. Nothing at
-      # runtime would look wrong; the records are still well-formed, just not the intended
-      # ones. `port` is types.port (an int) and cannot carry a separator.
-      { assertion = !(lib.any
-          (e: lib.any (s: lib.hasInfix "|" s) [ e.hostname e.addr e.path ])
-          cfg.connectivityCheck.endpoints);
-        message = "common.connectivityFallback.connectivityCheck.endpoints: no field may contain '|' -- it separates the host|port|addr|path records the check script parses, so a '|' shifts the fields, every probe fails against the wrong target, and the host reboots in a loop."; }
     ];
 
     environment.systemPackages = [ cfg.tools.iw ];
@@ -408,16 +343,16 @@ in
     # mode) operation the ports are closed like everything else.
 
     systemd.services.connectivity-fallback-check = {
-      description = "Check internet connectivity; enter WiFi setup mode if offline";
+      description = "Check WiFi association; enter WiFi setup mode if not associated";
       serviceConfig = {
         Type = "oneshot";
         ExecStart = lib.getExe checkScript;
         # Explicit rather than inheriting DefaultTimeoutStartSec (90s), because the
-        # consequence of hitting it is silent: the probe loop would be killed before
-        # `systemctl start ... setup.service`, so an offline host would never raise the
-        # setup AP. Must stay comfortably above timeoutSeconds x length endpoints (40s at
-        # the defaults) -- see the timeoutSeconds description.
-        TimeoutStartSec = "120s";
+        # consequence of hitting it is silent: the sampling loop would be killed before
+        # `systemctl start ... setup.service`, so a host with no wifi would never raise
+        # the setup AP. Derived from the sampling window rather than hardcoded, so
+        # raising association.samples cannot quietly push the loop past the ceiling.
+        TimeoutStartSec = "${toString (associationWindow + 30)}s";
       };
     };
 

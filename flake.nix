@@ -310,12 +310,12 @@
         ];
         user = "nixos";
       };
-      # The probe-semantics regression test for the 2026-07-27 outage, on the REAL rpi
+      # The trigger-semantics regression test for the 2026-07-27 outage, on the REAL rpi
       # config (exact Pi kernel, live doh egress rules, live firewall -- so the setup
       # script's runtime nixos-fw openings are on the path here too). The decision logic
       # is arch-independent, but the incident was on the Pi and this is the deployed stack
-      # that has to survive a rotted endpoint.
-      connectivityFallbackProbeTestRpi = import ./tests/connectivity-fallback-probe.nix {
+      # that must not tear down its own network over a transient signal.
+      connectivityFallbackTriggerTestRpi = import ./tests/connectivity-fallback-trigger.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
@@ -391,7 +391,7 @@
         nix-gc-retention = nixGcRetentionTestRpi;
         monitoring = monitoringTestRpi;
         connectivity-fallback = connectivityFallbackTestRpi;
-        connectivity-fallback-probe = connectivityFallbackProbeTestRpi;
+        connectivity-fallback-trigger = connectivityFallbackTriggerTestRpi;
         connectivity-fallback-timing = connectivityFallbackTimingTestRpi;
         monitoring-nix-gc = monitoringNixGcTestRpi;
         monitoring-iroh-ssh = monitoringIrohSshTestRpi;
@@ -490,9 +490,10 @@
         inherit nixpkgs pkgs stateVersion;
         machineModule = connectivityFallbackNode;
       };
-      # Probe decision logic (rotted endpoint among healthy ones, TLS interception),
-      # isolated from the radio stack. Regression test for the 2026-07-27 reboot loop.
-      connectivityFallbackProbeTest = import ./tests/connectivity-fallback-probe.nix {
+      # Trigger decision logic (sustained non-association, flap tolerance, unusable
+      # radio), isolated from the radio stack. Regression test for the 2026-07-27
+      # reboot loop.
+      connectivityFallbackTriggerTest = import ./tests/connectivity-fallback-trigger.nix {
         inherit nixpkgs pkgs stateVersion;
         machineModule = connectivityFallbackNode;
       };
@@ -726,7 +727,7 @@
         plasma-firefox = plasmaFirefoxTest;
         restic = resticTest;
         connectivity-fallback = connectivityFallbackTest;
-        connectivity-fallback-probe = connectivityFallbackProbeTest;
+        connectivity-fallback-trigger = connectivityFallbackTriggerTest;
         connectivity-fallback-timing = connectivityFallbackTimingTest;
         zram = zramTest;
       } // (nixpkgs.lib.mapAttrs'
