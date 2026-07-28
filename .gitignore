@@ -1,5 +1,6 @@
 *.qcow2
 result
+result-*
 result-qemu-vm
 /results/
 /rpi-kernel-cache/
