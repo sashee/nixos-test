@@ -28,8 +28,3 @@ path = "src/bin/iroh-ssh-connect.rs"
 [[bin]]
 name = "iroh-ssh-generate-secret"
 path = "src/bin/iroh-ssh-generate-secret.rs"
-
-[profile.release]
-opt-level = "s"
-lto = true
-codegen-units = 1
