@@ -7,7 +7,29 @@ let
     pkgs  = stable;
     inherit unstable;
     nixgl = null;
-    skip  = [ "chromium" "vkquake" "libreoffice" "tor-browser"];
+    # Headless box, so the GUI programs go. Measured 2026-07-29 by diffing the nixUtils
+    # closure with and without the last four: 7.26 GB -> 5.74 GB, i.e. 1.52 GB and 385 of
+    # 2421 paths, and nothing outside this env references any of them. The tail is bigger
+    # than the programs themselves suggest -- vlc drags in qtdeclarative-5.15, openjdk-jre,
+    # samba, flite and freepats; keepassxc/flameshot drag in Qt 6 + gtk4; and one of them
+    # pulls a *second* systemd build (distinct store path from the system's own).
+    #
+    # The path count matters as much as the bytes: `nix` accumulates narinfo metadata per
+    # path, and that growth (measured at 5.9 GB) is what forced a mid-build process restart
+    # during the 2026-07-29 upgrade, so 16% fewer paths directly lowers the peak.
+    #
+    # claude and not opencode: opencode provides host-tools-mcp, which is the remote
+    # tooling channel into this box -- skipping it would cut off that access.
+    skip  = [
+      "chromium"
+      "vkquake"
+      "libreoffice"
+      "tor-browser"
+      "vlc"
+      "flameshot"
+      "keepassxc"
+      "claude"
+    ];
   };
   no = lib.mkForce lib.kernel.no;
   yes = lib.mkForce lib.kernel.yes;
