@@ -9,15 +9,26 @@ let
     name = "doh-upstream";
     readyFile = "/tmp/fake-doh-ready";
     respond = ''
+      import time
       request_dir = pathlib.Path("/tmp/fake-doh-requests"); request_dir.mkdir(exist_ok=True)
       probe_path = pathlib.Path("/tmp/fake-doh-last-probe.json")
+      # Ordered, append-only record of every request, timestamped. The files below are keyed
+      # by name+qtype and so overwrite each other, which loses *when* and *how many* -- the
+      # two things a failed wait_for_answer needs in order to tell "the query never reached
+      # the upstream" from "it did, and the answer never made it back to the client".
+      log_path = pathlib.Path("/tmp/fake-doh-request-log.jsonl")
       def _safe(n): return n.replace(".", "_") or "root"
       def respond(query, meta):
           name, qtype, qclass, _ = read_question(query)
-          rec = json.dumps({
+          record = {
               "family": meta["family"], "method": meta["method"], "path": meta["path"],
               "host": meta["host"], "content_type": meta["content_type"],
-              "question": name, "qtype": qtype, "qclass": qclass})
+              "question": name, "qtype": qtype, "qclass": qclass}
+          rec = json.dumps(record)
+          # One short O_APPEND write per request, so the threaded server's handlers cannot
+          # interleave a partial line.
+          with log_path.open("a") as fh:
+              fh.write(json.dumps(dict(record, t=round(time.time(), 3))) + "\n")
           if name.endswith(".upstream-test.example"):
               (request_dir / f"{_safe(name)}-{qtype}.json").write_text(rec)
           else:
@@ -35,6 +46,34 @@ let
   dohIpv4Json = builtins.toJSON interceptor.dohIpv4;
   dohIpv6Json = builtins.toJSON interceptor.dohIpv6;
   dohDomainsJson = builtins.toJSON interceptor.dohDomains;
+
+  # A DoH GET aimed straight at one impersonated upstream, bypassing dnscrypt-proxy
+  # entirely: --resolve pins the address, so the probe needs no DNS at all. Same shape
+  # modules/connectivity-fallback.nix probes with, and it sends dohStamps.dnsQuery -- the
+  # identical query, from the one place that literal lives (lib/doh-stamps.nix).
+  #
+  # This is what the 2026-07-29 rpi failure had no way to answer: dnscrypt-proxy was active
+  # and listening while every dig timed out, and nothing in the dump distinguished "this
+  # client cannot reach the fake upstream" from "dnscrypt-proxy is not answering". HTTP 200
+  # here means TCP 443 + TLS + a live fake server, i.e. the break is inside dnscrypt-proxy.
+  #
+  # No backslash in the -w format on purpose: this string is double-encoded on the way into
+  # the testScript (toJSON, then a Python literal, then json.loads), and a `\n` would come
+  # out the far end as a real newline. print_command already adds one.
+  probeCommand = host: dial:
+    "${pkgs.curl}/bin/curl -s -m 20 -o /dev/null -w '%{http_code} %{time_total}'"
+    + " --resolve ${host}:443:${dial}"
+    + " -H 'accept: application/dns-message'"
+    + " 'https://${host}/dns-query?dns=${dohStamps.dnsQuery}'";
+  # Bracketed for v6: curl needs the brackets to tell the address apart from --resolve's
+  # own host:port:addr colons.
+  upstreamProbes = pkgs.lib.concatMap
+    (p: [
+      { label = "${p.hostname} via ${p.v4}"; command = probeCommand p.hostname p.v4; }
+      { label = "${p.hostname} via ${p.v6}"; command = probeCommand p.hostname "[${p.v6}]"; }
+    ])
+    (pkgs.lib.attrValues dohStamps.providers);
+  upstreamProbesJson = builtins.toJSON upstreamProbes;
 in
 nixpkgs.lib.nixos.runTest {
   name = "doh-upstream";
@@ -78,6 +117,7 @@ nixpkgs.lib.nixos.runTest {
     doh_ipv4 = json.loads("""${dohIpv4Json}""")
     doh_ipv6 = json.loads("""${dohIpv6Json}""")
     doh_domains = json.loads("""${dohDomainsJson}""")
+    upstream_probes = json.loads("""${upstreamProbesJson}""")
 
     # Node-name symbols exposed by the driver; binding them starts nothing.
     dns_peer = dnsPeer
@@ -86,7 +126,7 @@ nixpkgs.lib.nixos.runTest {
 
     dns_peer.start()
     dns_peer.wait_for_unit("multi-user.target")
-    dns_peer.succeed("rm -rf /tmp/fake-doh-ready /tmp/fake-doh-requests /tmp/fake-doh-last-probe.json")
+    dns_peer.succeed("rm -rf /tmp/fake-doh-ready /tmp/fake-doh-requests /tmp/fake-doh-last-probe.json /tmp/fake-doh-request-log.jsonl")
     dns_peer.succeed("${pkgs.procps}/bin/sysctl -w net.ipv4.ip_forward=1")
     dns_peer.succeed("${pkgs.procps}/bin/sysctl -w net.ipv6.conf.all.forwarding=1")
     # On slow (TCG) runners eth1's static addresses can land after
@@ -135,28 +175,65 @@ nixpkgs.lib.nixos.runTest {
         print_command(node, label, "${pkgs.nftables}/bin/nft list ruleset")
         print_command(node, label, "${pkgs.systemd}/bin/systemctl status dnscrypt-proxy.service --no-pager")
         print_command(node, label, "${pkgs.systemd}/bin/journalctl -u dnscrypt-proxy.service -b --no-pager")
-        print_command(node, label, "${pkgs.iproute2}/bin/ss -tupn")
+        # -a, not bare -tupn: without it ss lists only *connected* sockets, so the
+        # 2026-07-29 rpi dump was an empty table and could not confirm dnscrypt-proxy
+        # still held [::1]:53 while every dig against it timed out.
+        print_command(node, label, "${pkgs.iproute2}/bin/ss -antup")
+        # nixos-fw and common-doh-egress rejects both log with a "refused " prefix.
+        print_command(node, label, "${pkgs.systemd}/bin/journalctl -k -b --grep refused --no-pager")
+        for probe in upstream_probes:
+            print_command(node, f"{label} upstream probe {probe['label']}", probe["command"])
 
     def print_peer_diagnostics():
         print_route_diagnostics(dns_peer, "doh-upstream-peer")
         print_command(dns_peer, "doh-upstream-peer", "${pkgs.iproute2}/bin/ss -ltnp")
-        print_command(dns_peer, "doh-upstream-peer", "find /tmp/fake-doh-requests -maxdepth 1 -type f -print -exec cat {} \\\;")
+        # Quote the ';' rather than escaping it. A lone backslash is literal in a Nix
+        # indented string and Python keeps \; verbatim, so the previous \\\; reached the
+        # shell as a literal \ argument plus a command terminator, and this died with
+        # "find: missing argument to `-exec'" -- losing the request dump on exactly the
+        # run that needed it.
+        print_command(dns_peer, "doh-upstream-peer", "find /tmp/fake-doh-requests -maxdepth 1 -type f -print -exec cat {} ';'")
+        print_command(dns_peer, "doh-upstream-peer", "cat /tmp/fake-doh-request-log.jsonl")
         print_command(dns_peer, "doh-upstream-peer", "cat /tmp/fake-doh-last-probe.json")
         print_command(dns_peer, "doh-upstream-peer", "${pkgs.systemd}/bin/systemctl status fake-doh-server.service --no-pager")
         print_command(dns_peer, "doh-upstream-peer", "${pkgs.systemd}/bin/journalctl -u fake-doh-server.service -b --no-pager")
 
+    # Run-length encode the attempts. Whether the failure mode changed over the loop --
+    # connection refused while dnscrypt-proxy was still binding, then timeouts, say -- is
+    # invisible from the last attempt alone, which is all this used to print.
+    def print_attempt_summary(attempts):
+        print("attempt outcomes, oldest first (count x exit status: first line of output):")
+        runs = []
+        for status, output in attempts:
+            lines = output.strip().splitlines()
+            key = (status, lines[0] if lines else "")
+            if runs and runs[-1][0] == key:
+                runs[-1][1] += 1
+            else:
+                runs.append([key, 1])
+        for (status, first_line), count in runs:
+            print(f"  {count}x status {status}: {first_line}")
+
     def wait_for_answer(node, label, server, question, qtype, expected):
         command = "${pkgs.dig}/bin/dig @{} {} {} +short +time=5 +tries=1 2>&1".format(server, question, qtype)
-        last_status = None
-        last_output = ""
+        attempts = []
+        started = time.monotonic()
         for attempt in range(60):
-            last_status, last_output = node.execute(command)
-            if expected in last_output:
+            attempts.append(node.execute(command))
+            if expected in attempts[-1][1]:
                 return
             time.sleep(1)
-        print(f"\n### {label}: dig did not return {expected}")
+        last_status, last_output = attempts[-1]
+        print(f"\n### {label}: dig did not return {expected}"
+              f" in {len(attempts)} attempts over {time.monotonic() - started:.0f}s")
+        print_attempt_summary(attempts)
         print(f"last status: {last_status}")
         print(f"last output:\n{last_output}")
+        # One retry over TCP with a timeout above dnscrypt-proxy's own 5s upstream timeout:
+        # separates UDP-specific loss from a flat no-answer, and shows whether an answer
+        # arrives at all when given more than the loop allows. Failure path only -- the
+        # loop's own behaviour above is deliberately unchanged.
+        print_command(node, label, "${pkgs.dig}/bin/dig @{} {} {} +tcp +time=20 +tries=1 2>&1".format(server, question, qtype))
         print_client_diagnostics(node, label)
         print_peer_diagnostics()
         raise Exception(f"{label} did not resolve {question} to {expected}")
