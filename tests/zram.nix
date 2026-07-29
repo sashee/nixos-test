@@ -27,7 +27,9 @@ nixpkgs.lib.nixos.runTest {
     # default compression algorithm is zstd
     machine.succeed("grep -q '\[zstd\]' /sys/block/zram0/comp_algorithm")
 
-    # device has a nonzero size (memoryPercent = 50 of VM RAM)
+    # device has a nonzero size. Deliberately ratio-agnostic: this test is shared by the
+    # laptop variants (memoryPercent 50, the module default) and the rpi one (100, raised
+    # after the 2026-07-29 OOM), so it can only assert that sizing happened at all.
     machine.succeed('test "$(cat /sys/block/zram0/disksize)" -gt 0')
   '';
 }
