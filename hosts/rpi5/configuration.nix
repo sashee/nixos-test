@@ -39,7 +39,31 @@ in
   networking.hostName = lib.mkDefault "nixos-rpi5";
 
   # Compressed RAM-backed swap (same mechanism as the laptops); useful on the 4 GB Pi.
-  zramSwap.enable = true;
+  #
+  # memoryPercent=100 rather than the module default of 50. `zram-size` is *uncompressed*
+  # capacity, so the default gave 1.97 GiB of swap on this box -- and on 2026-07-29 that
+  # ceiling was what turned a too-big nightly upgrade into a 5-hour outage. Measured at the
+  # OOM: zram held 1.94 GiB (98% full) while `mem_used_max` was only 398 MiB, i.e. 10% of
+  # RAM -- zstd was getting ~5:1 on the nix evaluator's heap, with only 1.3% of pages ever
+  # incompressible (`huge_pages_since` 1678 of ~124k). So swap ran out with 90% of RAM still
+  # unused by zram. Once swap was full the only reclaimable memory left was clean page cache,
+  # so kswapd reclaimed ~1.62 TB worth of pages and the SD served 1.89 TB of reads (7.09 h
+  # device-busy) while the build made 27 min of CPU progress in 7.5 h.
+  #
+  # 100 and not more: at the measured 5:1 a full 4.03 GiB costs 0.79 GiB of RAM, and even at
+  # 2:1 it costs what the old 50% cost at 1:1 -- so this raises the ceiling without adding a
+  # new worst case. 150 would bet on >=3:1, and `zramSwap` exposes no `mem_limit` (the sysfs
+  # attribute is 0/unlimited), so there is no backstop if the ratio ever degrades.
+  #
+  # Not `writebackDevice`: it would push pages onto the SD, and *writes* are what wear the
+  # card -- reads do not, which is why the 1.89 TB read above is harmless.
+  #
+  # Takes effect on reboot only: `disksize` is writable on an uninitialised zram device, so
+  # a `switch` cannot resize swap that is already in use.
+  zramSwap = {
+    enable = true;
+    memoryPercent = 100;
+  };
 
   # No interactive boot menu on the Pi + limited SD space: keep only the current
   # generation on GC (laptops keep 14 days to roll back from the boot menu).

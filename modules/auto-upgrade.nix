@@ -82,15 +82,20 @@ in
         "--print-build-logs"
         "--commit-lock-file"
         # Bound build concurrency for the unattended upgrade only; an interactive
-        # nixos-rebuild still uses every core. On the 4 GB Pi this is the only lever that
-        # limits build memory: `cgroup_disable=memory` is on the rpi kernel cmdline, so
-        # there is no memory cgroup and MemoryHigh=/MemoryMax= are inert, and swap is
-        # zram (compressed RAM, not extra capacity). A 2026-07-20 upgrade was OOM-killed
-        # with two 1.1 GiB rustc plus the evaluator's retained ~2 GiB heap.
+        # nixos-rebuild still uses every core. On the 4 GB Pi `cgroup_disable=memory` is on
+        # the rpi kernel cmdline, so there is no memory cgroup and MemoryHigh=/MemoryMax=
+        # are inert. A 2026-07-20 upgrade was OOM-killed with two 1.1 GiB rustc plus the
+        # evaluator's retained ~2 GiB heap -- exactly the shape these flags remove.
         #   --cores 1     -> NIX_BUILD_CORES=1, which nixpkgs' cargo build hook passes as
         #                    `-j`, so Rust crates compile one at a time.
         #   --max-jobs 1  -> one derivation at a time, so the kernel and the locally built
         #                    Rust packages cannot pile up together.
+        # These are not the only lever, and alone they are not enough: the 2026-07-29 OOM
+        # killed the top-level `nix` process at ~4.6 GB of anon demand while every compiler
+        # alive at that moment came to 401 MB combined, so serializing builds would not have
+        # saved it. Swap sizing is the other lever -- zram is compressed RAM and therefore
+        # *does* buy effective capacity (~5:1 measured on the evaluator's heap), which is why
+        # hosts/rpi5/configuration.nix now sets zramSwap.memoryPercent = 100.
         # Substitutions are unaffected (max-substitution-jobs/http-connections are
         # separate), so download-only nights are as fast as before; a from-source kernel
         # bump goes from ~4h to ~11h, which is acceptable for an unattended nightly.
