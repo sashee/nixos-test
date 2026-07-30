@@ -156,38 +156,48 @@ in
         misbehaving probe costs one pointless reboot per day instead of the reboot every
         15m23s that modules/connectivity-fallback.nix caused on 2026-07-27. Seconds rather
         than a systemd duration string because the check does integer arithmetic on it.
+
+        Must also outlast a boot, which is why the assertions below impose a floor. On the
+        boot AFTER a watchdog reboot there is no /run marker, so the age is the uptime
+        itself -- set this below a slow boot and the first probe of the new boot is already
+        over the threshold, turning the one thing this module structurally prevents (see
+        `since` above) back into a reboot loop.
       '';
     };
 
-    interval = lib.mkOption {
-      type = lib.types.str;
-      default = "1h";
+    intervalSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 3600;
       description = ''
-        How often to probe (OnBootSec and OnUnitActiveSec on the timer).
+        How often to probe, in seconds (OnBootSec and OnUnitActiveSec on the timer).
 
-        Bounds how late the reboot can be: the host reboots within afterSeconds + interval
-        + accuracySec of DNS breaking. Probing far more often than that buys nothing, since
-        the decision is about a whole day.
+        Bounds how late the reboot can be: the host reboots within afterSeconds +
+        intervalSeconds + accuracySeconds of DNS breaking. Probing far more often than that
+        buys nothing, since the decision is about a whole day.
+
+        Seconds rather than a systemd duration string so the assertions below can relate it
+        to afterSeconds and accuracySeconds; a string leaves the constraints stated in prose
+        and unchecked.
       '';
     };
 
-    accuracySec = lib.mkOption {
-      type = lib.types.str;
-      default = "1m";
+    accuracySeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 60;
       description = ''
-        AccuracySec on the timer. Loose by default on purpose: it lets systemd coalesce this
-        probe with other timers instead of waking the box alone for it, and 1m of jitter is
-        noise against a threshold of a day.
+        AccuracySec on the timer, in seconds. Loose by default on purpose: it lets systemd
+        coalesce this probe with other timers instead of waking the box alone for it, and 1m
+        of jitter is noise against a threshold of a day.
 
-        Must not exceed `interval`. systemd places the expiry anywhere in
-        [elapse, elapse + accuracySec], at a host-stable position synchronized across local
-        timer units -- effectively a grid of this size. An interval that is not a multiple of
-        it therefore does not mean what it says: every nominal elapse lands between grid
-        points and is pushed to the next one, so the real cadence is accuracySec. At the
-        production 1h/1m the interval is an exact multiple and firings land on grid points
-        with no drift; it is the shortened intervals in tests/connectivity-watchdog.nix that
-        need this turned down, and before it existed that test's 20s interval was silently a
-        60s one.
+        systemd places the expiry anywhere in [elapse, elapse + accuracySeconds], at a
+        host-stable position synchronized across local timer units -- effectively a grid of
+        this size. So an intervalSeconds that is not a multiple of it does not mean what it
+        says: every nominal elapse lands between grid points and is pushed to the next one,
+        and the real cadence is neither value. Both that and "no coarser than the interval"
+        are asserted below. At the production 3600/60 the interval is an exact multiple and
+        firings land on grid points with no drift; it is the shortened intervals in
+        tests/connectivity-watchdog.nix that need this turned down, and before it was
+        configurable that test's 20s interval was silently a 60s one.
       '';
     };
 
@@ -208,10 +218,39 @@ in
     # queries over four independent operators). A validating resolver with RFC 8198
     # aggressive NSEC would answer random labels from cache and quietly defeat the probe --
     # see the comment on `name` above. This assertion is what stops one being substituted.
+    #
+    # The four timing assertions after it exist because every one of them fails INVISIBLY:
+    # the timer is well-formed, the unit runs, the journal looks right, and only the cadence
+    # or the fuse length is not what the file says. Same reason modules/connectivity-fallback.nix
+    # guards its own options at eval time rather than trusting the runtime to complain.
     assertions = [
       {
         assertion = config.services.dnscrypt-proxy.enable;
         message = "common.connectivityWatchdog probes 127.0.0.1 for DNS and expects dnscrypt-proxy to answer it (modules/doh.nix). Without it every probe fails and the host reboots every common.connectivityWatchdog.afterSeconds forever, on a healthy network.";
+      }
+      {
+        assertion = cfg.accuracySeconds <= cfg.intervalSeconds;
+        message = "common.connectivityWatchdog.accuracySeconds (${toString cfg.accuracySeconds}) must not exceed intervalSeconds (${toString cfg.intervalSeconds}): systemd would place every expiry on a grid coarser than the interval, so the real probe cadence is accuracySeconds and the configured interval means nothing.";
+      }
+      {
+        # Same reasoning one step further: a non-multiple pushes every nominal elapse to the
+        # next grid point, so the effective cadence is neither configured value.
+        assertion = lib.mod cfg.intervalSeconds cfg.accuracySeconds == 0;
+        message = "common.connectivityWatchdog.intervalSeconds (${toString cfg.intervalSeconds}) must be a multiple of accuracySeconds (${toString cfg.accuracySeconds}): otherwise each nominal elapse lands between grid points and is pushed to the next one, and the effective cadence is neither of the two configured values.";
+      }
+      {
+        # One failed probe must never be enough -- that is the whole difference between this
+        # module and the 2026-07-27 bootloop.
+        assertion = cfg.intervalSeconds < cfg.afterSeconds;
+        message = "common.connectivityWatchdog.intervalSeconds (${toString cfg.intervalSeconds}) must be below afterSeconds (${toString cfg.afterSeconds}): otherwise the very first probe of a boot is already at or past the threshold, so a single failed probe reboots the host.";
+      }
+      {
+        # See the `afterSeconds` description: with no marker the age IS the uptime, so a
+        # threshold shorter than a slow boot reboots the host again on its first probe.
+        # Measured boots: ~60s on the Pi, 250-390s for the TCG VM tests -- hence 600, which
+        # is also the value tests/connectivity-watchdog.nix picked for the same reason.
+        assertion = cfg.afterSeconds >= 600;
+        message = "common.connectivityWatchdog.afterSeconds (${toString cfg.afterSeconds}) must be at least 600: on the boot after a watchdog reboot there is no /run marker, so the age is the uptime itself, and a threshold shorter than a slow boot reboots the host again on its first probe -- a loop.";
       }
     ];
 
@@ -225,7 +264,7 @@ in
         # in there, and the default (remove when the unit stops) would wipe it every run.
         RuntimeDirectoryPreserve = true;
         # dig's own budget is +time=5 x +tries=2 per address family; leave room for both
-        # plus process spawn, but stay well under `interval` so runs cannot pile up.
+        # plus process spawn, but stay well under intervalSeconds so runs cannot pile up.
         TimeoutStartSec = "60s";
       };
     };
@@ -233,9 +272,9 @@ in
     systemd.timers.connectivity-watchdog = {
       wantedBy = [ "timers.target" ];
       timerConfig = {
-        OnBootSec = cfg.interval;
-        OnUnitActiveSec = cfg.interval;
-        AccuracySec = cfg.accuracySec;
+        OnBootSec = "${toString cfg.intervalSeconds}s";
+        OnUnitActiveSec = "${toString cfg.intervalSeconds}s";
+        AccuracySec = "${toString cfg.accuracySeconds}s";
         # No Persistent: catching up on missed runs after downtime is meaningless when the
         # whole question is "how long has this boot been without DNS".
         Unit = "connectivity-watchdog.service";

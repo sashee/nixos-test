@@ -20,7 +20,7 @@
 #     the probe only works at all because it dials 127.0.0.1. Live on the aarch64 variant.
 #
 # Everything is TIMER-driven: the driver never starts connectivity-watchdog itself, it only
-# breaks and repairs the network and then reads the journal. afterSeconds/interval are
+# breaks and repairs the network and then reads the journal. afterSeconds/intervalSeconds are
 # shortened, exactly as tests/connectivity-fallback.nix shortens bootGrace/setupTimeout and
 # leaves its timer armed. `date -s` is deliberately not used -- the module's age is
 # monotonic (uptime), so moving the wall clock would prove nothing -- and icount is not
@@ -35,16 +35,18 @@ let
   # watchdog reboot there is no /run marker, so `since` is the uptime itself -- if the
   # threshold were shorter than a boot, a slow (TCG) boot would already be over it and the
   # box would reboot again immediately, turning the loop-breaker subtest into a loop.
-  # Measured TCG boots in this repo run 250-390s, hence 600.
+  # Measured TCG boots in this repo run 250-390s, hence 600 -- which is also the floor the
+  # module asserts, for exactly this reason.
   afterSeconds = 600;
   # Every `n * interval` timeout below is derived from this, so it has to be the REAL cadence.
-  # That is what accuracySec is for: systemd places a timer's expiry anywhere in
-  # [elapse, elapse + AccuracySec], on a grid of that size, so the production 1m would floor
+  # That is what accuracySeconds is for: systemd places a timer's expiry anywhere in
+  # [elapse, elapse + AccuracySec], on a grid of that size, so the production 60 would floor
   # the cadence here at 60s and every bound below would be 3x looser than it reads (a later
   # "this test is slow, halve the interval" would then tighten the timeouts while changing
-  # nothing about the firing rate). 1s makes the shortening real.
+  # nothing about the firing rate). 1 makes the shortening real, and the module asserts the
+  # interval stays a multiple of it.
   interval = 20;
-  accuracySec = "1s";
+  accuracySeconds = 1;
 
   interceptor = import ./doh-interceptor.nix {
     inherit pkgs dohStamps;
@@ -106,8 +108,8 @@ nixpkgs.lib.nixos.runTest {
 
     common.connectivityWatchdog = {
       enable = true;
-      inherit afterSeconds accuracySec;
-      interval = "${toString interval}s";
+      inherit afterSeconds accuracySeconds;
+      intervalSeconds = interval;
     };
 
     # No extra disk for the reboot breadcrumb: virtualisation.diskImage defaults to a
