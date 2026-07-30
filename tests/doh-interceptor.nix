@@ -29,6 +29,20 @@ let
   # unlike the bracketed dial targets inside a stamp.
   dohIpv6 = lib.unique (lib.filter (x: x != null) (lib.mapAttrsToList (_: p: p.v6 or null) providers));
 
+  # RFC 8484 GET parameter: base64url, unpadded. Decodes to a standard query for
+  # www.example.com IN A with ID 0 and RD set:
+  #   0000 0100 0001 0000 0000 0000  (header: ID, flags, QDCOUNT=1, no RRs)
+  #   03 "www" 07 "example" 03 "com" 00   (QNAME)
+  #   0001 0001                      (QTYPE=A, QCLASS=IN)
+  # ID 0 is deliberate: it keeps the request cacheable by intermediaries.
+  #
+  # Lives here, with the harness that answers it, rather than in lib/doh-stamps.nix: nothing
+  # this repo deploys sends a DoH GET by hand any more (dnscrypt-proxy builds its own), so
+  # the only readers are tests aiming a `curl` straight at an impersonated upstream. Exported
+  # rather than inlined per test so two callers cannot send subtly different queries and
+  # disagree about what the harness saw.
+  dnsQuery = "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB";
+
   # A test CA + leaf for the DoH provider hostnames only. The stock nodes trust
   # this CA so dnscrypt-proxy accepts the fake upstream. (Other impersonated
   # services, e.g. an iroh relay, mint their own cert with the same helper.)
@@ -138,5 +152,5 @@ let
   };
 in
 {
-  inherit dohDomains dohIpv4 dohIpv6 caFile certFile keyFile serverScript mkService;
+  inherit dohDomains dohIpv4 dohIpv6 dnsQuery caFile certFile keyFile serverScript mkService;
 }

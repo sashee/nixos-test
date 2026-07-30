@@ -337,7 +337,18 @@
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
-        machineModule = rpiConnectivitySystemModule;
+        # hosts/rpi5 also enables connectivity-fallback, whose check would fire at the
+        # production bootGrace of 5min -- inside a test that runs ~25 virtual minutes and
+        # whose whole subject is a reboot. It happens to be harmless today (this node has
+        # no wlan0, so the check takes its `iw`-failed fail-safe branch and starts nothing),
+        # but that leaves the only thing between this test and a competing reboot every
+        # bootGrace+setupTimeout sitting in an unrelated code path in another module. Push
+        # the deadline past the end of the test instead; the fallback units stay present, so
+        # this is still the deployed config.
+        machineModule = { ... }: {
+          imports = [ rpiConnectivitySystemModule ];
+          common.connectivityFallback.bootGrace = "3h";
+        };
         inherit dohStamps;
       };
       # Production timer constants under icount time-warp, on the real rpi config. Composes

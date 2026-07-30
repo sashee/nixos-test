@@ -48,9 +48,9 @@ let
   dohDomainsJson = builtins.toJSON interceptor.dohDomains;
 
   # A DoH GET aimed straight at one impersonated upstream, bypassing dnscrypt-proxy
-  # entirely: --resolve pins the address, so the probe needs no DNS at all. Same shape
-  # modules/connectivity-fallback.nix probes with, and it sends dohStamps.dnsQuery -- the
-  # identical query, from the one place that literal lives (lib/doh-stamps.nix).
+  # entirely: --resolve pins the address, so the probe needs no DNS at all. The query comes
+  # from the interceptor harness (tests/doh-interceptor.nix), i.e. the one place that
+  # literal lives, so the probe cannot ask something the fake upstream does not expect.
   #
   # This is what the 2026-07-29 rpi failure had no way to answer: dnscrypt-proxy was active
   # and listening while every dig timed out, and nothing in the dump distinguished "this
@@ -64,7 +64,7 @@ let
     "${pkgs.curl}/bin/curl -s -m 20 -o /dev/null -w '%{http_code} %{time_total}'"
     + " --resolve ${host}:443:${dial}"
     + " -H 'accept: application/dns-message'"
-    + " 'https://${host}/dns-query?dns=${dohStamps.dnsQuery}'";
+    + " 'https://${host}/dns-query?dns=${interceptor.dnsQuery}'";
   # Bracketed for v6: curl needs the brackets to tell the address apart from --resolve's
   # own host:port:addr colons.
   upstreamProbes = pkgs.lib.concatMap
