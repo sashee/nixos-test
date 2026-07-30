@@ -18,9 +18,9 @@
 # publishing a certificate hash, or needing different props or a different path -- has to
 # be taught to lib/doh-stamp-encode.nix, because a pasted stamp would reach dnscrypt-proxy
 # via `stamps` while being absent from `endpoints`: not golden-tested and not impersonated
-# by tests/doh-interceptor.nix. Both eval
-# guards (tests/doh-stamp-encode.nix and tests/doh-endpoints.nix) pin the full key set of
-# `stamps`, so they reject such an entry anyway.
+# by tests/doh-interceptor.nix. Both eval guards (tests/doh-stamp-encode.nix and
+# tests/doh-endpoints.nix) pin the full key set of `stamps`, so they reject such an entry
+# anyway.
 { lib }:
 
 let
