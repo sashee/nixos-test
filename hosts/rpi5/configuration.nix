@@ -17,9 +17,6 @@ let
     # The path count matters as much as the bytes: `nix` accumulates narinfo metadata per
     # path, and that growth (measured at 5.9 GB) is what forced a mid-build process restart
     # during the 2026-07-29 upgrade, so 16% fewer paths directly lowers the peak.
-    #
-    # claude and not opencode: opencode provides host-tools-mcp, which is the remote
-    # tooling channel into this box -- skipping it would cut off that access.
     skip  = [
       "chromium"
       "vkquake"
@@ -29,6 +26,7 @@ let
       "flameshot"
       "keepassxc"
       "claude"
+			"opencode"
     ];
   };
   no = lib.mkForce lib.kernel.no;
