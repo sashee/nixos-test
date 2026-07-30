@@ -380,6 +380,38 @@ github:sashee/nixos-test#iroh-ssh` works in place of an installed
 ssh -o ProxyCommand='iroh-ssh-connect <ticket>' user@laptop
 ```
 
+`modules/connectivity-watchdog.nix` reboots the host after a sustained DNS
+outage. It covers the one failure nothing else here can reach: the machine is on
+a network and its wifi stack is healthy, but nothing resolves — a wedged
+`dnscrypt-proxy`, a halted brcmfmac firmware, an IPv4LL lease, a broken route.
+`modules/connectivity-fallback.nix` deliberately ignores that case (its remedy is
+new wifi credentials, which cannot fix a wedged network stack), monitoring can
+only report it to a server that is by definition unreachable, and the iroh-ssh
+failsafe above only opens a port on the local network — which is no help on a
+headless box that nobody shares a LAN with. A reboot does fix those.
+
+Every hour it resolves one name through the host's own resolver at `127.0.0.1`
+and reboots once nothing has resolved for 24 hours. Three details are
+load-bearing rather than incidental. The query name is a **fresh random label**
+under `example.com` on every probe, because `dnscrypt-proxy`'s cache is keyed on
+the question and its `cache_max_ttl` defaults to exactly this module's threshold
+— one fixed name could be answered from cache for the entire window, hiding a
+real outage. Success is an explicit DNS **rcode**, not `dig`'s exit status: with
+every upstream unreachable `dnscrypt-proxy` answers SERVFAIL, which is a
+perfectly valid response, so `dig` exits 0 and an offline box would read as
+healthy. And the age is measured in **monotonic uptime**, never the wall clock,
+so NTP stepping the clock on a Pi 5 with no RTC battery cannot be mistaken for a
+day without DNS. The verdict is left in the journal rather than a breadcrumb
+file (journald is persistent by default), readable after the fact with
+`journalctl -b -1 -u connectivity-watchdog`.
+
+It is **off by default** — a laptop merely closed for two days must not reboot
+itself — and enabled only on the Raspberry Pi host. Evaluation fails unless
+`services.dnscrypt-proxy` is enabled (`modules/doh.nix`), since without a local
+resolver every probe would fail and a perfectly healthy machine would reboot on
+a timer. Tune with
+`common.connectivityWatchdog.{enable,afterSeconds,intervalSeconds,accuracySeconds}`.
+
 `modules/fonts.nix` contains common desktop fonts.
 
 `modules/development-base.nix` contains common CLI tools and direnv with
