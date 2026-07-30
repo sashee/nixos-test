@@ -8,15 +8,21 @@ let
     inherit unstable;
     nixgl = null;
     # Headless box, so the GUI programs go. Measured 2026-07-29 by diffing the nixUtils
-    # closure with and without the last four: 7.26 GB -> 5.74 GB, i.e. 1.52 GB and 385 of
-    # 2421 paths, and nothing outside this env references any of them. The tail is bigger
-    # than the programs themselves suggest -- vlc drags in qtdeclarative-5.15, openjdk-jre,
-    # samba, flite and freepats; keepassxc/flameshot drag in Qt 6 + gtk4; and one of them
-    # pulls a *second* systemd build (distinct store path from the system's own).
+    # closure with and without vlc + flameshot + keepassxc + claude: 7.26 GB -> 5.74 GB,
+    # i.e. 1.52 GB and 385 of 2421 paths, and nothing outside this env references any of
+    # them. The tail is bigger than the programs themselves suggest -- vlc drags in
+    # qtdeclarative-5.15, openjdk-jre, samba, flite and freepats; keepassxc/flameshot drag
+    # in Qt 6 + gtk4; and one of them pulls a *second* systemd build (distinct store path
+    # from the system's own).
     #
     # The path count matters as much as the bytes: `nix` accumulates narinfo metadata per
     # path, and that growth (measured at 5.9 GB) is what forced a mid-build process restart
     # during the 2026-07-29 upgrade, so 16% fewer paths directly lowers the peak.
+    #
+    # opencode came off separately, and only became skippable with the dotfiles bump that
+    # split host-tools-mcp into its own program: mcp-register/-prefix and the broker used
+    # to ride on opencode's and claude's `scripts`, so dropping both agents would have
+    # taken the registration CLIs -- the way this headless box is driven -- with them.
     skip  = [
       "chromium"
       "vkquake"
@@ -26,7 +32,7 @@ let
       "flameshot"
       "keepassxc"
       "claude"
-			"opencode"
+      "opencode"
     ];
   };
   no = lib.mkForce lib.kernel.no;
