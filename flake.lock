@@ -48,6 +48,22 @@
         "type": "github"
       }
     },
+    "monitoring-platform": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785516497,
+        "narHash": "sha256-7sMD3X6cJNLZklS3IkRVaiTmbiA4bYwiRtkTtdMo34g=",
+        "owner": "sashee",
+        "repo": "monitoring-platform",
+        "rev": "538f311c673358031e955ff1f7cad3848d100172",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sashee",
+        "repo": "monitoring-platform",
+        "type": "github"
+      }
+    },
     "nixos-images": {
       "inputs": {
         "nixos-stable": [
@@ -146,6 +162,7 @@
     "root": {
       "inputs": {
         "dotfiles": "dotfiles",
+        "monitoring-platform": "monitoring-platform",
         "nixos-raspberrypi": "nixos-raspberrypi",
         "nixpkgs": "nixpkgs_2",
         "nixpkgs-unstable": "nixpkgs-unstable"
