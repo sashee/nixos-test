@@ -113,6 +113,20 @@ in
     timerConfig.OnCalendar = "*:0/30";  # every 30 minutes (:00 and :30)
   };
 
+  # OTLP/HTTP measurement receiver storing device measurements in SQLite under
+  # /var/lib/monitoring-platform. Unrelated to common.monitoring above, which reports
+  # this host's own health to Healthchecks; this one collects measurements *from*
+  # devices. The module itself lives in the monitoring-platform input and is composed
+  # in by mkRpi5 (see flake.nix), not imported here.
+  #
+  # It listens on a unix socket only (RestrictAddressFamilies=AF_UNIX, enforced by the
+  # kernel), so there is no port for the default-deny firewall to open and no
+  # credential to provision: access is gated by the 0750 group-owned runtime directory,
+  # i.e. by membership of the `monitoring-platform` group. Nothing writes to it yet --
+  # upstream's remote (iroh) transport has not landed, so today it is a working but
+  # empty receiver reachable only from this host.
+  services.monitoring-platform.enable = true;
+
   users.users.nixos = {
     isNormalUser = true;
     extraGroups = [ "wheel" ];

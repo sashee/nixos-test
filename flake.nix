@@ -9,9 +9,17 @@
       url = "github:sashee/dotfiles/master";
       flake = false;
     };
+    # OTLP measurement receiver for the Pi (unix socket only). Deliberately not a
+    # flake, and consumed like dotfiles: nix/module.nix is a plain NixOS module and
+    # nix/package.nix a plain callPackage, so the service is built with the target
+    # system's own nixpkgs instead of a second pinned one nothing here deploys.
+    monitoring-platform = {
+      url = "github:sashee/monitoring-platform";
+      flake = false;
+    };
   };
 
-  outputs = { nixpkgs, nixpkgs-unstable, dotfiles, nixos-raspberrypi, ... }:
+  outputs = { nixpkgs, nixpkgs-unstable, dotfiles, nixos-raspberrypi, monitoring-platform, ... }:
     let
       system = "x86_64-linux";
       stateVersion = nixpkgs.lib.trivial.release;
@@ -73,6 +81,12 @@
         modules = [
           nixos-raspberrypi.nixosModules.sd-image
           ({ ... }: { imports = with nixos-raspberrypi.nixosModules; [ raspberry-pi-5.base ]; })
+          # External modules are composed here rather than imported from the host
+          # config: an `imports` entry has to be resolvable before module arguments
+          # exist, so a specialArg would be needed on every path that evaluates
+          # hosts/rpi5 -- including the test nodes, which cannot pass one through the
+          # upstream VM harness. rpiSystemModule below imports the same path.
+          "${monitoring-platform}/nix/module.nix"
           ./hosts/rpi5/configuration.nix
         ] ++ modules;
       };
@@ -196,8 +210,14 @@
       # The real rpi system config as a test node (hosts/rpi5 on the rpi kernel, with
       # the nix-utils args mkRpi5 passes via specialArgs). All rpi tests build on this
       # so they exercise the deployed config.
+      # The monitoring-platform module comes along because hosts/rpi5 sets one of its
+      # options; mkRpi5 composes it the same way, so both paths declare it exactly once.
       rpiSystemModule = { ... }: {
-        imports = [ ./hosts/rpi5/configuration.nix rpiTestKernel ];
+        imports = [
+          ./hosts/rpi5/configuration.nix
+          rpiTestKernel
+          "${monitoring-platform}/nix/module.nix"
+        ];
         _module.args = rpiSystemArgs;
       };
       # The deployed rpi config as a connectivity-test node: only what cannot work in a VM
@@ -309,6 +329,31 @@
           }
         ];
         user = "nixos";
+      };
+      # The monitoring platform's own VM suite, run against the REAL rpi config. Its
+      # repo ships the same cases against a synthetic machine, but calls that the
+      # weaker run on purpose: the assertions are about systemd sandboxing
+      # (RestrictAddressFamilies, SystemCallFilter, ProtectSystem=strict), whose
+      # semantics depend on the systemd version the target actually boots, so the
+      # consumer-side run is the one that decides whether the hardening is correct
+      # (its SPEC.md 11.1). Only the Pi deploys the service, hence no x86 variant.
+      # Cases: `platform` runs the lightweight ones (readiness, ingest, socket-access,
+      # hardening) as subtests on one VM; restart/ordering/crash-recovery get their own.
+      monitoringPlatformTestsRpi = import "${monitoring-platform}/nix/tests/lib.nix" {
+        pkgs = pkgsRpi;
+        machineModules = [
+          rpiQuiescedSystemModule
+          {
+            # Same reason as rpiNixUtilsTests: the harness sets no node hostName, so
+            # without one the rpi config's mkDefault ties with the framework's.
+            networking.hostName = "monitoring-platform-test";
+            system.stateVersion = rpi5Base.config.system.stateVersion;
+            virtualisation.memorySize = nixpkgs.lib.mkDefault 2048;
+            # The tunnel has no credential in a VM so the unit would only skip, but
+            # keep the node deterministic: nothing here is about remote access.
+            common.irohSsh.enable = nixpkgs.lib.mkForce false;
+          }
+        ];
       };
       # The trigger-semantics regression test for the 2026-07-27 outage, on the REAL rpi
       # config (exact Pi kernel, live doh egress rules, live firewall -- so the setup
@@ -428,7 +473,16 @@
         boot-clock = bootClockTestRpi;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
-        rpiNixUtilsTests)) // {
+        rpiNixUtilsTests)
+      # The harness's `platform` key is its shared-VM run, so it takes the bare name
+      # and the isolated cases get suffixed. dropKvm applies because these are inside
+      # the mapAttrs argument: upstream only drops it in its own nix/tests/default.nix,
+      # which we do not import.
+      // (nixpkgs.lib.mapAttrs'
+        (name: test: nixpkgs.lib.nameValuePair
+          (if name == "platform" then "monitoring-platform" else "monitoring-platform-${name}")
+          test)
+        monitoringPlatformTestsRpi)) // {
         # Pure build check, no VM: every module in hosts/rpi5/required-modules.txt
         # exists in the Pi kernel (see modules/required-kernel-modules.nix). Kept
         # outside the dropKvm mapAttrs since it isn't a runTest derivation.

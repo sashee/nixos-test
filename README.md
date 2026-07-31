@@ -297,6 +297,27 @@ the URL credential) or evaluation fails. Disable the whole check with
 `common.monitoring.report.enable = false`. See `common.monitoring.*` to tune each
 check.
 
+The **monitoring platform** is a separate thing that reads confusingly close to
+the above: `modules/monitoring.nix` reports a host's *own* health outward, while
+the platform *collects* measurements from devices. It is an OTLP/HTTP receiver
+(protobuf, logs signal, events only) storing arbitrary measurements — CPU load,
+GPS position, heart rate — in SQLite at `/var/lib/monitoring-platform`. It lives
+in its own repository and is consumed as the non-flake `monitoring-platform`
+input, exactly like `dotfiles`: `nix/module.nix` is a plain NixOS module and
+`nix/package.nix` a plain `callPackage`, so the binary is built with the target
+system's nixpkgs rather than a second pinned one. `mkRpi5` composes the module in
+(an `imports` entry must resolve before module arguments exist, so the host
+config cannot import it itself), and `hosts/rpi5` enables it with
+`services.monitoring-platform.enable = true`. It listens on a **unix socket
+only** — `RestrictAddressFamilies = [ "AF_UNIX" ]` makes that a kernel guarantee
+— so there is no port for the firewall to open and no credential to provision;
+reaching it means being in the `monitoring-platform` group, which owns the 0750
+runtime directory. Nothing produces measurements yet: upstream's remote (iroh)
+transport has not landed, so today the Pi runs a working but empty receiver.
+Upstream's own VM suite runs against the real Pi configuration as the
+`monitoring-platform*` aarch64 checks, which is the run that decides whether its
+hardening is right for the systemd the Pi actually boots.
+
 `modules/iroh-ssh.nix` keeps the laptop SSH-reachable by node identity
 instead of IP: a hardened long-running service runs `iroh-ssh-listen` (a small
 tool in `packages/iroh-ssh`, built on [iroh](https://iroh.computer))
