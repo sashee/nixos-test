@@ -337,6 +337,14 @@ systemd-timesyncd reports the clock synchronised, because the RTC-less Pi would
 otherwise write permanent 1970-dated rows into a store that has no retention;
 and a receiver that is down makes the unit **fail** rather than skip, since a
 silently-green unit that stopped measuring is the failure mode worth avoiding.
+The clock gate is tested against a real NTP server rather than a hand-placed
+marker file: the check runs a second node with chrony (`local stratum 10`, so an
+island with no upstream still serves a usable reference) and asserts that the
+host records nothing while that daemon is down, starts recording once
+`systemd-timesyncd` syncs to it, and stops again when it goes away. That helper
+node takes the same `-rtc base=tomorrow 10:00` as the node under test
+(`lib/test-rtc-base.nix`) — otherwise it would serve real wall-clock time and
+step the machine a day backwards mid-test.
 It is opt-in (`common.systemMetrics.enable`) and enabled wherever a receiver
 runs. `system-metrics --dry-run` prints the batch a run would send without
 sending it. Covered end to end by the `system-metrics` check on both x86 and

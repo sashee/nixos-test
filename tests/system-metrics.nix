@@ -21,10 +21,50 @@ nixpkgs.lib.nixos.runTest {
     common.monitoring.enable = lib.mkForce false;
     common.irohSsh.enable = lib.mkForce false;
 
-    # Restored, not overridden: requireClockSync follows services.timesyncd.enable, which the
-    # VM harness forces off, so without this the node would silently drop the clock gate that
-    # every real host runs with. The marker timesyncd would write is faked in the script.
-    common.systemMetrics.requireClockSync = true;
+    # Restored, not overridden. qemu-vm.nix disables timesyncd on every test node, which would
+    # take `requireClockSync` (it follows services.timesyncd.enable) down with it and quietly
+    # drop the clock gate every real host runs behind. mkForce because that definition is at
+    # normal priority, so a plain `true` fails to merge.
+    services.timesyncd = {
+      enable = lib.mkForce true;
+      servers = [ "ntp-server" ];
+      # The nixos pool is unreachable from a test net; without this timesyncd would keep
+      # retrying it and the "no working NTP" state below would be noisier than it needs to be.
+      fallbackServers = [ ];
+    };
+
+    system.stateVersion = stateVersion;
+  };
+
+  # The only time source on this network. Its own node because chrony, ntpd and openntpd all
+  # `mkForce services.timesyncd.enable = false` -- a real NTP daemon cannot sit next to the
+  # timesyncd client it is meant to serve.
+  nodes.ntp = { lib, ... }: {
+    networking.hostName = "ntp-server";
+    networking.firewall.allowedUDPPorts = [ 123 ];
+    # Helper node, tiny workload: keeps the two-VM run affordable under aarch64 TCG.
+    virtualisation.memorySize = 512;
+
+    # The same RTC base the node under test runs on. Without it this node would serve real
+    # wall-clock time to a client pinned at tomorrow-10:00, and timesyncd would step that
+    # client 10-34 hours BACKWARDS mid-test -- rearming the nix-gc Persistent timers the
+    # pinning exists to avoid, and breaking the "each run appends a newer batch" assertion
+    # below. `date -d tomorrow` is day-truncated, so both nodes resolve to the same instant.
+    virtualisation.qemu.options = [ (import ../lib/test-rtc-base.nix pkgs.coreutils) ];
+
+    services.chrony = {
+      enable = true;
+      # An island: there is no upstream to reach, and `local` is what makes chronyd offer its
+      # own clock as a valid reference anyway instead of refusing to answer until it syncs.
+      servers = [ ];
+      extraConfig = ''
+        local stratum 10
+        allow all
+      '';
+    };
+    # Not started at boot: "no working NTP" is the state the first subtest needs, and starting
+    # this daemon is how the test flips the machine to "the clock is real now".
+    systemd.services.chronyd.wantedBy = lib.mkForce [ ];
 
     system.stateVersion = stateVersion;
   };
@@ -59,15 +99,50 @@ nixpkgs.lib.nixos.runTest {
         return [m["body"] for m in measurements if m["type"] == kind]
 
 
+    MARKER = "/run/systemd/timesync/synchronized"
+
+
+    def unix_seconds(node):
+        return int(node.succeed("date +%s").strip())
+
+
+    start_all()
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("monitoring-platform.service")
+    ntp.wait_for_unit("multi-user.target")
 
-    # The unit is conditioned on timesyncd's "clock is real now" marker, and a test VM has no
-    # NTP server to reach, so stand the marker up by hand -- the skip path it guards gets its
-    # own subtest at the end.
-    machine.succeed(
-        "mkdir -p /run/systemd/timesync && touch /run/systemd/timesync/synchronized"
-    )
+    with subtest("a host that does not know the time records nothing"):
+        # The natural state of a freshly booted machine whose only NTP server is down. Nothing
+        # here fakes it: chronyd is simply not started yet.
+        machine.fail(f"test -e {MARKER}")
+        # Asserted on the unit file: systemd exposes conditions as an opaque `Conditions`
+        # array, not as a per-type property `systemctl show` can be asked for.
+        machine.succeed(
+            f"systemctl cat system-metrics.service | grep -Fx 'ConditionPathExists={MARKER}'"
+        )
+
+        # An unmet condition is a no-op, not a failure -- the host is not broken, it just does
+        # not know what time it is -- so the start succeeds and the receiver stays empty.
+        machine.succeed("systemctl start system-metrics.service")
+        assert query("limit=10") == [], (
+            "a host with no synchronised clock must not store measurements"
+        )
+
+    with subtest("the gate opens once NTP works"):
+        ntp.succeed("systemctl start chronyd.service")
+        ntp.wait_for_unit("chronyd.service")
+
+        before = unix_seconds(machine)
+        # RuntimeDirectory=, so a restart clears the marker and re-polls immediately: a clean
+        # edge trigger rather than waiting out timesyncd's poll interval.
+        machine.succeed("systemctl restart systemd-timesyncd.service")
+        machine.wait_for_file(MARKER)
+
+        # Both nodes share the RTC base, so synchronising must be a nudge and not a leap. A
+        # ~24h step would mean the helper node lost the base and served real wall-clock time,
+        # which would otherwise surface much later as a baffling assertion failure.
+        drift = abs(unix_seconds(machine) - before)
+        assert drift < 300, f"synchronising moved the clock by {drift}s; the nodes disagree"
 
     with subtest("the collector is wired to a timer, not run by hand"):
         machine.succeed("systemctl is-active system-metrics.timer")
@@ -189,17 +264,23 @@ nixpkgs.lib.nixos.runTest {
         # Ordered event_time DESC, so the newest is first and must be strictly newer.
         assert int(after[0]["event_time_unix_nano"]) > int(before[0]["event_time_unix_nano"])
 
-    with subtest("an unsynchronised clock skips the run rather than dating it 1970"):
-        machine.succeed("rm -f /run/systemd/timesync/synchronized")
+    with subtest("losing NTP closes the gate again"):
+        # The operationally important half: a host that loses its time source stops recording
+        # rather than carrying on with a clock nobody is correcting.
+        ntp.succeed("systemctl stop chronyd.service")
+        machine.succeed("systemctl restart systemd-timesyncd.service")
+        machine.wait_until_fails(f"test -e {MARKER}", timeout=60)
+
         machine.succeed("systemctl reset-failed system-metrics.service")
         before = query("type=system.memory&limit=20")
-        # Condition unsatisfied: systemd reports the start as a success and runs nothing, which
-        # is the honest description -- the host simply does not know the time yet.
         machine.succeed("systemctl start system-metrics.service")
         assert query("type=system.memory&limit=20") == before, (
             "a run with no synchronised clock must not store anything"
         )
-        machine.succeed("touch /run/systemd/timesync/synchronized")
+
+        ntp.succeed("systemctl start chronyd.service")
+        machine.succeed("systemctl restart systemd-timesyncd.service")
+        machine.wait_for_file(MARKER)
 
     with subtest("a receiver that is down fails the run instead of skipping it"):
         # There is deliberately no ConditionPathExists on the socket: a condition would mark
