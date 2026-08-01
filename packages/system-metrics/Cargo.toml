@@ -1,0 +1,19 @@
+[package]
+name = "system-metrics"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Collect basic host metrics and report them to a local monitoring-platform receiver over its unix socket"
+
+[dependencies]
+# The same crate the receiver decodes with, so the message definitions cannot drift.
+# `gen-tonic-messages` gives the prost message structs without the gRPC transport;
+# `logs` is what unlocks the logs/collector modules (this receiver only takes logs).
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs"] }
+prost = "0.14"
+# Safe statvfs wrapper: AGENTS.md asks for no unsafe blocks, and std has no statvfs.
+rustix = { version = "1", features = ["fs"] }
+
+[[bin]]
+name = "system-metrics"
+path = "src/main.rs"

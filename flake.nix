@@ -28,10 +28,25 @@
         inherit system;
         config.allowUnfree = true;
       };
-      commonDesktopHostModule = { ... }: {
-        imports = [ ./modules/common-desktop.nix ];
+      commonDesktopHostModule = { config, ... }: {
+        imports = [
+          ./modules/common-desktop.nix
+          # TEMPORARY. The measurement receiver is a Pi feature; it is composed in here so the
+          # x86 desktop config has one too, which is what lets the system-metrics producer be
+          # tested in a fast x86 VM instead of only under aarch64 TCG. Deliberately NOT in
+          # hosts/anya-feher-laptop/configuration.nix: that host composes its own module list
+          # (anyaFeherLaptopHostModule) and so is untouched by this.
+          "${monitoring-platform}/nix/module.nix"
+        ];
         _module.args.commonDotfiles = dotfiles;
         _module.args.unstable = unstable;
+
+        services.monitoring-platform.enable = true;
+        common.systemMetrics = {
+          enable = true;
+          socketPath = config.services.monitoring-platform.socketPath;
+          group = config.services.monitoring-platform.group;
+        };
       };
       # VM-test guest clock: tomorrow at 10:00 UTC, computed when the VM starts
       # (qemu-vm.nix splices options unescaped into the start script, so the $()
@@ -271,6 +286,15 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiSystemModule;
       };
+      # The measurement producer against the receiver the Pi actually deploys. Slow here (TCG),
+      # which is why the same file also runs as a generic x86 check.
+      systemMetricsTestRpi = import ./tests/system-metrics.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+        globalTimeout = 1800;
+      };
       nixGcRetentionTestRpi = import ./tests/nix-gc-retention.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
@@ -479,6 +503,7 @@
         iroh-ssh = irohSshTestRpi;
         restic = resticTestRpi;
         boot-clock = bootClockTestRpi;
+        system-metrics = systemMetricsTestRpi;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
         rpiNixUtilsTests)
@@ -556,6 +581,10 @@
       zramTest = import ./tests/zram.nix {
         inherit nixpkgs pkgs stateVersion;
         machineModule = ./modules/laptop-base.nix;
+      };
+      systemMetricsTest = import ./tests/system-metrics.nix {
+        inherit nixpkgs pkgs stateVersion;
+        machineModule = commonDesktopModule;
       };
       nixGcRetentionTest = import ./tests/nix-gc-retention.nix {
         inherit nixpkgs pkgs stateVersion;
@@ -834,6 +863,7 @@
         connectivity-watchdog = connectivityWatchdogTest;
         connectivity-fallback-timing = connectivityFallbackTimingTest;
         zram = zramTest;
+        system-metrics = systemMetricsTest;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
         nixUtilsTests));

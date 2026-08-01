@@ -45,6 +45,7 @@ in
     ../../modules/restic.nix
     ../../modules/auto-upgrade.nix
     ../../modules/monitoring.nix
+    ../../modules/system-metrics.nix
     ../../modules/connectivity-fallback.nix
     ../../modules/connectivity-watchdog.nix
     ../../modules/iroh-ssh.nix
@@ -123,10 +124,19 @@ in
   # It listens on a unix socket only (RestrictAddressFamilies=AF_UNIX, enforced by the
   # kernel), so there is no port for the default-deny firewall to open and no
   # credential to provision: access is gated by the 0750 group-owned runtime directory,
-  # i.e. by membership of the `monitoring-platform` group. Nothing writes to it yet --
-  # upstream's remote (iroh) transport has not landed, so today it is a working but
-  # empty receiver reachable only from this host.
+  # i.e. by membership of the `monitoring-platform` group. Remote devices still cannot
+  # reach it -- upstream's iroh transport has not landed -- so its only producer today is
+  # this host's own system-metrics collector below.
   services.monitoring-platform.enable = true;
+
+  # First producer for the receiver: CPU, memory, filesystem usage and the current NixOS
+  # generation, every 5 minutes. Wired from the receiver's own options rather than
+  # restating its defaults, so the socket path and group cannot drift apart.
+  common.systemMetrics = {
+    enable = true;
+    socketPath = config.services.monitoring-platform.socketPath;
+    group = config.services.monitoring-platform.group;
+  };
 
   users.users.nixos = {
     isNormalUser = true;

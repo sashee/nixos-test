@@ -312,11 +312,42 @@ config cannot import it itself), and `hosts/rpi5` enables it with
 only** — `RestrictAddressFamilies = [ "AF_UNIX" ]` makes that a kernel guarantee
 — so there is no port for the firewall to open and no credential to provision;
 reaching it means being in the `monitoring-platform` group, which owns the 0750
-runtime directory. Nothing produces measurements yet: upstream's remote (iroh)
-transport has not landed, so today the Pi runs a working but empty receiver.
-Upstream's own VM suite runs against the real Pi configuration as the
-`monitoring-platform*` aarch64 checks, which is the run that decides whether its
-hardening is right for the systemd the Pi actually boots.
+runtime directory. Remote devices still cannot reach it — upstream's iroh
+transport has not landed — so its only producer today is the host's own
+`modules/system-metrics.nix`, below. Upstream's own VM suite runs against the
+real Pi configuration as the `monitoring-platform*` aarch64 checks, which is the
+run that decides whether its hardening is right for the systemd the Pi actually
+boots.
+
+`modules/system-metrics.nix` is that producer: a systemd oneshot on a 15-minute
+timer that collects the host's CPU (load, core count, utilisation over a
+1-second `/proc/stat` sample), memory (including swap), per-filesystem usage and
+current NixOS generation, and posts them to the receiver as one OTLP batch —
+five measurement types, `system.cpu` / `system.memory` / `system.filesystem` /
+`system.generation` / `system.host`, each carrying `resource.attributes.host.name`
+so one query can serve a whole fleet later. The receiver only speaks binary OTLP
+protobuf and requires a non-empty `LogRecord.event_name` per record, so the
+producer is a small Rust binary in `packages/system-metrics` built on the same
+`opentelemetry-proto` crate the receiver decodes with, rather than a shell
+script. It runs under `DynamicUser` whose only privilege is membership of the
+receiver's group, and `RestrictAddressFamilies = [ "AF_UNIX" ]` makes "this
+never talks to the network" a kernel guarantee on the producer side too. Two
+behaviours worth knowing: a run is skipped (not failed) until
+systemd-timesyncd reports the clock synchronised, because the RTC-less Pi would
+otherwise write permanent 1970-dated rows into a store that has no retention;
+and a receiver that is down makes the unit **fail** rather than skip, since a
+silently-green unit that stopped measuring is the failure mode worth avoiding.
+It is opt-in (`common.systemMetrics.enable`) and enabled wherever a receiver
+runs. `system-metrics --dry-run` prints the batch a run would send without
+sending it. Covered end to end by the `system-metrics` check on both x86 and
+aarch64: it posts through the real socket and reads the results back out of the
+receiver's own query API, which is what verifies the encoding.
+
+The generic x86 desktop configuration **temporarily** composes the receiver in
+too (`commonDesktopHostModule` in `flake.nix`), purely so the producer has a
+fast x86 VM target instead of only the slow aarch64 TCG one.
+`hosts/anya-feher-laptop` composes its own module list and is deliberately
+untouched by that.
 
 `modules/iroh-ssh.nix` keeps the laptop SSH-reachable by node identity
 instead of IP: a hardened long-running service runs `iroh-ssh-listen` (a small
