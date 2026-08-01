@@ -72,6 +72,17 @@
         nixUtilsTests;
       dohStamps = import ./lib/doh-stamps.nix { lib = nixpkgs.lib; };
       resticLib = import ./lib/restic.nix { lib = nixpkgs.lib; };
+      # Everything that makes up the rpi5 host config: the config itself plus the
+      # external modules whose options it sets. Those cannot be imported from the host
+      # config -- an `imports` entry has to be resolvable before module arguments
+      # exist, so a specialArg would be needed on every path that evaluates hosts/rpi5,
+      # including the test nodes, which cannot pass one through the upstream VM
+      # harness. Every consumer composes this list instead (mkRpi5 for the deployed
+      # system, rpiNodeBase for the test nodes), so no path can lose a declaration.
+      rpi5HostModules = [
+        "${monitoring-platform}/nix/module.nix"
+        ./hosts/rpi5/configuration.nix
+      ];
       mkRpi5 = { modules ? [ ] }: nixos-raspberrypi.lib.nixosSystem {
         trustCaches = false;
         specialArgs = {
@@ -81,28 +92,26 @@
         modules = [
           nixos-raspberrypi.nixosModules.sd-image
           ({ ... }: { imports = with nixos-raspberrypi.nixosModules; [ raspberry-pi-5.base ]; })
-          # External modules are composed here rather than imported from the host
-          # config: an `imports` entry has to be resolvable before module arguments
-          # exist, so a specialArg would be needed on every path that evaluates
-          # hosts/rpi5 -- including the test nodes, which cannot pass one through the
-          # upstream VM harness. rpiSystemModule below imports the same path.
-          "${monitoring-platform}/nix/module.nix"
-          ./hosts/rpi5/configuration.nix
-        ] ++ modules;
+        ] ++ rpi5HostModules ++ modules;
       };
       # Laptop hosts: config lives in-repo; the machine-unique parts (LUKS
       # device, filesystems) stay on the device in hardware-configuration.nix.
       # The on-device stub flake builds the deployable system with
       #   common.lib.hosts.anya-feher-laptop { modules = [ ./hardware-configuration.nix ]; }
+      # The host config plus the module args it needs, as one module -- the same shape
+      # as commonDesktopHostModule above. Both the deployed system (mkAnyaFeherLaptop)
+      # and the test node (anyaFeherLaptopSystemModule) compose this, so neither path
+      # can drift from the other or lose an arg. External modules whose options the
+      # host config sets belong in this imports list too, for the reason spelled out
+      # on rpi5HostModules.
+      anyaFeherLaptopHostModule = { ... }: {
+        imports = [ ./hosts/anya-feher-laptop/configuration.nix ];
+        _module.args.commonDotfiles = dotfiles;
+        _module.args.unstable = unstable;
+      };
       mkAnyaFeherLaptop = { modules ? [ ] }: nixpkgs.lib.nixosSystem {
         inherit system;
-        modules = [
-          ./hosts/anya-feher-laptop/configuration.nix
-          {
-            _module.args.commonDotfiles = dotfiles;
-            _module.args.unstable = unstable;
-          }
-        ] ++ modules;
+        modules = [ anyaFeherLaptopHostModule ] ++ modules;
       };
       qemuGraphical = nixpkgs.lib.nixosSystem {
         inherit system;
@@ -190,35 +199,35 @@
       # rtc-pl031 (QEMU virt's RTC) must probe in the initrd so HCTOSYS sets the clock
       # before stage-2 timer units start: left to udev it can land minutes into a TCG
       # boot, and that late clock jump wakes Persistent timers (nix-gc) mid-test.
-      # Kernel pinning only. The -rtc flag lives in rpiTestKernel below rather than here
-      # because virtualisation.qemu.options is a list and QEMU merges -rtc options: a node
-      # that needs `clock=vm` (the icount timing test) would otherwise supply a second
-      # `base=` key alongside this one, and which wins is not defined. That test composes
-      # this module and owns its own -rtc.
-      rpiTestKernelPkg = { lib, ... }: {
+      # Kernel pinning only, no -rtc: that lives in rpiSystemModule below. See
+      # rpiNodeBase for why the two are separate.
+      rpiTestKernel = { lib, ... }: {
         boot.kernelPackages = lib.mkForce rpi5Base.config.boot.kernelPackages;
         boot.kernelPatches = lib.mkForce [ ];
         boot.initrd.kernelModules = [ "pci_host_generic" "rtc-pl031" ];
       };
-      rpiTestKernel = { ... }: {
-        imports = [ rpiTestKernelPkg ];
-        virtualisation.qemu.options = [ (testRtcBase pkgsRpi.coreutils) ];
-      };
-      # The nix-utils args mkRpi5 passes via specialArgs; needed by any node that imports
-      # hosts/rpi5/configuration.nix directly.
+      # The nix-utils args mkRpi5 passes via specialArgs; the VM harness has no
+      # specialArgs, so a test node re-supplies them as _module.args.
       rpiSystemArgs = { inherit dotfiles nixpkgs-unstable; nixpkgs-stable = nixpkgs; };
-      # The real rpi system config as a test node (hosts/rpi5 on the rpi kernel, with
-      # the nix-utils args mkRpi5 passes via specialArgs). All rpi tests build on this
-      # so they exercise the deployed config.
-      # The monitoring-platform module comes along because hosts/rpi5 sets one of its
-      # options; mkRpi5 composes it the same way, so both paths declare it exactly once.
-      rpiSystemModule = { ... }: {
-        imports = [
-          ./hosts/rpi5/configuration.nix
-          rpiTestKernel
-          "${monitoring-platform}/nix/module.nix"
-        ];
+      # The real rpi system config as a test node: rpi5HostModules (so the external
+      # modules whose options hosts/rpi5 sets are declared exactly as on the deployed
+      # system) on the pinned rpi kernel, with mkRpi5's specialArgs. Every rpi test
+      # node builds on this, so they all exercise the deployed config.
+      #
+      # Deliberately supplies no -rtc. virtualisation.qemu.options is a list and QEMU
+      # merges -rtc options, so a node that needs `clock=vm` (the icount timing test)
+      # must be the only contributor -- a second `base=` key alongside it resolves in
+      # no defined way. Such a node composes this; everything else takes the standard
+      # RTC base by composing rpiSystemModule.
+      rpiNodeBase = { ... }: {
+        imports = rpi5HostModules ++ [ rpiTestKernel ];
         _module.args = rpiSystemArgs;
+      };
+      # The default rpi test node: rpiNodeBase plus the repo's standard RTC base, so
+      # the real host timers stay enabled but can never elapse mid-test.
+      rpiSystemModule = { ... }: {
+        imports = [ rpiNodeBase ];
+        virtualisation.qemu.options = [ (testRtcBase pkgsRpi.coreutils) ];
       };
       # The deployed rpi config as a connectivity-test node: only what cannot work in a VM
       # is disabled (auto-upgrade needs /etc/nixos; monitoring needs credentials and its
@@ -397,9 +406,9 @@
         inherit dohStamps;
       };
       # Production timer constants under icount time-warp, on the real rpi config. Composes
-      # rpiTestKernelPkg + hosts/rpi5 rather than rpiSystemModule so this node owns the sole
-      # -rtc flag (it needs clock=vm; see rpiTestKernelPkg). irohSsh's failsafe is the one
-      # extra thing forced off: it is wantedBy=multi-user.target with Restart=always and
+      # rpiNodeBase rather than rpiSystemModule so this node owns the sole -rtc flag (it
+      # needs clock=vm; see rpiNodeBase). irohSsh's failsafe is the one extra thing forced
+      # off: it is wantedBy=multi-user.target with Restart=always and
       # rechecks every recheckIntervalSeconds=30 once its probe fails, so it would wake the
       # guest ~30x across the ~950 virtual seconds here and leave no idle gap for the clock
       # to warp through -- which is the entire mechanism this test measures. iroh-ssh.service
@@ -410,8 +419,7 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         rtcOption = "-rtc clock=vm,base=$(${pkgsRpi.coreutils}/bin/date -u -d tomorrow +%Y-%m-%dT10:00:00)";
         machineModule = { lib, ... }: {
-          imports = [ ./hosts/rpi5/configuration.nix rpiTestKernelPkg ];
-          _module.args = rpiSystemArgs;
+          imports = [ rpiNodeBase ];
           common.autoUpgrade.enable = lib.mkForce false;
           common.monitoring.enable = lib.mkForce false;
           common.irohSsh.failsafe.enable = lib.mkForce false;
@@ -600,13 +608,12 @@
         };
       };
       # The real anya-feher-laptop host config as a test node (mirrors
-      # rpiSystemModule; plain x86, so no kernel neutralization is needed).
-      # Feature tests run against it so a host-config change that breaks a
-      # feature fails that feature's -anya variant.
+      # rpiSystemModule; plain x86, so no kernel neutralization is needed). The RTC
+      # base is the only thing this layer adds to the deployed composition. Feature
+      # tests run against it so a host-config change that breaks a feature fails that
+      # feature's -anya variant.
       anyaFeherLaptopSystemModule = { ... }: {
-        imports = [ ./hosts/anya-feher-laptop/configuration.nix ];
-        _module.args.commonDotfiles = dotfiles;
-        _module.args.unstable = unstable;
+        imports = [ anyaFeherLaptopHostModule ];
         virtualisation.qemu.options = [ (testRtcBase pkgs.coreutils) ];
       };
       # Eval-only smoke check: force full evaluation (assertions included) of
