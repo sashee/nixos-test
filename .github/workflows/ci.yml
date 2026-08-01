@@ -200,7 +200,9 @@ jobs:
     # DIY auto-merge: main has no branch protection (so update-flake.yml can
     # push to it with the plain GITHUB_TOKEN), which also disables GitHub's
     # native auto-merge. `needs` gives the same semantics: this job only runs
-    # when both checks passed. Draft = "don't auto-merge yet". Owner-only so
+    # when both checks passed. Draft = "don't auto-merge yet": the payload flag
+    # below only skips runs that *started* draft, so the merge step re-reads it
+    # live (see the frozen-payload note on the triggers above). Owner-only so
     # fork PRs (read-only token anyway) are never merged unreviewed.
     needs: [full-build, rpi, host-checks]
     if: >
@@ -236,25 +238,42 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          current_main=$(gh api repos/${{ github.repository }}/branches/main --jq .commit.sha)
-          if [ "$current_main" != "$BASE_SHA" ]; then
-            echo "::error::main moved since CI ran ($BASE_SHA -> $current_main); update the PR branch to re-run CI against current main"
-            exit 1
-          fi
+          # Live PR facts in one call. All three can change after the run was
+          # triggered, and the job-level `if` only sees the frozen payload, so
+          # draft has to be re-read here or converting a ready PR to draft
+          # mid-run would still merge it. Assigned (not `read < <(gh ...)`)
+          # because under `bash -e` a failed command substitution aborts the
+          # step, while process substitution would swallow an API error into an
+          # empty state and read as a skip.
+          pr=$(gh pr view "$PR" --repo ${{ github.repository }} \
+            --json state,isDraft,headRefOid --jq '[.state, .isDraft, .headRefOid] | @tsv')
+          IFS=$'\t' read -r state is_draft current_head <<<"$pr"
 
-          state=$(gh pr view "$PR" --repo ${{ github.repository }} --json state --jq .state)
+          # Everything that means "this run has nothing left to do" comes
+          # first, so an intentional draft/close never mails the red
+          # main-moved error below.
           if [ "$state" != "OPEN" ]; then
             echo "::notice::skipping automerge: PR #$PR is $state (already handled elsewhere)"
+            exit 0
+          fi
+
+          if [ "$is_draft" = true ]; then
+            echo "::notice::skipping automerge: PR #$PR was converted to draft after CI started; mark it ready for review to re-run CI and merge"
             exit 0
           fi
 
           # Cheap up-front check for the common case, so the usual path does
           # not depend on GitHub's error wording. --match-head-commit below
           # still covers the narrow window between this check and the merge.
-          current_head=$(gh pr view "$PR" --repo ${{ github.repository }} --json headRefOid --jq .headRefOid)
           if [ "$current_head" != "$HEAD_SHA" ]; then
             echo "::notice::skipping automerge: PR #$PR was pushed after CI started ($HEAD_SHA -> $current_head); the run for the new head will merge it"
             exit 0
+          fi
+
+          current_main=$(gh api repos/${{ github.repository }}/branches/main --jq .commit.sha)
+          if [ "$current_main" != "$BASE_SHA" ]; then
+            echo "::error::main moved since CI ran ($BASE_SHA -> $current_main); update the PR branch to re-run CI against current main"
+            exit 1
           fi
 
           if out=$(gh pr merge "$PR" --rebase --repo ${{ github.repository }} --match-head-commit "$HEAD_SHA" 2>&1); then
@@ -264,6 +283,13 @@ jobs:
           echo "$out"
           if grep -qF 'Head branch was modified' <<<"$out"; then
             echo "::notice::skipping automerge: PR #$PR was pushed after CI started (head no longer $HEAD_SHA); the run for the new head will merge it"
+            exit 0
+          fi
+          # Drafted in the window between the check above and the merge. GitHub
+          # refuses to merge drafts, so nothing landed; re-read the flag rather
+          # than matching the error text, which is a generic "not mergeable".
+          if [ "$(gh pr view "$PR" --repo ${{ github.repository }} --json isDraft --jq .isDraft)" = true ]; then
+            echo "::notice::skipping automerge: PR #$PR became a draft while merging; mark it ready for review to re-run CI and merge"
             exit 0
           fi
           exit 1
