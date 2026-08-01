@@ -47,11 +47,18 @@ nixpkgs.lib.nixos.runTest {
     networking.hostName = "auto-upgrade-mocked-service";
     system.stateVersion = stateVersion;
 
+    # The mocks append to this; create it up front so the test can count it before the first
+    # upgrade run. The test driver runs every command with `set -euo pipefail`, so reading a
+    # missing file fails rather than counting zero.
+    systemd.tmpfiles.rules = [ "f /run/auto-upgrade-calls.log 0644 root root -" ];
+
     system.build.nixos-rebuild = lib.mkForce fakeNixosRebuild;
     systemd.services.nixos-upgrade.path = lib.mkBefore [ fakeNix ];
   };
 
   testScript = ''
+    import shlex
+
     machine.start()
     machine.wait_for_unit("multi-user.target")
 
@@ -60,28 +67,57 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("systemctl show nixos-upgrade.timer -p RandomizedDelayUSec --value | grep -F '2h'")
     machine.succeed("systemctl is-active --quiet nixos-upgrade.timer")
 
+    def prop(unit, name):
+        # Returned verbatim, not parsed: systemd renders these inconsistently -- the timer's
+        # LastTriggerUSecMonotonic comes out as "12.910274s" while the service's
+        # InactiveEnterTimestampMonotonic comes out as raw microseconds, and both are a bare
+        # "0" while unset. So compare them for *change*; a monotonic clock only moves
+        # forward, so "changed" means "advanced".
+        return machine.succeed(f"systemctl show {unit} -p {name} --value").strip()
+
+    def wait_until_changed(unit, name, previous):
+        machine.wait_until_succeeds(
+            f'test "$(systemctl show {unit} -p {name} --value)" != {shlex.quote(previous)}',
+            timeout=120,
+        )
+
     def calls():
-        return int(machine.succeed("cat /run/auto-upgrade-calls.log 2>/dev/null | wc -l").strip())
+        return int(machine.succeed("wc -l < /run/auto-upgrade-calls.log").strip())
 
-    def wait_idle():
-        machine.wait_until_succeeds("systemctl show nixos-upgrade.service -p ActiveState --value | grep -F inactive")
+    def trigger_daily_upgrade(day):
+        """Cross exactly one daily occurrence; return how many mocked calls that run logged.
 
-    # First trigger absorbs any boot-time Persistent catch-up firing (a variable
-    # baseline), so the test does not depend on how many times it fired at boot.
-    machine.succeed("date -s '2027-01-02 00:01:00'")
-    machine.succeed("date -s '2027-01-02 02:05:00'")
-    machine.wait_until_succeeds("systemctl show nixos-upgrade.service -p Result --value | grep -F success", timeout=120)
-    wait_idle()
-    baseline = calls()
+        Readiness comes from systemd's record of the timer firing and of the service
+        invocation ending -- NOT from Result/ActiveState, which already read
+        success/inactive for a unit that has never started. Both timestamps are
+        CLOCK_MONOTONIC, so the date jumps below cannot move them.
+        """
+        # Here `inactive` means only "nothing running right now" (also true when the unit
+        # never ran), so the snapshots are taken against a quiet unit.
+        machine.wait_until_succeeds(
+            "systemctl show nixos-upgrade.service -p ActiveState --value | grep -Fqx inactive"
+        )
+        before_trigger = prop("nixos-upgrade.timer", "LastTriggerUSecMonotonic")
+        before_finish = prop("nixos-upgrade.service", "InactiveEnterTimestampMonotonic")
+        before_calls = calls()
 
-    # Second, isolated trigger: crossing exactly one more daily occurrence must
-    # add exactly one run == two mocked calls (nix flake update + nixos-rebuild).
-    machine.succeed("date -s '2027-01-03 00:01:00'")
-    machine.succeed("date -s '2027-01-03 02:05:00'")
-    machine.wait_until_succeeds(f"test $(cat /run/auto-upgrade-calls.log | wc -l) -ge {baseline + 2}", timeout=120)
-    wait_idle()
+        # The 00:01 jump may land inside the 2h randomized delay window; 02:05 is past the
+        # whole window. Together they cross this day's occurrence exactly once.
+        machine.succeed(f"date -s '{day} 00:01:00'")
+        machine.succeed(f"date -s '{day} 02:05:00'")
 
-    assert calls() - baseline == 2, f"one upgrade should add 2 calls, got {calls() - baseline}"
+        wait_until_changed("nixos-upgrade.timer", "LastTriggerUSecMonotonic", before_trigger)
+        wait_until_changed("nixos-upgrade.service", "InactiveEnterTimestampMonotonic", before_finish)
+        machine.succeed("systemctl show nixos-upgrade.service -p Result --value | grep -qx success")
+        return calls() - before_calls
+
+    # One daily occurrence == one run == two mocked calls (nix flake update + nixos-rebuild).
+    first = trigger_daily_upgrade("2027-01-02")
+    assert first == 2, f"one upgrade should log 2 calls (nix flake update + nixos-rebuild), got {first}"
+
+    # The timer must re-arm: the next daily occurrence adds exactly one more run.
+    next_day = trigger_daily_upgrade("2027-01-03")
+    assert next_day == 2, f"the next day's occurrence should add 2 more calls, got {next_day}"
 
     machine.succeed("test \"$(tail -n 2 /run/auto-upgrade-calls.log | sed -n '1p')\" = 'nix flake update common --flake ${flakeRoot} --commit-lock-file'")
     machine.succeed("""
