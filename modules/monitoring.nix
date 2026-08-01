@@ -514,28 +514,7 @@ in
 
       excludeFsTypes = lib.mkOption {
         type = lib.types.listOf lib.types.str;
-        default = [
-          "tmpfs"
-          "devtmpfs"
-          "efivarfs"
-          "proc"
-          "sysfs"
-          "devpts"
-          "cgroup"
-          "cgroup2"
-          "pstore"
-          "securityfs"
-          "debugfs"
-          "tracefs"
-          "fusectl"
-          "configfs"
-          # Read-only / store-transport filesystems, not writable data volumes to alert
-          # on. In VM tests these expose the builder's host store (its real disk usage),
-          # which would otherwise make the check depend on the builder's free space.
-          "9p"
-          "virtiofs"
-          "erofs"
-        ];
+        default = import ../lib/exclude-fs-types.nix;
         description = "Filesystem types ignored by the disk-space check.";
       };
     };
