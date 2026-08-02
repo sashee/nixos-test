@@ -309,8 +309,13 @@ nixpkgs.lib.nixos.runTest {
         machine.wait_until_succeeds(
             "iw dev wlan0 link | grep -q 'SSID: HomeNet'", timeout=120
         )
+        # Association is not a lease: this waits out carrier pickup + DHCP + ACD.
+        # Under TCG dhcpcd can sit on wlan0's carrier long after iwd reports
+        # connected (65s observed in CI, while udev's event backlog from
+        # late-probing devices drained), then leases normally in a few seconds.
+        # Same wait costs ~10s on the KVM/x86 variant.
         machine.wait_until_succeeds(
-            "ip -4 -o addr show wlan0 | grep -q 192.168.77.", timeout=60
+            "ip -4 -o addr show wlan0 | grep -q 192.168.77.", timeout=180
         )
 
     with subtest("boot #2, station mode: AP ports are firewalled even with listeners bound"):
