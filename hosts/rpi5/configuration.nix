@@ -46,6 +46,7 @@ in
     ../../modules/auto-upgrade.nix
     ../../modules/monitoring.nix
     ../../modules/system-metrics.nix
+    ../../modules/time-sync.nix
     ../../modules/connectivity-fallback.nix
     ../../modules/connectivity-watchdog.nix
     ../../modules/iroh-ssh.nix

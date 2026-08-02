@@ -88,14 +88,28 @@ in
       '';
     };
 
+    syncedMarker = lib.mkOption {
+      type = lib.types.path;
+      default = "/run/systemd/timesync/synchronized";
+      description = ''
+        The path whose existence means "the clock is synchronised".
+
+        Which daemon owns the clock decides this, so it is an option rather than a constant:
+        systemd-timesyncd writes the default path itself, while chrony writes nothing of the
+        kind and `modules/time-sync.nix` points this at the marker its chrony-wait unit
+        creates. Getting it wrong in either direction is silent -- a marker that never appears
+        stops the collector forever, and one that appears too early puts pre-sync timestamps
+        into a store that cannot delete them.
+      '';
+    };
+
     requireClockSync = lib.mkOption {
       type = lib.types.bool;
       default = config.services.timesyncd.enable;
       defaultText = lib.literalExpression "config.services.timesyncd.enable";
       description = ''
-        Skip runs until systemd-timesyncd reports the clock synchronised, by conditioning the
-        unit on the `/run/systemd/timesync/synchronized` marker it writes after its first
-        successful sync.
+        Skip runs until the clock is reported synchronised, by conditioning the unit on
+        [](#opt-common.systemMetrics.syncedMarker).
 
         The Pi has no RTC battery, so between boot and the first sync its clock reads somewhere
         near the epoch. That timestamp is non-zero and therefore perfectly conforming, so the
@@ -106,8 +120,12 @@ in
 
         A skipped run is reported by systemd as a satisfied-condition no-op rather than a
         failure, which is the honest description: nothing is broken, the host just does not yet
-        know what time it is. Defaults off where timesyncd is not the time source, since the
-        marker would then never appear and the collector would never run at all.
+        know what time it is.
+
+        The default follows timesyncd only because that is the stock NixOS time source. It is
+        not "off unless timesyncd": `modules/time-sync.nix` turns it back on when chrony owns
+        the clock, which it must, since enabling chrony forces `services.timesyncd.enable` to
+        false and would otherwise switch this gate off on precisely the host that needs it.
       '';
     };
 
@@ -176,8 +194,7 @@ in
       # condition, not a check inside the collector, because systemd already knows how to skip
       # a unit without calling it a failure -- and because the marker is timesyncd's own answer
       # rather than this module guessing at a plausible date.
-      unitConfig.ConditionPathExists =
-        lib.mkIf cfg.requireClockSync "/run/systemd/timesync/synchronized";
+      unitConfig.ConditionPathExists = lib.mkIf cfg.requireClockSync cfg.syncedMarker;
 
       serviceConfig = {
         Type = "oneshot";

@@ -10,8 +10,17 @@
 # `dohStamps` is lib/doh-stamps.nix evaluated -- i.e. `{ providers, endpoints, stamps }`
 # -- and only `.providers` is used here.
 #
-# Used by tests/doh-upstream.nix, tests/iroh-ssh.nix and tests/connectivity-watchdog.nix.
-{ pkgs, dohStamps, readyFile ? "/tmp/doh-interceptor-ready", respond, name ? "doh-interceptor" }:
+# `responseHeaders` is an optional second Python function, `header_overrides(meta) -> dict`,
+# for tests that care about the response envelope rather than the DNS payload. A returned
+# value replaces the header the server would have sent, and `None` suppresses it entirely --
+# so `{"Date": None}` impersonates a provider that sends no Date, and `{"Age": "122"}` one
+# answering from a cache. Omitting the argument leaves every response byte-identical to
+# before, which is what the three DNS-only consumers rely on.
+#
+# Used by tests/doh-upstream.nix, tests/iroh-ssh.nix, tests/connectivity-watchdog.nix and
+# tests/rough-time.nix.
+{ pkgs, dohStamps, readyFile ? "/tmp/doh-interceptor-ready", respond, responseHeaders ? null
+, name ? "doh-interceptor" }:
 
 let
   lib = pkgs.lib;
@@ -56,9 +65,14 @@ let
   # framing helpers; the main loop owns TLS, GET/POST decode, the per-family
   # tag, and the readiness signal. Extra argv is exposed as meta["args"].
   serverScript = pkgs.writeText "${name}-server.py" ''
-    import base64, http.server, json, pathlib, socket, ssl, sys, threading, urllib.parse
+    import base64, email.utils, http.server, json, pathlib, socket, ssl, sys, threading, time, urllib.parse
 
     ARGS = sys.argv[1:]
+
+    def http_date(seconds):
+        # IMF-fixdate, the format RFC 9110 wants and the only one real servers send. Exposed
+        # to header_overrides so a test can name an instant without hand-formatting it.
+        return email.utils.formatdate(seconds, usegmt=True)
 
     def read_question(query):
         labels = []; off = 12
@@ -106,6 +120,8 @@ let
 
     ${respond}
 
+    ${if responseHeaders == null then "def header_overrides(meta): return {}" else responseHeaders}
+
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         family = "unknown"
@@ -121,7 +137,17 @@ let
                     "host": self.headers.get("host"),
                     "content_type": self.headers.get("content-type"), "args": ARGS}
             r = respond(query, meta)
-            self.send_response(200)
+            # send_response_only rather than send_response, so Date is emitted here and can
+            # therefore be overridden or suppressed. Absent an override the bytes are exactly
+            # what send_response would have produced: Server then Date, in that order.
+            extra = header_overrides(meta)
+            self.send_response_only(200)
+            self.send_header("Server", self.version_string())
+            if "Date" not in extra:
+                self.send_header("Date", self.date_time_string())
+            for key, value in extra.items():
+                if value is not None:
+                    self.send_header(key, value)
             self.send_header("content-type", "application/dns-message")
             self.send_header("content-length", str(len(r)))
             self.end_headers(); self.wfile.write(r)

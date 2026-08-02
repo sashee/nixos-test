@@ -10,6 +10,7 @@
     ./auto-upgrade.nix
     ./monitoring.nix
     ./system-metrics.nix
+    ./time-sync.nix
     ./iroh-ssh.nix
     ./fonts.nix
     ./development-base.nix

@@ -1,0 +1,38 @@
+[package]
+name = "rough-time"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Establish a rough system clock at boot from the Date headers of the configured DoH providers"
+
+[dependencies]
+# TLS. The whole design rests on being able to verify a chain at an instant of our choosing,
+# which rustls exposes (ServerCertVerifier::verify_server_cert takes `now`) and no other
+# client in the ecosystem does. `ring` rather than the default aws-lc-rs: aws-lc-rs wants
+# cmake/nasm at build time and package.nix carries no nativeBuildInputs, while ring builds
+# with the C compiler already in stdenv (packages/iroh-ssh depends on iroh's ring backend and
+# builds the same way).
+# HTTP, at whatever version the server negotiates over ALPN. Hand-rolling HTTP/1.1 would bake
+# in an assumption about the providers that is already false for two of them and could become
+# false for the rest at any time; this path runs rarely enough that the dependency weight is
+# the cheaper side of the trade. default-features off drops the bundled roots, the proxy
+# support and the codecs -- none of which belong in a boot-critical binary.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# The OS trust store. NOT webpki-roots: VM tests trust their CA through
+# security.pki.certificateFiles, which writes /etc/ssl/certs/ca-certificates.crt, and a client
+# with compiled-in roots would ignore it and fail every test for the wrong reason.
+rustls-native-certs = "0.8"
+# notBefore/notAfter, to intersect the chain's validity window. rustls parses certificates
+# only inside its verifier, and does not hand the dates back.
+x509-parser = "0.16"
+# clock_settime. AGENTS.md asks for no unsafe blocks, and std cannot set the clock.
+rustix = { version = "1", features = ["time"] }
+# adjtimex, to ask the kernel whether the clock is already disciplined. rustix 1.x does not
+# bind it and the crates that do are unvetted single-purpose packages, so this is the one
+# place the crate makes a raw call; see the SAFETY note in main.rs.
+libc = "0.2"
+
+[[bin]]
+name = "rough-time"
+path = "src/main.rs"
