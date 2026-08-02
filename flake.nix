@@ -30,6 +30,7 @@
       };
       commonDesktopHostModule = { config, ... }: {
         imports = [
+          timeSyncSettings
           ./modules/common-desktop.nix
           # TEMPORARY. The measurement receiver is a Pi feature; it is composed in here so the
           # x86 desktop config has one too, which is what lets the system-metrics producer be
@@ -48,6 +49,30 @@
           group = config.services.monitoring-platform.group;
         };
       };
+      # Turning time synchronisation on, for every host that does. `floor` is the reason this
+      # lives in flake.nix rather than in each host config: it is the bound on how far back a
+      # compromised provider could roll the clock, so it has to be a build-time constant, and
+      # `nixpkgs.lastModified` is the one in scope here (tests/restic.nix already uses it as a
+      # clock base for the same reason).
+      timeSyncSettings = {
+        common.timeSync = {
+          enable = true;
+          floor = nixpkgs.lastModified;
+        };
+      };
+      # The counterpart to qemu-vm.nix's `services.timesyncd.enable = false` ("Don't run ntpd
+      # in the guest. It should get the correct time from KVM."). That line neutralises the
+      # stock time daemon on every test node; chrony is now the time daemon, so without the
+      # same treatment every VM test acquires a daemon -- and a rough-time unit retrying
+      # forever against a network with no providers -- that argues with the ~10 tests which
+      # drive the clock with `date -s`.
+      #
+      # Priority 90 rather than mkForce: it has to beat the host config's normal-priority
+      # `enable = true`, while leaving mkForce free for the two tests that are ABOUT time and
+      # must switch it back on.
+      testNodeTimeSyncOff = { lib, ... }: {
+        common.timeSync.enable = lib.mkOverride 90 false;
+      };
       # VM-test guest clock: tomorrow at 10:00 UTC. See lib/test-rtc-base.nix for why, and
       # for why it is a file rather than a binding here (a test file needs it for a helper
       # node that must share the clock of the node under test).
@@ -55,7 +80,7 @@
       # The desktop config as a VM-test node; all tests use this variant so the
       # real host timers (nix-gc, ...) stay enabled but can never elapse mid-test.
       commonDesktopModule = { ... }: {
-        imports = [ commonDesktopHostModule ];
+        imports = [ commonDesktopHostModule testNodeTimeSyncOff ];
         virtualisation.qemu.options = [ (testRtcBase pkgs.coreutils) ];
       };
       qemuDemoUserModule = ./modules/qemu-demo-user.nix;
@@ -80,6 +105,7 @@
         })
         nixUtilsTests;
       dohStamps = import ./lib/doh-stamps.nix { lib = nixpkgs.lib; };
+      ntsServers = import ./lib/nts-servers.nix { lib = nixpkgs.lib; };
       resticLib = import ./lib/restic.nix { lib = nixpkgs.lib; };
       # Everything that makes up the rpi5 host config: the config itself plus the
       # external modules whose options it sets. Those cannot be imported from the host
@@ -90,6 +116,7 @@
       # system, rpiNodeBase for the test nodes), so no path can lose a declaration.
       rpi5HostModules = [
         "${monitoring-platform}/nix/module.nix"
+        timeSyncSettings
         ./hosts/rpi5/configuration.nix
       ];
       mkRpi5 = { modules ? [ ] }: nixos-raspberrypi.lib.nixosSystem {
@@ -114,7 +141,7 @@
       # host config sets belong in this imports list too, for the reason spelled out
       # on rpi5HostModules.
       anyaFeherLaptopHostModule = { ... }: {
-        imports = [ ./hosts/anya-feher-laptop/configuration.nix ];
+        imports = [ ./hosts/anya-feher-laptop/configuration.nix timeSyncSettings ];
         _module.args.commonDotfiles = dotfiles;
         _module.args.unstable = unstable;
       };
@@ -229,7 +256,7 @@
       # no defined way. Such a node composes this; everything else takes the standard
       # RTC base by composing rpiSystemModule.
       rpiNodeBase = { ... }: {
-        imports = rpi5HostModules ++ [ rpiTestKernel ];
+        imports = rpi5HostModules ++ [ rpiTestKernel testNodeTimeSyncOff ];
         _module.args = rpiSystemArgs;
       };
       # The default rpi test node: rpiNodeBase plus the repo's standard RTC base, so
@@ -427,6 +454,38 @@
         };
         inherit dohStamps;
       };
+      # The boot-time rough clock on the REAL rpi config -- the valuable variant, since the
+      # RTC-less Pi is the host that actually needs it: the deployed dnscrypt, the DoH egress
+      # rules and the default-deny firewall are all live around it.
+      roughTimeTestRpi = import ./tests/rough-time.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        inherit dohStamps;
+        # Same reasoning as connectivityWatchdogTestRpi: hosts/rpi5 enables
+        # connectivity-fallback, whose check would fire at the production 5min bootGrace
+        # inside a test whose retry subtests span far longer than that. Push the deadline
+        # past the end of the run rather than removing the units.
+        machineModule = { ... }: {
+          imports = [ rpiConnectivitySystemModule ./modules/time-sync.nix ];
+          common.connectivityFallback.bootGrace = "3h";
+        };
+        globalTimeout = 1800;
+      };
+      # The full time chain on the REAL rpi config: rough clock -> DNS -> chrony over NTS.
+      # The RTC-less Pi is the host the bootstrap deadlock actually happens to, so this is the
+      # variant that matters.
+      ntsSyncTestRpi = import ./tests/nts-sync.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        inherit dohStamps;
+        machineModule = { ... }: {
+          imports = [ rpiConnectivitySystemModule ./modules/time-sync.nix ];
+          common.connectivityFallback.bootGrace = "3h";
+        };
+        globalTimeout = 2400;
+      };
       # Production timer constants under icount time-warp, on the real rpi config. Composes
       # rpiNodeBase rather than rpiSystemModule so this node owns the sole -rtc flag (it
       # needs clock=vm; see rpiNodeBase). irohSsh's failsafe is the one extra thing forced
@@ -494,6 +553,8 @@
         connectivity-fallback = connectivityFallbackTestRpi;
         connectivity-fallback-trigger = connectivityFallbackTriggerTestRpi;
         connectivity-watchdog = connectivityWatchdogTestRpi;
+        rough-time = roughTimeTestRpi;
+        nts-sync = ntsSyncTestRpi;
         connectivity-fallback-timing = connectivityFallbackTimingTestRpi;
         monitoring-nix-gc = monitoringNixGcTestRpi;
         monitoring-iroh-ssh = monitoringIrohSshTestRpi;
@@ -628,6 +689,22 @@
       # with the watchdog module added and switched on. The feature ships only on the rpi,
       # so this variant exists for fast local feedback; the aarch64 variant against
       # hosts/rpi5 is the one that covers the deployed target.
+      # The rough clock on the generic desktop config, for fast local feedback; the aarch64
+      # variant against hosts/rpi5 is the one that covers the deployed target. The module is
+      # imported here rather than through common-desktop.nix so the test exercises it before
+      # any host switches its clock over to it.
+      roughTimeTest = import ./tests/rough-time.nix {
+        inherit nixpkgs pkgs stateVersion dohStamps;
+        machineModule = { ... }: {
+          imports = [ commonDesktopModule ./modules/time-sync.nix ];
+        };
+      };
+      ntsSyncTest = import ./tests/nts-sync.nix {
+        inherit nixpkgs pkgs stateVersion dohStamps;
+        machineModule = { ... }: {
+          imports = [ commonDesktopModule ./modules/time-sync.nix ];
+        };
+      };
       connectivityWatchdogTest = import ./tests/connectivity-watchdog.nix {
         inherit nixpkgs pkgs stateVersion dohStamps;
         machineModule = { ... }: {
@@ -644,7 +721,7 @@
       # tests run against it so a host-config change that breaks a feature fails that
       # feature's -anya variant.
       anyaFeherLaptopSystemModule = { ... }: {
-        imports = [ anyaFeherLaptopHostModule ];
+        imports = [ anyaFeherLaptopHostModule testNodeTimeSyncOff ];
         virtualisation.qemu.options = [ (testRtcBase pkgs.coreutils) ];
       };
       # Eval-only smoke check: force full evaluation (assertions included) of
@@ -669,6 +746,9 @@
       };
       dohEndpointsTest = import ./tests/doh-endpoints.nix {
         inherit pkgs dohStamps;
+      };
+      ntsServersTest = import ./tests/nts-servers.nix {
+        inherit pkgs ntsServers;
       };
       anyaFeherLaptopTest = import ./tests/anya-feher-laptop.nix {
         inherit nixpkgs pkgs stateVersion;
@@ -865,6 +945,8 @@
         connectivity-fallback = connectivityFallbackTest;
         connectivity-fallback-trigger = connectivityFallbackTriggerTest;
         connectivity-watchdog = connectivityWatchdogTest;
+        rough-time = roughTimeTest;
+        nts-sync = ntsSyncTest;
         connectivity-fallback-timing = connectivityFallbackTimingTest;
         system = systemTest;
         system-metrics = systemMetricsTest;
@@ -879,6 +961,7 @@
       evalChecks = {
         doh-stamp-encode = dohStampEncodeTest;
         doh-endpoints = dohEndpointsTest;
+        nts-servers = ntsServersTest;
       };
     in
     {
