@@ -750,6 +750,9 @@
       ntsServersTest = import ./tests/nts-servers.nix {
         inherit pkgs ntsServers;
       };
+      dohProvidersTest = import ./tests/doh-providers.nix {
+        inherit pkgs dohStamps;
+      };
       anyaFeherLaptopTest = import ./tests/anya-feher-laptop.nix {
         inherit nixpkgs pkgs stateVersion;
         machineModule = anyaFeherLaptopSystemModule;
@@ -962,6 +965,7 @@
         doh-stamp-encode = dohStampEncodeTest;
         doh-endpoints = dohEndpointsTest;
         nts-servers = ntsServersTest;
+        doh-providers = dohProvidersTest;
       };
     in
     {
