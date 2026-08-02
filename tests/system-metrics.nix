@@ -23,8 +23,14 @@ nixpkgs.lib.nixos.runTest {
 
     # Restored, not overridden. qemu-vm.nix disables timesyncd on every test node, which would
     # take `requireClockSync` (it follows services.timesyncd.enable) down with it and quietly
-    # drop the clock gate every real host runs behind. mkForce because that definition is at
-    # normal priority, so a plain `true` fails to merge.
+    # drop the clock gate. mkForce because that definition is at normal priority, so a plain
+    # `true` fails to merge.
+    #
+    # Note this is no longer the configuration the hosts deploy: they run chrony, which forces
+    # timesyncd off, and gate on /run/chrony-wait/synchronized instead (modules/time-sync.nix).
+    # This test keeps the timesyncd marker because it is the option's default and the cheaper
+    # way to exercise the gate MECHANISM -- one node, no NTS server. The deployed marker is
+    # asserted end to end by tests/nts-sync.nix, which has real chrony to synchronise.
     services.timesyncd = {
       enable = lib.mkForce true;
       servers = [ "ntp-server" ];

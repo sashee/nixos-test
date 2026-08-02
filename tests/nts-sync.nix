@@ -200,6 +200,19 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed("systemctl stop chronyd.service || true")
         machine.succeed(f"date -s '{when}'")
 
+    def start_collector():
+        # Returns systemd's own verdict on the unit's conditions. A condition that is not met
+        # makes `systemctl start` a satisfied no-op rather than an error, so the exit status
+        # says nothing -- ConditionResult is the observable.
+        #
+        # reset-failed first because a oneshot started back to back trips the start rate limit
+        # and would fail with "start-limit-hit" instead of running (tests/system-metrics.nix:86).
+        machine.succeed("systemctl reset-failed system-metrics.service || true")
+        machine.succeed("systemctl start system-metrics.service")
+        return machine.succeed(
+            "systemctl show -p ConditionResult --value system-metrics.service"
+        ).strip()
+
     def resync():
         # Drop everything chrony knows and make it start over, so a subtest cannot pass on a
         # measurement taken before it changed anything.
@@ -208,6 +221,22 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed("systemctl reset-failed chrony-wait.service || true")
         machine.succeed("systemctl restart chronyd.service")
         machine.succeed("systemctl start --no-block chrony-wait.service")
+
+    with subtest("the collector is gated on chrony's marker, not timesyncd's"):
+        # This wiring is why the RTC-less Pi does not write 1970-dated rows into a store that
+        # has no retention, and until now nothing asserted it. tests/system-metrics.nix covers
+        # the timesyncd marker, which no host uses any more -- enabling chrony forces timesyncd
+        # off -- so the deployed gate was evaluated by these tests and checked by none of them.
+        machine.succeed(
+            f"systemctl cat system-metrics.service | grep -Fx 'ConditionPathExists={MARKER}'"
+        )
+
+        # Nothing has synchronised yet, so the collector must hold back even though the clock
+        # is perfectly capable of producing a timestamp -- that is exactly the trap, since the
+        # timestamp it would produce is wrong and permanent.
+        machine.fail(f"test -e {MARKER}")
+        condition = start_collector()
+        assert condition == "no", f"the collector ran before the clock was synchronised ({condition})"
 
     with subtest("with the clock years out, nothing resolves"):
         # The deadlock the rough clock exists to break, demonstrated rather than assumed.
@@ -246,6 +275,17 @@ nixpkgs.lib.nixos.runTest {
         # silently did not happen.
         authdata = machine.succeed("${pkgs.chrony}/bin/chronyc -N authdata")
         assert "NTS" in authdata, authdata
+
+    with subtest("the collector is released once chrony has synchronised"):
+        # The other half of the gate. Asserting only the closed side would pass just as well
+        # with a marker path that can never appear, which would silently stop collection
+        # forever -- the failure modules/system-metrics.nix warns about in both directions.
+        condition = start_collector()
+        assert condition == "yes", f"the collector is still gated after synchronisation ({condition})"
+        machine.log(
+            "collector run result: "
+            + machine.succeed("systemctl show -p Result --value system-metrics.service")
+        )
 
     with subtest("the rough clock stands down once something has synchronised"):
         # The STA_UNSYNC no-op path, which tests/rough-time.nix cannot reach because nothing

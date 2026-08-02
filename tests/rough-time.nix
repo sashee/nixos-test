@@ -292,6 +292,54 @@ nixpkgs.lib.nixos.runTest {
         rough_time("--only cloudflare,google", expect_success=True)
         connect_upstream()
 
+    with subtest("a v6-only host still gets a clock"):
+        # The mirror, and not redundant: the two families are separate code paths all the way
+        # down -- separate addresses in lib/doh-stamps.nix, separate sockets, separate routes --
+        # and this repo already treats an asymmetry between them as serious enough to run a
+        # dedicated v6-only client in tests/doh-upstream.nix. With only v4 blackholed, a
+        # provider is reachable solely over IPv6, so this also proves an address the v4-only
+        # subtest never needs is genuinely dialled rather than merely configured.
+        clear_control()
+        disconnect_upstream(v4=True, v6=False)
+        rough_time("--only cloudflare,google", expect_success=True)
+        connect_upstream()
+
+    with subtest("the unit keeps exactly the privilege it needs"):
+        # Setting the clock is why this unit is not sandboxed like the others, so the shape of
+        # that exception is worth pinning: everything here is deliberate, and a later refactor
+        # that widened it would otherwise pass every test in the repo.
+        def unit_property(name):
+            return machine.succeed(
+                f"systemctl show -p {name} --value rough-time.service"
+            ).strip()
+
+        # Exactly one capability. `CAP_SYS_TIME` alone is the whole reason the unit is
+        # privileged; anything else in the bounding set is scope it does not need.
+        bounding = unit_property("CapabilityBoundingSet")
+        assert bounding == "cap_sys_time", f"bounding set is {bounding!r}, expected cap_sys_time"
+        ambient = unit_property("AmbientCapabilities")
+        assert ambient == "cap_sys_time", f"ambient set is {ambient!r}, expected cap_sys_time"
+
+        # Deliberately off -- the unit exists to change the clock -- so pin it rather than
+        # leave it looking like an oversight someone should "fix".
+        protect_clock = unit_property("ProtectClock")
+        assert protect_clock == "no", f"ProtectClock is {protect_clock!r}; the unit cannot set the clock with it on"
+
+        for name in [
+            "NoNewPrivileges",
+            "RestrictSUIDSGID",
+            "MemoryDenyWriteExecute",
+            "ProtectKernelModules",
+            "ProtectKernelTunables",
+            "LockPersonality",
+        ]:
+            value = unit_property(name)
+            assert value == "yes", f"{name} is {value!r}, expected yes"
+
+        # Reaching the providers needs the internet and nothing else.
+        families = unit_property("RestrictAddressFamilies")
+        assert set(families.split()) == {"AF_INET", "AF_INET6"}, families
+
     with subtest("the deployed provider set still converges"):
         # Reproduces production: quad9 and mullvad send no Date, so only one draw in six can
         # succeed. The unit must still get there on its own, which is the property that makes
