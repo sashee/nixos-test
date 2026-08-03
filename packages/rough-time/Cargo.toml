@@ -3,21 +3,21 @@ name = "rough-time"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Establish a rough system clock at boot from the Date headers of the configured DoH providers"
+description = "Establish a rough system clock at boot from an authenticated NTS timestamp, resolving the server over DoH"
 
 [dependencies]
+# HTTP for the DoH leg, at whatever version the resolver negotiates over ALPN. Hand-rolling
+# HTTP/1.1 would bake in an assumption about the providers that could become false at any time;
+# this path runs rarely enough that the dependency weight is the cheaper side of the trade.
+# default-features off drops the bundled roots, the proxy support and the codecs -- none of
+# which belong in a boot-critical binary. The NTS leg needs no HTTP at all.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider", "http2"] }
 # TLS. The whole design rests on being able to verify a chain at an instant of our choosing,
 # which rustls exposes (ServerCertVerifier::verify_server_cert takes `now`) and no other
-# client in the ecosystem does. `ring` rather than the default aws-lc-rs: aws-lc-rs wants
-# cmake/nasm at build time and package.nix carries no nativeBuildInputs, while ring builds
-# with the C compiler already in stdenv (packages/iroh-ssh depends on iroh's ring backend and
-# builds the same way).
-# HTTP, at whatever version the server negotiates over ALPN. Hand-rolling HTTP/1.1 would bake
-# in an assumption about the providers that is already false for two of them and could become
-# false for the rest at any time; this path runs rarely enough that the dependency weight is
-# the cheaper side of the trade. default-features off drops the bundled roots, the proxy
-# support and the codecs -- none of which belong in a boot-critical binary.
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider", "http2"] }
+# client in the ecosystem does. It also exports NTS's keying material from the handshake.
+# `ring` rather than the default aws-lc-rs: aws-lc-rs wants cmake/nasm at build time and
+# package.nix carries no nativeBuildInputs, while ring builds with the C compiler already in
+# stdenv (packages/iroh-ssh depends on iroh's ring backend and builds the same way).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # The OS trust store. NOT webpki-roots: VM tests trust their CA through
 # security.pki.certificateFiles, which writes /etc/ssl/certs/ca-certificates.crt, and a client

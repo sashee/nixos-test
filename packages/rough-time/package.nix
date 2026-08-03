@@ -12,7 +12,7 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
 
   meta = {
-    description = "Establish a rough system clock at boot from the Date headers of the configured DoH providers";
+    description = "Establish a rough system clock at boot from an authenticated NTS timestamp, resolving the server over DoH";
     license = with lib.licenses; [ mit asl20 ];
     mainProgram = "rough-time";
   };

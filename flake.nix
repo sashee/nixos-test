@@ -684,15 +684,13 @@
         machineModule = connectivityFallbackNode;
         rtcOption = "-rtc clock=vm,base=$(${pkgs.coreutils}/bin/date -u -d tomorrow +%Y-%m-%dT10:00:00)";
       };
-      # The DNS-outage reboot failsafe on x86: the real desktop host config (which already
-      # imports modules/doh.nix, so dnscrypt-proxy and its cache are the deployed ones)
-      # with the watchdog module added and switched on. The feature ships only on the rpi,
-      # so this variant exists for fast local feedback; the aarch64 variant against
-      # hosts/rpi5 is the one that covers the deployed target.
-      # The rough clock on the generic desktop config, for fast local feedback; the aarch64
-      # variant against hosts/rpi5 is the one that covers the deployed target. The module is
-      # imported here rather than through common-desktop.nix so the test exercises it before
-      # any host switches its clock over to it.
+      # The two halves of the time chain on the generic desktop config, for fast local
+      # feedback; the aarch64 variants against hosts/rpi5 are the ones that cover the deployed
+      # target, since the RTC-less Pi is the host the bootstrap actually matters on.
+      # rough-time.nix covers the rough clock itself -- quorum, floor, deferred certificate
+      # checks -- and nts-sync.nix covers the chain it exists to unblock. time-sync.nix arrives
+      # through commonDesktopModule and is named again here so the composition each test runs
+      # is readable at its call site.
       roughTimeTest = import ./tests/rough-time.nix {
         inherit nixpkgs pkgs stateVersion dohStamps;
         machineModule = { ... }: {
@@ -705,6 +703,11 @@
           imports = [ commonDesktopModule ./modules/time-sync.nix ];
         };
       };
+      # The DNS-outage reboot failsafe on x86: the real desktop host config (which already
+      # imports modules/doh.nix, so dnscrypt-proxy and its cache are the deployed ones)
+      # with the watchdog module added and switched on. The feature ships only on the rpi,
+      # so this variant exists for fast local feedback; the aarch64 variant against
+      # hosts/rpi5 is the one that covers the deployed target.
       connectivityWatchdogTest = import ./tests/connectivity-watchdog.nix {
         inherit nixpkgs pkgs stateVersion dohStamps;
         machineModule = { ... }: {
