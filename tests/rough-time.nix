@@ -39,10 +39,32 @@ let
   goodHost = "time.cloudflare.com";
   staleHost = "nts.netnod.se";
 
-  # Valid now, so the NTS leg's pass 2 succeeds.
+  # Valid now, so the NTS leg's pass 2 succeeds -- and DELIBERATELY not the same window as the
+  # good DoH certificate below. The stand-down rule is defined over the validity of *every*
+  # certificate gathered on the way to an answer, so the two legs are given windows that differ
+  # at both ends and the intersection is strictly narrower than either:
+  #
+  #   DoH   2020-01-01 .................................... 2060-01-01
+  #   NTS         2024-01-01 ................................... 2100-01-01
+  #   both        2024-01-01 ............................. 2060-01-01
+  #
+  # With one shared 100-year window (which is what these fixtures used to have) a client that
+  # consulted only one leg, or that answered "every instant" when it could not tell, would pass
+  # every subtest here. The dates are absolute rather than relative to the build so the fixture
+  # is reproducible, and far enough out that the window still contains the present for decades.
+  ntsNotBefore = "20240101000000Z";
+  ntsNotAfter = "21000101000000Z";
+  dohNotBefore = "20200101000000Z";
+  dohNotAfter = "20600101000000Z";
+  # The intersection, as epoch seconds, for the driver to assert against.
+  bothFrom = 1704067200; # 2024-01-01
+  bothUntil = 2840140800; # 2060-01-01
+
   ntsCert = import ./test-cert.nix { inherit pkgs; } {
     name = "nts-good";
     sans = [ goodHost ];
+    notBefore = ntsNotBefore;
+    notAfter = ntsNotAfter;
   };
 
   # Well formed, chains to a CA the machine trusts, matches the hostname -- and expired in 2021.
@@ -94,6 +116,8 @@ let
     inherit pkgs dohStamps respond;
     name = "rough-time-doh";
     readyFile = "/tmp/fake-doh-ready";
+    certNotBefore = dohNotBefore;
+    certNotAfter = dohNotAfter;
   };
 
   dohStale = import ./doh-interceptor.nix {
@@ -202,6 +226,9 @@ nixpkgs.lib.nixos.runTest {
     doh_ipv4 = ${builtins.toJSON dohGood.dohIpv4}
     doh_ipv6 = ${builtins.toJSON dohGood.dohIpv6}
     FLOOR = ${toString floor}
+    # The instants at which BOTH good certificates are valid; see the fixtures above.
+    BOTH_FROM = ${toString bothFrom}
+    BOTH_UNTIL = ${toString bothUntil}
 
     start_all()
 
@@ -322,30 +349,57 @@ nixpkgs.lib.nixos.runTest {
         output = rough_time(f"--only cloudflare --floor {2 ** 40}", expect_success=False)
         assert "earlier than the build-time floor" in output, output
 
-    with subtest("a clock already inside the certificates' validity is left alone"):
+    def stand_down_or_set(when):
         # Not --force and not --dry-run: the decision AND its effect are the subject. The kernel
-        # still reports STA_UNSYNC here (nothing on this machine has synchronised anything), so
-        # the adjtimex check cannot be what stands this down -- only the certificate window can.
-        #
-        # 2030 is wrong by years and inside every fixture's validity, which is exactly the state
+        # reports STA_UNSYNC throughout this test (nothing here ever synchronises the clock), so
+        # the adjtimex check can never be what decides these -- only the certificate window can.
+        machine.succeed(f"date -s '{when}'")
+        return machine.succeed("rough-time --only cloudflare 2>&1")
+
+    with subtest("a clock already inside the certificates' validity is left alone"):
+        # 2030 is wrong by years and inside both fixtures' validity, which is exactly the state
         # the rule is about: TLS works, so chrony can reach its sources and make the accurate
         # correction itself, and stepping here would only replace one wrong time with a
         # whole-second approximation of a different one.
-        machine.succeed("date -s '2030-01-01 00:00:00'")
-        output = machine.succeed("rough-time --only cloudflare 2>&1")
+        output = stand_down_or_set("2030-01-01 00:00:00")
         assert "already inside the certificates' validity" in output, output
+        # The reported window is the INTERSECTION of the two legs, asserted exactly. Without this
+        # the subtest would pass just as well on a client that answered "every instant is inside"
+        # whenever it could not work a window out -- which is the one wrong answer here, and the
+        # reason `common_window` treats a single unknown as poisoning the whole result.
+        assert f"({BOTH_FROM}..{BOTH_UNTIL})" in output, output
         # Still in 2030, i.e. not stepped back to what the NTS server serves.
         assert 1893456000 <= clock() < 1900000000, f"the clock moved to {clock()}"
 
     with subtest("a clock outside the certificates' validity is set"):
         # The converse, so the subtest above cannot pass by rough-time having simply stopped
         # setting clocks. Same command, same flags, only the starting clock differs.
-        machine.succeed("date -s '2001-01-01 00:00:00'")
-        output = machine.succeed("rough-time --only cloudflare 2>&1")
-        assert "clock set to" in output, output
+        assert "clock set to" in stand_down_or_set("2001-01-01 00:00:00")
         served = int(ntsgood.succeed("date +%s").strip())
         drift = abs(clock() - served)
         assert drift < 120, f"clock is {drift}s from what the NTS server serves"
+
+    with subtest("one leg's window is not enough to stand down on"):
+        # 2022 is inside the DoH certificate's validity and outside the NTS one; 2070 is inside
+        # the NTS certificate's and outside the DoH one. Either way the clock is outside the
+        # instants where BOTH hold, so TLS does not actually work there and the clock must be
+        # set. A client that consulted one leg and not the other would stand down on exactly one
+        # of these two -- which is why both directions are here rather than one.
+        for when in ["2022-06-01 00:00:00", "2070-06-01 00:00:00"]:
+            output = stand_down_or_set(when)
+            assert "clock set to" in output, f"{when} should have been stepped: {output}"
+        served = int(ntsgood.succeed("date +%s").strip())
+        assert abs(clock() - served) < 120, "the clock did not end up on the served time"
+
+    with subtest("--force overrides the certificate window, not just adjtimex"):
+        # The documented way to check the configured servers still answer on a host whose clock
+        # is fine (`rough-time --force --dry-run`). If --force skipped only the adjtimex check,
+        # this would report a stand-down on any host whose clock is inside validity -- i.e. every
+        # healthy host -- and the escape hatch would be useless precisely where it is used.
+        machine.succeed("date -s '2030-01-01 00:00:00'")
+        output = machine.succeed("rough-time --force --dry-run --only cloudflare 2>&1")
+        assert "would set the clock to" in output, output
+        machine.succeed(f"date -s @{int(ntsgood.succeed('date +%s').strip())}")
 
     with subtest("a v4-only host still gets a clock"):
         disconnect(v4=False, v6=True)
