@@ -357,6 +357,29 @@ nixpkgs.lib.nixos.runTest {
         ), "the previous boot's reboot verdict went missing"
         unwedge.succeed("systemctl is-active multi-user.target")
 
+    with subtest("synchronising clears the breadcrumb, so the bound is per episode"):
+        # The other half of that bound, and the one whose failure is silent. If the successful
+        # path did not remove the breadcrumb, the host would stand down for the rest of its life
+        # after a single unwedge reboot -- the failsafe would be permanently disabled and nothing
+        # would say so. "One reboot per stuck episode" only means that if an episode can end.
+        unwedge.succeed(f"test -s {STATE}")
+        unwedge.succeed("systemctl start chronyd.service")
+        unwedge.succeed("systemctl reset-failed chrony-wait.service || true")
+        unwedge.succeed("systemctl start --no-block chrony-wait.service")
+        unwedge.wait_for_file("/run/chrony-wait/synchronized", timeout=300)
+
+        unwedge.succeed("systemctl reset-failed time-sync-unwedge.service || true")
+        unwedge.succeed("systemctl restart time-sync-unwedge.service")
+        journal = unwedge.succeed(f"{UNWEDGE_JOURNAL} || true")
+        assert "nothing to do" in journal, journal
+        unwedge.fail(f"test -e {STATE}")
+
+    with subtest("unwedgeSeconds = null installs no failsafe at all"):
+        # The off switch, checked on the node that relies on it: every subtest above this one
+        # leaves `machine` deliberately unsynchronised for a minute or more at a time, so a unit
+        # that had quietly been installed there would have rebooted the host under test.
+        machine.fail("systemctl cat time-sync-unwedge.service")
+
 
     def peer_ip(node):
         return node.wait_until_succeeds(
