@@ -179,6 +179,11 @@ nixpkgs.lib.nixos.runTest {
     common.monitoring.enable = lib.mkForce false;
     common.irohSsh.enable = lib.mkForce false;
 
+    # The clock goes back to 2001 and forward again repeatedly below, and nix-gc.timer is
+    # Persistent, so a forward jump past a missed OnCalendar fires a store-wide delete in the
+    # middle of a subtest. Same reasoning and remedy as tests/restic.nix.
+    nix.gc.automatic = lib.mkForce false;
+
     # mkForce: the shared test-node layer switches time sync off on every node (see
     # testNodeTimeSyncOff in flake.nix), and here it is the thing under test.
     common.timeSync = {
@@ -219,6 +224,10 @@ nixpkgs.lib.nixos.runTest {
     common.irohSsh.enable = lib.mkForce false;
     common.systemMetrics.enable = lib.mkForce false;
 
+    # wedge_chrony steps this node's clock too, and it survives two reboots -- so the Persistent
+    # nix-gc.timer has three chances to fire during the countdowns. See the machine node above.
+    nix.gc.automatic = lib.mkForce false;
+
     common.timeSync = {
       enable = lib.mkForce true;
       servers = lib.mkForce [ goodHost liarHost ];
@@ -245,21 +254,50 @@ nixpkgs.lib.nixos.runTest {
     # therefore before network-addresses-eth1 has assigned anything, so installing a route via a
     # gateway on eth1's subnet fails with "Nexthop has invalid gateway" (observed). What this
     # needs is to be after the addresses and before the first rough-time attempt.
+    #
+    # `network.target` is NOT that point, which cost an aarch64 CI run. It is a passive
+    # synchronisation target, so on a slow runner where eth1 appears late it is reached before
+    # the addresses are assigned at all:
+    #
+    #   [188.4] Reached target Network.
+    #   [190.2] doh-routes-start: Error: Nexthop has invalid gateway.
+    #   [190.3] Starting Address configuration of eth1...
+    #   [193.8] network-addresses-eth1-start: adding address 192.168.1.5/24... done
+    #   [204.5] Reached target Network is Online.
+    #
+    # Hence network-online.target, which is the first point after the addresses. And hence the
+    # retry: with no Restart= that single failure was permanent, so the node spent the whole run
+    # with no route to the resolver and rough-time failed every 30s for fourteen minutes. A loop
+    # rather than Restart=on-failure keeps this clear of systemd's start rate limit (see
+    # tests/system-metrics.nix:86). The last attempt is not swallowed, so a gateway that never
+    # becomes valid still fails the unit loudly instead of leaving the cause to be guessed at.
     systemd.services.doh-routes = {
       description = "Point the DoH provider addresses at the interceptor";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
+      wants = [ "network-online.target" ];
+      after = [ "network.target" "network-online.target" ];
       before = [ "rough-time.service" ];
-      path = [ pkgs.iproute2 ];
+      path = [ pkgs.iproute2 pkgs.coreutils ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
       };
-      script =
-        lib.concatMapStrings
-          (ip: "ip route replace ${ip}/32 via ${nodes.dohpeer.networking.primaryIPAddress} dev eth1\n")
-          interceptor.dohIpv4
-        + lib.concatMapStrings (ip: "ip -6 route replace unreachable ${ip}/128\n") interceptor.dohIpv6;
+      script = ''
+        # Retry until the gateway is usable, then let the final attempt's status stand -- the
+        # script runs under `set -e`, so a route that never installs still fails the unit.
+        route_with_retry() {
+          tries=0
+          while [ "$tries" -lt 30 ]; do
+            if "$@"; then return 0; fi
+            tries=$((tries + 1))
+            sleep 1
+          done
+          "$@"
+        }
+      '' + lib.concatMapStrings
+        (ip: "route_with_retry ip route replace ${ip}/32 via ${nodes.dohpeer.networking.primaryIPAddress} dev eth1\n")
+        interceptor.dohIpv4
+      + lib.concatMapStrings (ip: "ip -6 route replace unreachable ${ip}/128\n") interceptor.dohIpv6;
     };
 
     security.pki.certificateFiles = [ interceptor.caFile ntsCert.caFile ];

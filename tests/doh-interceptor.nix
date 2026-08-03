@@ -158,6 +158,23 @@ let
 
   # A systemd service that assigns the DoH provider IPs to eth1 and runs the
   # server. `args` are appended to ExecStart (exposed to respond as meta["args"]).
+  #
+  # `nodad` on the IPv6 adds, and it is load-bearing rather than tidiness. A test may run two
+  # interceptor nodes on one segment holding the SAME provider addresses, choosing between them
+  # by routing (tests/rough-time.nix does exactly that) -- and those addresses are then genuine
+  # duplicates, so whichever node adds one second loses duplicate address detection and has it
+  # marked `dadfailed`, permanently unusable for the rest of the run:
+  #
+  #   dohgood # IPv6: eth1: IPv6 duplicate address 2620:fe::10 used by 52:54:00:12:01:02 detected!
+  #
+  # The race is per address, so each run left a different random subset of each node's addresses
+  # dead. It hid for a while because rough-time draws its resolver at random and a retry loop
+  # rerolls the draw, so a partial loss looks like slowness; the aarch64 run where dohgood lost
+  # all four failed outright. IPv4 has no DAD, which is why only the v6 path ever showed it.
+  #
+  # Duplicates on one segment are fine here because nothing resolves these addresses on-link:
+  # callers route to them `via` each node's own unique address. Same idiom as
+  # tests/nm-captive-portal-ipv6.nix, which holds provider /128s the same way.
   mkService = { args ? [ ] }: {
     description = "Fake DoH upstream (${name})";
     wantedBy = [ "multi-user.target" ];
@@ -166,7 +183,7 @@ let
       (ip: "${pkgs.iproute2}/bin/ip addr add ${ip}/32 dev eth1 || true")
       dohIpv4
       + "\n" + lib.concatMapStringsSep "\n"
-      (ip: "${pkgs.iproute2}/bin/ip -6 addr add ${ip}/128 dev eth1 || true")
+      (ip: "${pkgs.iproute2}/bin/ip -6 addr add ${ip}/128 dev eth1 nodad || true")
       dohIpv6;
     serviceConfig.ExecStart = lib.concatStringsSep " " ([
       "${pkgs.python3}/bin/python3"

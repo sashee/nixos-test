@@ -393,11 +393,19 @@ fn ask_pair(
     // failure as long as the other did -- only an empty union is. Asking for both is what
     // makes an IPv6-only host work at all: querying A alone resolves to an address it has no
     // way to reach.
+    //
+    // Every failure is collected rather than only the last kept, which is a diagnostics fix with
+    // a real cost behind it. Keeping one meant reporting whichever attempt happened to come last
+    // -- always AAAA over the resolver's IPv6 address -- so a host whose IPv4 path was the broken
+    // one produced logs that named an IPv6 address and nothing else, and a CI failure caused
+    // entirely by a missing IPv4 route read as an IPv6 problem. Only an empty union is a failure,
+    // so this text appears only when EVERY attempt failed, and then each is worth naming.
     let resolve = |deferred: &mut deferred::Deferred, name: &str, id: u16| {
         let mut found: Vec<IpAddr> = Vec::new();
-        let mut last = format!("{} has no usable address", resolver.name);
+        let mut failures: Vec<String> = Vec::new();
 
         for (offset, qtype) in [(0u16, dns::TYPE_A), (1u16, dns::TYPE_AAAA)] {
+            let kind = if qtype == dns::TYPE_A { "A" } else { "AAAA" };
             // Whichever address of the resolver answers first. Being unreachable over one
             // family is normal on these hosts; unreachable over both is the failure.
             for address in &resolver.addresses {
@@ -415,13 +423,21 @@ fn ask_pair(
                         found.extend(addresses);
                         break;
                     }
-                    Err(e) => last = e,
+                    Err(e) => failures.push(format!("{kind} via {address}: {e}")),
                 }
             }
         }
 
         if found.is_empty() {
-            Err(last)
+            Err(format!(
+                "{} could not resolve {name}: {}",
+                resolver.name,
+                if failures.is_empty() {
+                    "no address was even attempted".to_string()
+                } else {
+                    failures.join("; ")
+                }
+            ))
         } else {
             Ok(found)
         }
