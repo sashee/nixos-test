@@ -218,8 +218,8 @@ mod tests {
 
     #[test]
     fn several_silent_providers_are_all_named() {
-        // The real failure mode: two of the four configured providers send no Date at all, and
-        // a message naming only one of them points at the wrong operator.
+        // Two of the four sampled operators never answered, and a message naming only one of
+        // them points at the wrong operator.
         let got = decide(
             &names(&["a", "b", "c", "d"]),
             &[answer("a", "x", NOW), answer("c", "y", NOW)],

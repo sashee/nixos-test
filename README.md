@@ -32,6 +32,7 @@ these internal modules:
 
 ```text
 modules/nix-settings.nix
+modules/locale.nix
 modules/laptop-base.nix
 modules/audio.nix
 modules/firewall.nix
@@ -39,11 +40,12 @@ modules/doh.nix
 modules/restic.nix
 modules/auto-upgrade.nix
 modules/monitoring.nix
+modules/system-metrics.nix
+modules/time-sync.nix
 modules/iroh-ssh.nix
 modules/fonts.nix
 modules/development-base.nix
 modules/nix-utils.nix
-modules/locale.nix
 modules/plasma-firefox.nix
 ```
 
@@ -244,6 +246,52 @@ test drives NetworkManager end-to-end against a fake `captive.apple.com`,
 asserting it reports `full` on an open network and `portal` once the endpoint
 redirects.
 
+`modules/time-sync.nix` owns the clock. chrony replaces systemd-timesyncd and
+synchronises over NTS — authenticated NTP — against the four servers in
+`lib/nts-servers.nix` (Cloudflare, Netnod, and PTB's two hosts), with
+`minsources 2` so no single reachable server can set the time unchallenged.
+`enableNTS` brings `ntsdumpdir` with it, so cookies survive a reboot and a cold
+boot does not have to redo key establishment before it can ask the time. The
+module also sets `rtcsync`, which is the only thing that makes chronyd tell the
+*kernel* the clock is synchronised; nixpkgs' default `enableRTCTrimming` is
+mutually exclusive with it and is therefore off, which costs nothing here — the
+Pi has no RTC battery at all, and what the laptop needs is only that the next
+boot starts close to correct. The module writes `/run/chrony-wait/synchronized`
+from a small `chrony-wait` unit and repoints
+`common.systemMetrics.syncedMarker` at it, since chrony has no equivalent of
+timesyncd's marker and `time-sync.target` is reached when chronyd *starts*, not
+when it has synchronised.
+
+The other half of the module is the way out of a deadlock. DoH and NTS are both
+TLS, so a clock outside certificate validity blocks name resolution and time
+synchronisation at once and neither can recover the other — and an RTC-less
+Raspberry Pi is in exactly that state on every cold boot. chrony cannot break it
+alone, because whatever its certificate policy it still has to *resolve* the NTS
+hostnames, and that is DoH. So `packages/rough-time`, a small Rust binary, runs
+first as a oneshot that retries every 30s until it succeeds: it dials a DoH
+resolver at a pinned address (the same addresses `modules/doh.nix` pins, read
+from `lib/doh-stamps.nix`) to resolve an NTS server's name, does NTS key
+establishment with that server, takes an authenticated NTPv4 timestamp — and
+only then verifies both certificate chains, at the instant that was reported.
+That last step is the whole security argument, and a `Deferred` type makes it
+structural rather than a step someone can forget: there is no way to obtain a
+believable time except by consuming the recorded chains. Two independent
+operators must agree within a minute, so moving this clock means compromising
+two at once, and only ever within a certificate's validity window — with
+`nixpkgs.lastModified` passed in from `flake.nix` as a floor bounding how far
+back a once-valid certificate could roll things. Before doing anything it asks
+the kernel via `adjtimex` whether `STA_UNSYNC` is clear, and asks again before
+writing, so on a laptop with a working RTC or any warm reboot it is a no-op.
+`rough-time --force --dry-run` on a live host asks exactly what the boot service
+asks and prints the answer without setting anything.
+
+It is opt-in (`common.timeSync.enable`) and enabled on both hosts. Two VM checks
+cover it on x86 and aarch64: `rough-time` exercises the binary's quorum, floor
+and deferred certificate checks against controlled DoH resolvers and NTS
+servers, and `nts-sync` reproduces the deadlock end to end on the real host
+config — the machine boots years out, cannot resolve anything, and has to climb
+out through rough-time to chrony on its own.
+
 `modules/restic.nix` configures named restic backups using systemd credentials.
 Each backup must specify the user that runs the service. Backup paths are bound
 read-only into the hardened unit while `/home` is otherwise protected with a
@@ -343,19 +391,27 @@ producer is a small Rust binary in `packages/system-metrics` built on the same
 script. It runs under `DynamicUser` whose only privilege is membership of the
 receiver's group, and `RestrictAddressFamilies = [ "AF_UNIX" ]` makes "this
 never talks to the network" a kernel guarantee on the producer side too. Two
-behaviours worth knowing: a run is skipped (not failed) until
-systemd-timesyncd reports the clock synchronised, because the RTC-less Pi would
-otherwise write permanent 1970-dated rows into a store that has no retention;
-and a receiver that is down makes the unit **fail** rather than skip, since a
-silently-green unit that stopped measuring is the failure mode worth avoiding.
-The clock gate is tested against a real NTP server rather than a hand-placed
-marker file: the check runs a second node with chrony (`local stratum 10`, so an
-island with no upstream still serves a usable reference) and asserts that the
-host records nothing while that daemon is down, starts recording once
-`systemd-timesyncd` syncs to it, and stops again when it goes away. That helper
-node takes the same `-rtc base=tomorrow 10:00` as the node under test
-(`lib/test-rtc-base.nix`) — otherwise it would serve real wall-clock time and
-step the machine a day backwards mid-test.
+behaviours worth knowing: a run is skipped (not failed) until the clock is
+known-synchronised, because the RTC-less Pi would otherwise write permanent
+1970-dated rows into a store that has no retention; and a receiver that is down
+makes the unit **fail** rather than skip, since a silently-green unit that
+stopped measuring is the failure mode worth avoiding.
+
+The gate is a `ConditionPathExists` on `common.systemMetrics.syncedMarker`. Its
+default is the marker systemd-timesyncd writes, because that is the stock NixOS
+time source — but the deployed hosts run chrony, which writes nothing of the
+kind, so `modules/time-sync.nix` (above) repoints the option at the marker its
+own `chrony-wait` unit writes. Both paths are tested against a real NTP server
+rather than a hand-placed marker file. The `system-metrics` check covers the
+default: it runs a second node with chrony (`local stratum 10`, so an island with
+no upstream still serves a usable reference) and asserts that the host records
+nothing while that daemon is down, starts recording once `systemd-timesyncd`
+syncs to it, and stops again when it goes away. That helper node takes the same
+`-rtc base=tomorrow 10:00` as the node under test (`lib/test-rtc-base.nix`) —
+otherwise it would serve real wall-clock time and step the machine a day
+backwards mid-test. The chrony marker the hosts actually use is covered by
+`nts-sync` instead, which has real chrony to synchronise.
+
 It is opt-in (`common.systemMetrics.enable`) and enabled wherever a receiver
 runs. `system-metrics --dry-run` prints the batch a run would send without
 sending it. Covered end to end by the `system-metrics` check on both x86 and
@@ -680,6 +736,20 @@ make run-tests MAX_JOBS=1
 `doh-upstream` is hermetic: it routes `doh-test` default IPv4 traffic through
 `dns-peer`, redirects outbound HTTPS there, and verifies that a local DNS query
 becomes an HTTPS `/dns-query` request to one of the configured DoH hostnames.
+
+`rough-time` and `nts-sync` are hermetic in the same way and are among the
+slowest checks in the suite — five and four VMs respectively, both existing on
+x86 and aarch64. `rough-time` covers the boot clock in isolation against
+impersonated DoH resolvers and NTS servers, including the cases that only ever
+matter once: an expired certificate on either leg while that server's clock stays
+correct (so the answer it gives is right and must still be refused), a time below
+the build-time floor, no reachable resolver at all, and v4-only, v6-only and
+NTS-reachable-only-over-v6 hosts. `nts-sync` boots a machine years out of date on
+the deployed configuration and asserts it climbs out on its own, then that chrony
+refuses a falseticker, keeps cookies across a reboot, and will not fall back to
+unauthenticated NTP when NTS-KE is blocked. Their aarch64 variants get a raised
+`globalTimeout` (1800s and 2400s), since under TCG a run of either is measured in
+tens of minutes.
 
 `nix flake check` also works, but it evaluates every check in one nix process
 (~15 GiB peak) and leaves no output symlinks — prefer the `make run-*` targets,

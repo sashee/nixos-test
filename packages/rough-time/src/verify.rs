@@ -259,8 +259,9 @@ impl ServerCertVerifier for TimeAgnosticVerifier {
 mod tests {
     //! The window arithmetic is what decides whether pass 1 can run at all, so it is tested
     //! directly. Building real chains would need a certificate generator; the end-to-end
-    //! behaviour is covered by tests/rough-time.nix, which serves a Date outside the leaf's
-    //! validity and asserts the clock is left alone.
+    //! behaviour is covered by tests/rough-time.nix, which gives a provider a genuinely expired
+    //! certificate while its clock stays correct -- so the answer it returns is right and pass 2
+    //! must still reject it -- and asserts the clock is left alone.
 
     use super::intersect;
 

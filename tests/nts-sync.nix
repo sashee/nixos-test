@@ -2,13 +2,15 @@
 
 # The whole time chain, on the real host config: rough clock -> DNS -> chrony over NTS.
 #
-# tests/rough-time.nix covers the rough clock against a controlled HTTP server. This covers
-# what happens after it, and it is the only place the bootstrap deadlock is actually
-# reproduced rather than described:
+# tests/rough-time.nix covers the rough clock itself -- its quorum, floor and deferred
+# certificate checks -- against controlled DoH resolvers and NTS servers. This covers what
+# happens after it, and it is the only place the bootstrap deadlock is actually reproduced
+# rather than described:
 #
 #   the machine boots with its clock years out, so DoH's TLS cannot validate and no name
-#   resolves; rough-time reaches the DoH providers by pinned address and sets a rough clock;
-#   DNS starts working; chronyd resolves the NTS hostnames and synchronises over NTS-KE.
+#   resolves; rough-time reaches the DoH providers by pinned address, resolves an NTS server
+#   through them, takes an authenticated timestamp from it and sets a rough clock; DNS starts
+#   working; chronyd resolves the NTS hostnames itself and synchronises over NTS-KE.
 #
 # Nothing about the machine is reconfigured to make that work. It runs the deployed chrony
 # config against real NTS servers, resolving real hostnames through the real dnscrypt-proxy.

@@ -11,10 +11,12 @@
 #
 # The order out of that deadlock is:
 #
-#   rough-time  dials the DoH providers' PINNED ADDRESSES over HTTPS, ignoring certificate
-#               dates during the handshake and re-checking them against the Date the server
-#               reported. No name resolution, so it does not need DNS; no trust in the clock,
-#               so it does not need the clock. Sets a rough time and exits.
+#   rough-time  dials the DoH providers' PINNED ADDRESSES over HTTPS to resolve an NTS
+#               server's name, then takes an authenticated timestamp from that server --
+#               ignoring certificate dates during both handshakes and re-checking them against
+#               the timestamp afterwards. No name resolution to start with, so it does not need
+#               DNS; no trust in the clock, so it does not need the clock. Sets a rough time
+#               and exits.
 #   dnscrypt    now that the clock is inside certificate validity, DoH works, so names resolve.
 #   chronyd     resolves the NTS hostnames and takes over. It is authoritative; whatever
 #               rough-time set is only a seed accurate to a minute or so.
@@ -100,7 +102,7 @@ in
 {
   options.common.timeSync = {
     # Opt-in like the other common.* modules, so a host that has not been thought about does
-    # not silently acquire a service that sets its clock from an HTTP header.
+    # not silently acquire a service that steps its clock at boot.
     enable = lib.mkEnableOption "chrony over NTS plus the boot-time rough clock";
 
     package = lib.mkOption {
@@ -273,9 +275,9 @@ in
       # On Linux `rtcsync` works by having the kernel copy the system time to the RTC every 11
       # minutes, and the kernel only does that while `STA_UNSYNC` is clear, so enabling it is
       # what clears the bit. Without it chronyd synchronises perfectly and the kernel still
-      # reports the clock as unsynchronised forever -- which would make rough-time step the
-      # clock from an HTTP header on every boot despite chrony already having it right, and
-      # would make `timedatectl` report NTPSynchronized=no on a host that is synchronised.
+      # reports the clock as unsynchronised forever -- which would make rough-time re-run and
+      # step the clock on every boot despite chrony already having it right, and would make
+      # `timedatectl` report NTPSynchronized=no on a host that is synchronised.
       # Confirmed by tests/nts-sync.nix, whose "stands down once something has synchronised"
       # subtest fails outright with the nixpkgs default.
       #
@@ -291,7 +293,7 @@ in
     };
 
     systemd.services.rough-time = {
-      description = "Establish a rough system clock from the DoH providers";
+      description = "Establish a rough system clock from an authenticated NTS timestamp";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
       # Before chronyd: chronyd needs DNS, DNS needs DoH, DoH needs a plausible clock. This is
