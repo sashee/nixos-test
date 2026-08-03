@@ -9,7 +9,8 @@
 # neither can recover the other. A Raspberry Pi with no RTC battery is in exactly that state
 # on every cold boot.
 #
-# The order out of that deadlock is:
+# The way out of that deadlock is, in causal order -- not in unit ordering, which deliberately
+# does not constrain these against each other; see the comment on the rough-time unit below:
 #
 #   rough-time  dials the DoH providers' PINNED ADDRESSES over HTTPS to resolve an NTS
 #               server's name, then takes an authenticated timestamp from that server --
@@ -368,6 +369,22 @@ in
         '';
       }
       {
+        # chrony-wait declares its directory with `RuntimeDirectory`, which takes a single
+        # component under /run -- so a marker nested any deeper is created in the wrong place
+        # and the ExecStartPost that writes it fails. Checked rather than documented because
+        # the failure is a touch into a directory that does not exist, on a unit whose entire
+        # output is that file.
+        assertion =
+          lib.hasPrefix "/run/" (toString cfg.syncedMarker)
+          && builtins.length (lib.splitString "/" (toString cfg.syncedMarker)) == 4;
+        message = ''
+          common.timeSync.syncedMarker (${toString cfg.syncedMarker}) must be of the form
+          /run/<directory>/<file>: chrony-wait creates its parent with RuntimeDirectory, which
+          takes one path component, so anything deeper is created somewhere else and the marker
+          is never written.
+        '';
+      }
+      {
         # chronyd polls with `iburst` (services.chrony.serverOption's default), so its first
         # synchronisation after the rough clock is seconds away, not minutes. What this floor
         # protects against is a window shorter than that first exchange, which would reboot a
@@ -422,10 +439,29 @@ in
       description = "Establish a rough system clock from an authenticated NTS timestamp";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
-      # Before chronyd: chronyd needs DNS, DNS needs DoH, DoH needs a plausible clock. This is
-      # ordering only, not a dependency -- if the rough clock never succeeds, chronyd should
-      # still be running and trying, because an RTC-equipped host may not need this at all.
-      before = [ "chronyd.service" ];
+      # Deliberately NOT ordered against chronyd, though the temptation is obvious: chronyd
+      # needs DNS, DNS needs DoH, DoH needs a plausible clock, so `Before=chronyd.service`
+      # reads like the right thing. It buys much less than it costs.
+      #
+      # What it would buy: chrony's retry for a `server` name it could not resolve is
+      # 7 * 2^n seconds with n clamped to [2,9] (chrony 4.8 ntp_sources.c:114-116, 670-672) --
+      # 28s, 56s, 112s, ... 3584s -- and n resets only on a successful resolve. Ordering
+      # chronyd after this unit means its FIRST resolve happens with a usable clock, so it
+      # never enters that backoff.
+      #
+      # Why that is not worth it: the ordering only holds for the first attempt. `Restart=`
+      # does not keep the start job open (the unit reaches `failed`, which finishes the job,
+      # and each retry is a fresh one), so from attempt two onward chronyd is already up and
+      # already backing off -- and on a cold boot attempt one usually fails, since
+      # `After=network.target` does not mean an address exists. So the case the ordering fixes
+      # is the case that needed no fixing, while the delay it imposes -- one full DoH+NTS
+      # exchange before chronyd may start -- is paid on every boot of every host, including
+      # the laptop, where STA_UNSYNC is set at boot like everywhere else and this unit
+      # therefore runs the whole exchange before deciding it had nothing to do.
+      #
+      # The consequence, accepted knowingly: on an RTC-less cold boot chrony's first
+      # synchronisation is gated by its own 28s retry floor rather than by this unit.
+      # tests/rough-time.nix pins that chronyd runs while this unit is still failing.
 
       serviceConfig = {
         Type = "oneshot";

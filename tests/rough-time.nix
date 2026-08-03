@@ -302,8 +302,19 @@ nixpkgs.lib.nixos.runTest {
             "start-limit" not in machine.succeed("systemctl status rough-time.service || true")
         ), "the restart rate limit stopped the retries"
         assert abs(clock() - before) < 120, "the clock moved with nothing reachable"
-        # Ordering, not requiring: a box with no time still boots.
+        # A box with no time still boots.
         machine.succeed("systemctl is-active multi-user.target")
+        # And chronyd runs regardless, which is what modules/time-sync.nix declines to order
+        # against this unit in order to guarantee. Two ways it could regress, so both are
+        # checked: someone re-adding `Before=chronyd.service` (whose effect depends on whether
+        # a `Restart=` unit holds its start job open across retries -- today it does not, the
+        # unit reaches `failed` first and each retry is a fresh job), or a Requires-shaped
+        # dependency appearing. Either would mean a host that can never reach an NTS server
+        # runs no time daemon at all, chrony having forced timesyncd off -- and nothing else in
+        # this suite would notice, because chrony-wait would simply never run.
+        machine.succeed("systemctl is-active chronyd.service")
+        jobs = machine.succeed("systemctl list-jobs --no-legend || true")
+        assert "chronyd" not in jobs, f"chronyd's start job is still queued:\n{jobs}"
 
     # Outside the good certificates' validity, which is what makes the next subtest test
     # anything. The fixtures are 100-year certificates (tests/test-cert.nix) issued at build

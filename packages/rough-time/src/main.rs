@@ -679,10 +679,10 @@ fn reason_to_stand_down(
     // Asked again, having also been asked before the exchange. That earlier check is only an
     // optimization -- it saves the exchange on a host whose clock is already fine -- and it
     // cannot cover the common case on its own: STA_UNSYNC is always set at boot, so on a warm
-    // reboot the early check never fires, while chronyd starts concurrently (the ordering
-    // dependency is not a barrier) and with cached NTS cookies can synchronise in well under a
-    // second. Without this, the exchange finishes moments later and overwrites an accurate
-    // clock with a whole-second approximation of it.
+    // reboot the early check never fires, while chronyd starts alongside this program -- nothing
+    // orders the two, see modules/time-sync.nix -- and with cached NTS cookies can synchronise in
+    // well under a second. Without this, the exchange finishes moments later and overwrites an
+    // accurate clock with a whole-second approximation of it.
     if clock_is_disciplined() {
         return Ok(Some(
             "something synchronised the clock while we were asking".to_string(),
