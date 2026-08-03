@@ -126,8 +126,19 @@ let
         ${lib.getExe cfg.package} --check-synced >/dev/null 2>&1
       }
 
-      deadline=$(( $(cut -d. -f1 /proc/uptime) + ${unwedgeSeconds} ))
-      while [ "$(cut -d. -f1 /proc/uptime)" -lt "$deadline" ]; do
+      # Counted in sleeps rather than measured against a clock, and that is the point rather than
+      # laziness. `sleep` waits on CLOCK_MONOTONIC, which does not advance while the machine is
+      # suspended, so this counts time the host was actually AWAKE and able to synchronise.
+      #
+      # /proc/uptime (or any wall clock) would be wrong here in a way that reboots laptops: it
+      # includes suspended time, so a lid closed for two hours resumes with the deadline already
+      # long past, and the verdict lands in the same second the lid opened -- before chrony has
+      # polled anything. The remedy is a reboot, so getting this wrong is not a cosmetic bug.
+      #
+      # Integer division, so a value that is not a multiple of the interval rounds down; the
+      # assertion in modules/time-sync.nix keeps it far enough above the interval to matter.
+      remaining=$(( ${unwedgeSeconds} / 10 ))
+      while [ "$remaining" -gt 0 ]; do
         if synced; then
           # Episode over. Clearing the breadcrumb is what makes the guard below "one reboot per
           # stuck episode" rather than "one reboot ever".
@@ -136,7 +147,16 @@ let
           exit 0
         fi
         sleep 10
+        remaining=$(( remaining - 1 ))
       done
+
+      # Asked once more, because the last sleep is as good a moment to synchronise as any and
+      # the alternative is rebooting a host that just succeeded.
+      if synced; then
+        rm -f ${unwedgeState}
+        echo "time-sync-unwedge: the clock is synchronised; nothing to do"
+        exit 0
+      fi
 
       boot_id="$(cat /proc/sys/kernel/random/boot_id)"
 
@@ -274,6 +294,12 @@ in
       description = ''
         How long to wait for chrony to synchronise after the rough clock has succeeded, before
         rebooting. `null` installs no such unit at all.
+
+        Counted in time the host was AWAKE, not wall clock: the wait is a series of sleeps, and
+        sleeping does not advance while the machine is suspended. On a laptop the difference is
+        the whole behaviour -- a lid closed for longer than this would otherwise resume with the
+        deadline already past and reboot in the second the lid opened, before chrony had polled
+        anything.
 
         Note where this sits: it only starts once rough-time has obtained an authenticated
         timestamp, so by the time it is counting, the network and the NTS servers demonstrably

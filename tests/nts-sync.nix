@@ -411,8 +411,13 @@ nixpkgs.lib.nixos.runTest {
         return int((node or machine).succeed("date +%s").strip())
 
     def set_clock(when):
-        # chronyd exits on a backward time jump ("Backward time jump detected!"), so it is
-        # stopped first: the step is deliberate here and should not read as a crash.
+        # chronyd is stopped first because a running one would fight the step -- it is tracking
+        # real sources and would pull the clock back toward them, so a subtest that needs the
+        # host to sit at a chosen time cannot leave it running.
+        #
+        # NOT because the step would kill it: chronyd logs "Backward time jump detected!" and
+        # carries on (same MainPID either side, asserted in the subtest below). The comment here
+        # used to claim it exits, which would have made the whole retry loop unsafe.
         machine.succeed("systemctl stop chronyd.service || true")
         machine.succeed(f"date -s '{when}'")
 
@@ -641,6 +646,39 @@ nixpkgs.lib.nixos.runTest {
         # which is the state a real power cycle leaves it in.
         connect_upstream()
         machine.wait_for_file(MARKER, timeout=600)
+
+    with subtest("a clock step under a running chronyd does not break it for good"):
+        # The race the retry loop makes real. rough-time is ordered BEFORE chronyd, but it retries
+        # every restartSeconds until it succeeds, so every attempt after the first runs with
+        # chronyd already up -- and the timestamp it applies is as old as the slowest leg of its
+        # exchange and truncated to a whole second, so the step it makes on an already-plausible
+        # clock is BACKWARD. If that could kill chronyd for the rest of the boot, this host would
+        # end up permanently unsynchronised while DNS kept working, so nothing else would notice
+        # and the metrics gate would stay shut forever.
+        machine.wait_for_file(MARKER, timeout=300)
+
+        def chronyd_pid():
+            return machine.succeed("systemctl show -p MainPID --value chronyd.service").strip()
+
+        before_pid = chronyd_pid()
+        before = clock()
+        machine.succeed("date -s '-30 seconds'")
+        # Non-vacuity, without depending on chrony's log wording: the clock really did move
+        # backwards. Otherwise a step that silently did nothing would satisfy everything below.
+        assert clock() < before - 20, f"the clock did not step back: {before} -> {clock()}"
+        machine.sleep(15)
+
+        # Alive, and the SAME process -- not merely restartable. Restart=on-failure would paper
+        # over an exit here, and with systemd's default start limit a daemon that died on every
+        # step would eventually stay dead.
+        machine.succeed("systemctl is-active chronyd.service")
+        after_pid = chronyd_pid()
+        assert after_pid == before_pid, f"chronyd restarted across the step: {before_pid} -> {after_pid}"
+        # Still doing the job it was doing, authenticated sources included.
+        assert "NTS" in machine.succeed("${pkgs.chrony}/bin/chronyc -N authdata")
+        machine.wait_until_succeeds(
+            "${pkgs.chrony}/bin/chronyc tracking | grep -q 'Leap status.*Normal'", timeout=300
+        )
 
     with subtest("no NTS-KE means no time, not unauthenticated time"):
         # Port 123 stays open and both servers keep serving correct time, so anything that
