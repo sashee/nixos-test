@@ -1,10 +1,24 @@
 # The NTS time sources chrony is pointed at, as readable components.
 #
 # Hostnames, not addresses -- unlike lib/doh-stamps.nix, which pins IPs because dnscrypt-proxy
-# is what resolves names in the first place and cannot depend on itself. NTS has no such
-# constraint: by the time chronyd runs, the rough-clock service has put the clock inside
-# certificate validity and dnscrypt-proxy answers, so a name resolves. Hostnames also survive
-# an operator renumbering, which for a time source is the likelier failure.
+# is what resolves names in the first place and cannot depend on itself. Two consumers read
+# this list and neither wants addresses:
+#
+#   chronyd runs after the clock is already inside certificate validity, so a name resolves;
+#   rough-time runs before that, and resolves these names itself through a DoH resolver dialled
+#     at a pinned address -- which is why lib/doh-stamps.nix pins and this file does not.
+#
+# Pinning would not work here anyway, which is the substantive reason. Measured 2026-08-02:
+# time.cloudflare.com is anycast across a few hundred sites, nts.netnod.se is a ten-way DNS
+# round-robin across Swedish sites, and only the two PTB hosts are single unicast machines --
+# one operator, so pinning them buys nothing. Hostnames also survive an operator renumbering,
+# which for a time source is the likelier failure.
+#
+# One protocol wrinkle any client of this list must handle: an NTS server may answer key
+# establishment itself and hand the timestamping to a different host and port, using records
+# marked CRITICAL, which a client that does not understand them must abort on. nts.netnod.se
+# does exactly that -- it redirects to 194.58.207.80:4123. chronyd handles it transparently;
+# packages/rough-time implements it explicitly (see src/nts.rs).
 #
 # `operator` is carried explicitly rather than derived from the hostname. The spec requires
 # multiple servers so a single lying or broken source can be outvoted, and that only holds if
@@ -19,9 +33,13 @@
 { lib }:
 
 rec {
-  # REACHABILITY UNVERIFIED -- confirm each of these answers NTS-KE on tcp/4460 from the rpi5
-  # and record the date here before this lands on a host, the way lib/doh-stamps.nix does. A
-  # server that is merely unreachable degrades quietly: chronyd drops to the remaining
+  # Verified 2026-08-02 from a development machine, NOT yet from the rpi5: all four completed
+  # NTS-KE on tcp/4460 (TLS 1.3, ALPN ntske/1, AEAD 15, 8 cookies each), and all four returned
+  # an authenticated timestamp over NTPv4 through the full rough-time path. Re-run
+  # `rough-time --force --dry-run` on the Pi and record that here before relying on it there;
+  # its egress is not this machine's.
+  #
+  # A server that is merely unreachable degrades quietly: chronyd drops to the remaining
   # sources and `minsources 2` keeps working until it cannot, and nothing reports it yet.
   providers = {
     cloudflare = {

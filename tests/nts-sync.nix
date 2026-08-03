@@ -88,6 +88,44 @@ let
           return a(query, mapping[name])
     '';
   };
+  # Clears STA_UNSYNC without moving the clock, so "something synchronised the clock while
+  # rough-time was mid-exchange" can be staged at a chosen instant rather than raced for.
+  # Nothing but this test has any use for it; it exists only on the test node.
+  clearUnsync = pkgs.writers.writePython3Bin "clear-unsync" { } ''
+    import ctypes
+    import ctypes.util
+
+
+    class Timex(ctypes.Structure):
+        _fields_ = [("modes", ctypes.c_uint), ("offset", ctypes.c_long),
+                    ("freq", ctypes.c_long), ("maxerror", ctypes.c_long),
+                    ("esterror", ctypes.c_long), ("status", ctypes.c_int),
+                    ("constant", ctypes.c_long), ("precision", ctypes.c_long),
+                    ("tolerance", ctypes.c_long), ("tv_sec", ctypes.c_long),
+                    ("tv_usec", ctypes.c_long), ("tick", ctypes.c_long),
+                    ("ppsfreq", ctypes.c_long), ("jitter", ctypes.c_long),
+                    ("shift", ctypes.c_int), ("stabil", ctypes.c_long),
+                    ("jitcnt", ctypes.c_long), ("calcnt", ctypes.c_long),
+                    ("errcnt", ctypes.c_long), ("stbcnt", ctypes.c_long),
+                    ("tai", ctypes.c_int), ("pad", ctypes.c_int * 11)]
+
+
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    buf = Timex()
+    assert libc.adjtimex(ctypes.byref(buf)) >= 0, "adjtimex read failed"
+    buf.status &= ~0x0040  # STA_UNSYNC
+    # Clearing the bit alone is not enough. The kernel grows time_maxerror
+    # every second and re-sets STA_UNSYNC once it reaches NTP_PHASE_LIMIT,
+    # and on a clock that has been unsynchronised it is already pinned
+    # there -- so the bit came back within a second, and rough-time saw it
+    # set again eighteen seconds into its exchange. Real daemons reset
+    # these on every update; so must this.
+    buf.maxerror = 0
+    buf.esterror = 0
+    # ADJ_MAXERROR | ADJ_ESTERROR | ADJ_STATUS
+    buf.modes = 0x0004 | 0x0008 | 0x0010
+    assert libc.adjtimex(ctypes.byref(buf)) >= 0, "adjtimex write failed"
+  '';
 in
 
 nixpkgs.lib.nixos.runTest {
@@ -128,6 +166,7 @@ nixpkgs.lib.nixos.runTest {
 
   nodes.machine = { lib, ... }: {
     imports = [ machineModule ];
+    environment.systemPackages = [ clearUnsync pkgs.iproute2 ];
 
     networking.hostName = "nts-sync-test";
 
@@ -143,7 +182,10 @@ nixpkgs.lib.nixos.runTest {
       # Well below any date this test uses, so the floor never masks a different failure --
       # tests/rough-time.nix is where the floor itself is exercised.
       floor = lib.mkForce 1000000000;
-      timeoutSeconds = 3;
+      # Headroom for the mid-exchange subtest, which slows the network deliberately. Nothing
+      # here exercises an unreachable provider, so the short timeout that keeps
+      # tests/rough-time.nix brisk buys nothing.
+      timeoutSeconds = 10;
     };
 
     # Both CAs: the DoH interceptor's, so dnscrypt-proxy and rough-time accept it, and the NTS
@@ -178,6 +220,15 @@ nixpkgs.lib.nixos.runTest {
         return node.wait_until_succeeds(
             "${pkgs.iproute2}/bin/ip -j -4 addr show dev eth1 "
             "| ${pkgs.jq}/bin/jq -r '.[0].addr_info[] | select(.prefixlen==24) | .local' "
+            "| ${pkgs.gnugrep}/bin/grep .",
+            timeout=120,
+        ).strip()
+
+    def peer_ip6(node):
+        return node.wait_until_succeeds(
+            "${pkgs.iproute2}/bin/ip -j -6 addr show dev eth1 "
+            "| ${pkgs.jq}/bin/jq -r '.[0].addr_info[] "
+            "| select(.prefixlen==64 and .scope==\"global\") | .local' "
             "| ${pkgs.gnugrep}/bin/grep .",
             timeout=120,
         ).strip()
@@ -293,6 +344,115 @@ nixpkgs.lib.nixos.runTest {
         output = machine.succeed("rough-time --dry-run 2>&1")
         assert "already synchronised" in output, output
 
+    with subtest("a clock synchronised mid-exchange is not overwritten"):
+        # The race the second adjtimex check exists for, staged rather than hoped for.
+        #
+        # The check at the top of the program cannot cover this on its own: STA_UNSYNC is
+        # always set at boot, so on a warm reboot rough-time always proceeds to the full
+        # exchange, while chronyd starts alongside it and -- with cached cookies and no key
+        # establishment to do -- can synchronise in well under a second. Without a second
+        # check the exchange then finishes and overwrites an accurate clock with a
+        # whole-second approximation of it.
+        #
+        # clear-unsync plays the part of chrony finishing: it flips the kernel bit without
+        # moving the clock, so the assertion below is about rough-time's decision and nothing
+        # else.
+        machine.succeed("systemctl stop chronyd.service || true")
+        machine.succeed("rm -f " + MARKER)
+        set_clock("2001-01-01 00:00:00")
+        before = clock()
+
+        # Widen the window deterministically rather than by shaping traffic. Every attempt to
+        # slow the link failed for its own reason: at 800ms the run finished in about two
+        # seconds and the flip landed after the check it exercises, at 1500ms chronyd's own
+        # key-establishment timeout closed the session before answering, and a blackhole route
+        # turned out not to delay anything at all -- for locally generated packets the routing
+        # lookup fails immediately rather than the packet being sent and dropped, so the run
+        # still finished in 200ms.
+        #
+        # Dropping the packets on the way out is what actually costs a timeout. Silently
+        # dropping IPv4 to the resolvers while pointing their IPv6 addresses at the interceptor
+        # makes each of the two DoH lookups spend the unit's full 10s connect timeout on IPv4
+        # before succeeding on IPv6, so the run reliably lasts over twenty seconds with every
+        # server behaving exactly as it does in the other subtests.
+        nft = "${pkgs.nftables}/bin/nft"
+        machine.succeed(f"{nft} add table inet slowdoh")
+        machine.succeed(
+            f"{nft} add chain inet slowdoh out "
+            "'{ type filter hook output priority 0; policy accept; }'"
+        )
+        for ip in doh_ipv4:
+            machine.succeed(f"{nft} add rule inet slowdoh out ip daddr {ip} tcp dport 443 drop")
+        via6 = peer_ip6(dohpeer)
+        for ip in doh_ipv6:
+            machine.succeed(
+                f"${pkgs.iproute2}/bin/ip -6 route replace {ip}/128 via {via6} dev eth1"
+            )
+
+        try:
+            machine.succeed("systemctl reset-failed rough-time.service || true")
+
+            # `systemctl start --no-block` returns before the unit has started, so reading
+            # InvocationID straight afterwards yields the PREVIOUS run's -- whose journal
+            # already contains "clock set to" from an earlier subtest, which made this pass its
+            # wait instantly and then fail against the wrong run's output. Poll until the id
+            # actually changes.
+            previous = machine.succeed(
+                "systemctl show -p InvocationID --value rough-time.service"
+            ).strip()
+            # `restart`, not `start`: the unit is RemainAfterExit and still active from an
+            # earlier subtest, and `start` on an active unit is a no-op that produces no new
+            # invocation at all.
+            machine.succeed("systemctl restart --no-block rough-time.service")
+
+            inv = ""
+            for _ in range(120):
+                inv = machine.succeed(
+                    "systemctl show -p InvocationID --value rough-time.service"
+                ).strip()
+                if inv and inv != previous:
+                    break
+                machine.sleep(0.5)
+            assert inv and inv != previous, "rough-time never started a new invocation"
+
+            # Flip as early as possible: the window is however long the exchange takes, and
+            # every moment spent here is a moment it might finish in.
+            machine.succeed("clear-unsync")
+            # The staging has to have worked, or this subtest proves nothing about rough-time.
+            # A second invocation short-circuits on the check at the top of the program without
+            # touching the network, so this is both cheap and a direct read of the bit.
+            staged = machine.succeed("rough-time --dry-run --only cloudflare 2>&1")
+            assert "already synchronised" in staged, f"clear-unsync did not take: {staged}"
+            # And that it holds. The first version of this helper left maxerror at its ceiling,
+            # so the kernel re-set the bit a second later and the assertion above still passed
+            # while the run under test saw it set.
+            machine.sleep(3)
+            still = machine.succeed("rough-time --dry-run --only cloudflare 2>&1")
+            assert "already synchronised" in still, f"the bit did not stay clear: {still}"
+            # Waiting on the unit's ActiveState would never return: RemainAfterExit keeps a
+            # successful oneshot active. Wait on what the run said instead, scoped to this
+            # invocation so an earlier run cannot satisfy it -- and accept any terminal message
+            # so a regression fails on the assertion below with the journal attached, rather
+            # than timing out with nothing to look at.
+            machine.wait_until_succeeds(
+                f"journalctl _SYSTEMD_INVOCATION_ID={inv} -o cat "
+                "| grep -qE 'while we were asking|clock set to|error:'",
+                timeout=300,
+            )
+            journal = machine.succeed(f"journalctl _SYSTEMD_INVOCATION_ID={inv} -o cat")
+        finally:
+            machine.succeed(f"{nft} delete table inet slowdoh || true")
+            connect_upstream()
+
+        assert "while we were asking" in journal, journal
+        drift = abs(clock() - before)
+        assert drift < 60, f"the clock moved {drift}s despite being synchronised mid-exchange"
+
+        # Put the host back the way the following subtests expect it.
+        machine.succeed("systemctl start chronyd.service")
+        resync()
+        machine.wait_for_file(MARKER, timeout=300)
+
     with subtest("NTS cookies are dumped when chronyd stops"):
         # chronyd writes the cookie dump on exit, not continuously, so this has to stop it
         # rather than look while it is running. One file per NTS-KE server, named by address.
@@ -345,13 +505,18 @@ nixpkgs.lib.nixos.runTest {
         # Both sources were correct until now. Skewing one leaves chrony with two mutually
         # exclusive intervals and no majority, which -- with minsources 2 -- must resolve to
         # "no usable time" rather than to whichever answered first.
+        # Re-establish a sane clock BEFORE skewing anything. rough-time now asks two NTS
+        # operators and requires them to agree, so once one of them is lying it will correctly
+        # refuse -- which is the behaviour under test here, not a way to set up for it.
+        machine.succeed("systemctl reset-failed rough-time.service || true")
+        machine.succeed("systemctl restart rough-time.service")
+        rough = clock()
+
         # Cut its upstream first, or chronyd simply steps the clock back to ntsgood's.
         ntsliar.succeed(
             f"${pkgs.iproute2}/bin/ip route replace unreachable {peer_ip(ntsgood)}"
         )
         ntsliar.succeed("date -s '+3 hours'")
-        machine.succeed("systemctl restart rough-time.service")
-        rough = clock()
         resync()
         machine.sleep(90)
 

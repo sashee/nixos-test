@@ -5,11 +5,15 @@
 //! provider silent, one lying, one answering twice from two addresses -- is a table entry in
 //! the tests below rather than a VM boot.
 
-/// One successful reading. `provider` is the operator key, `endpoint` the address it came
-/// from, so a provider reachable over both IPv4 and IPv6 yields two answers.
+/// One successful reading.
+///
+/// `operator` is the voting identity: the organisation running the NTS server, not the server
+/// itself. lib/nts-servers.nix carries it explicitly because nothing in a hostname says that
+/// ptbtime1 and ptbtime2 are one organisation, one failure and one opinion. `endpoint`
+/// describes which server and which resolver produced this, for diagnostics only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
-    pub provider: String,
+    pub operator: String,
     pub endpoint: String,
     pub seconds: i64,
 }
@@ -41,22 +45,32 @@ pub fn sample(names: &[String], count: usize, seed: u64) -> Vec<String> {
     picked
 }
 
-/// Collapse one provider's answers into a single vote.
+/// The middle of a set of readings that already agree.
 ///
-/// A provider reachable on both families answers twice, and those two readings are one
-/// source's opinion -- counting them separately would let a single operator satisfy a quorum
-/// of two. They must also agree with each other: a provider whose own addresses disagree is
+/// Deliberately not the maximum. Under the previous Date-header design the newest reading was
+/// the least stale, because a `Date` is stamped when the response is generated and read some
+/// milliseconds later, so the truth was always at or after it. An NTP timestamp has no such
+/// bias: it is the server's own transmit time, early or late only by network delay in either
+/// direction. With no reason to prefer an extreme, the middle is the reading least sensitive to
+/// one outlier -- and since everything here has already passed the tolerance check, any choice
+/// is within tolerance of the truth anyway.
+fn middle(mut values: Vec<i64>) -> i64 {
+    values.sort_unstable();
+    values[values.len() / 2]
+}
+
+/// Collapse one operator's answers into a single vote.
+///
+/// An operator reachable more than one way answers more than once, and those readings are one
+/// source's opinion -- counting them separately would let a single operator satisfy a quorum of
+/// two. They must also agree with each other: an operator whose own endpoints disagree is
 /// either misconfigured or partially impersonated, and neither is something to average over.
-///
-/// The vote is the latest reading. `Date` is stamped when the response is generated and read
-/// some milliseconds later, so the true time is at or after it; the newest reading is the
-/// least stale.
 fn vote(answers: &[&Answer], tolerance: i64) -> Result<i64, String> {
     let newest = answers.iter().map(|a| a.seconds).max().expect("non-empty");
     let oldest = answers.iter().map(|a| a.seconds).min().expect("non-empty");
 
     if newest - oldest > tolerance {
-        let provider = &answers[0].provider;
+        let provider = &answers[0].operator;
         let spread: Vec<String> = answers
             .iter()
             .map(|a| format!("{}={}", a.endpoint, a.seconds))
@@ -68,14 +82,19 @@ fn vote(answers: &[&Answer], tolerance: i64) -> Result<i64, String> {
         ));
     }
 
-    Ok(newest)
+    Ok(middle(answers.iter().map(|a| a.seconds).collect()))
 }
 
 /// Decide what time to believe, or why no time may be believed.
 ///
-/// Every sampled provider must have answered. A missing provider is not outvoted by the ones
-/// that did answer: with a sample of two there is nothing left to cross-check against, and a
-/// single unchallenged source is exactly what the sampling exists to avoid.
+/// Every sampled operator must have answered. A missing one is not outvoted by the ones that
+/// did: with a sample of two there is nothing left to cross-check against, and a single
+/// unchallenged source is exactly what the sampling exists to avoid.
+///
+/// Why an operator can be missing is deliberately not summarised here. Resolution failing, key
+/// establishment being refused and an NTP packet failing authentication are three different
+/// operational faults, and each is reported by the caller at the point it happened; folding
+/// them into one sentence would lose the only part worth acting on.
 pub fn decide(
     sampled: &[String],
     answers: &[Answer],
@@ -88,7 +107,7 @@ pub fn decide(
 
     let silent: Vec<&str> = sampled
         .iter()
-        .filter(|p| !answers.iter().any(|a| &a.provider == *p))
+        .filter(|p| !answers.iter().any(|a| &a.operator == *p))
         .map(String::as_str)
         .collect();
     if !silent.is_empty() {
@@ -96,7 +115,7 @@ pub fn decide(
         // in the same round, and a message that says "1 of 2" when 2 of 4 failed sends whoever
         // reads it looking for the wrong problem.
         return Err(format!(
-            "{} of {} providers gave no usable answer ({}), and the rest are unchallenged, which is not enough to set a clock",
+            "{} of {} operators gave no usable answer ({}), and the rest are unchallenged, which is not enough to set a clock",
             silent.len(),
             sampled.len(),
             silent.join(", ")
@@ -105,7 +124,7 @@ pub fn decide(
 
     let mut votes: Vec<(String, i64)> = Vec::new();
     for provider in sampled {
-        let own: Vec<&Answer> = answers.iter().filter(|a| &a.provider == provider).collect();
+        let own: Vec<&Answer> = answers.iter().filter(|a| &a.operator == provider).collect();
         votes.push((provider.clone(), vote(&own, tolerance)?));
     }
 
@@ -114,19 +133,20 @@ pub fn decide(
     if newest - oldest > tolerance {
         let spread: Vec<String> = votes.iter().map(|(p, s)| format!("{p}={s}")).collect();
         return Err(format!(
-            "providers disagree by {}s (>{tolerance}s): {}",
+            "operators disagree by {}s (>{tolerance}s): {}",
             newest - oldest,
             spread.join(" ")
         ));
     }
 
-    if newest < floor {
+    let believed = middle(votes.iter().map(|(_, s)| *s).collect());
+    if believed < floor {
         return Err(format!(
-            "refusing {newest}: earlier than the build-time floor {floor}. Retroactive certificate validation proves a chain was valid at the claimed time, not that the claimed time is now, so a once-valid certificate could otherwise roll this clock backwards"
+            "refusing {believed}: earlier than the build-time floor {floor}. Retroactive certificate validation proves a chain was valid at the claimed time, not that the claimed time is now, so a once-valid certificate could otherwise roll this clock backwards"
         ));
     }
 
-    Ok(newest)
+    Ok(believed)
 }
 
 #[cfg(test)]
@@ -136,9 +156,9 @@ mod tests {
     const FLOOR: i64 = 1_700_000_000;
     const NOW: i64 = 1_800_000_000;
 
-    fn answer(provider: &str, endpoint: &str, seconds: i64) -> Answer {
+    fn answer(operator: &str, endpoint: &str, seconds: i64) -> Answer {
         Answer {
-            provider: provider.to_string(),
+            operator: operator.to_string(),
             endpoint: endpoint.to_string(),
             seconds,
         }
@@ -156,7 +176,9 @@ mod tests {
             60,
             FLOOR,
         );
-        assert_eq!(got, Ok(NOW + 3), "the newest reading is the least stale");
+        // The middle of two is the upper of the pair after sorting; what matters is that it is
+        // one of the readings and inside the tolerance, not which extreme it is.
+        assert_eq!(got, Ok(NOW + 3));
     }
 
     #[test]
@@ -167,14 +189,14 @@ mod tests {
             60,
             FLOOR,
         );
-        assert!(got.unwrap_err().contains("providers disagree"));
+        assert!(got.unwrap_err().contains("operators disagree"));
     }
 
     #[test]
     fn a_silent_provider_blocks_the_decision() {
         let got = decide(&names(&["a", "b"]), &[answer("a", "1.1.1.1", NOW)], 60, FLOOR);
         let message = got.unwrap_err();
-        assert!(message.contains("1 of 2 providers"), "{message}");
+        assert!(message.contains("1 of 2 operators"), "{message}");
         assert!(message.contains("(b)"), "{message}");
     }
 
@@ -205,7 +227,7 @@ mod tests {
             FLOOR,
         );
         let message = got.unwrap_err();
-        assert!(message.contains("2 of 4 providers"), "{message}");
+        assert!(message.contains("2 of 4 operators"), "{message}");
         assert!(message.contains('b') && message.contains('d'), "{message}");
     }
 
@@ -288,6 +310,23 @@ mod tests {
         let got = decide(
             &names(&["a", "b"]),
             &[answer("a", "1.1.1.1", NOW), answer("b", "9.9.9.10", NOW)],
+            60,
+            FLOOR,
+        );
+        assert_eq!(got, Ok(NOW));
+    }
+
+    #[test]
+    fn the_middle_is_used_rather_than_an_extreme() {
+        // Three operators spread across the tolerance: the answer must be the middle reading,
+        // so one operator drifting toward the edge cannot drag the result with it.
+        let got = decide(
+            &names(&["a", "b", "c"]),
+            &[
+                answer("a", "x", NOW - 20),
+                answer("b", "y", NOW),
+                answer("c", "z", NOW + 20),
+            ],
             60,
             FLOOR,
         );

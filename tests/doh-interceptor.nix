@@ -19,8 +19,13 @@
 #
 # Used by tests/doh-upstream.nix, tests/iroh-ssh.nix, tests/connectivity-watchdog.nix and
 # tests/rough-time.nix.
+# `certNotBefore` / `certNotAfter` pin the leaf's validity window (see tests/test-cert.nix).
+# Both default to null, i.e. the 100-year certificate every existing caller gets. A window that
+# excludes the present is how a test impersonates a resolver whose certificate is genuinely
+# expired while its clock stays correct -- the only way to exercise a client that defers the
+# date check and re-applies it later.
 { pkgs, dohStamps, readyFile ? "/tmp/doh-interceptor-ready", respond, responseHeaders ? null
-, name ? "doh-interceptor" }:
+, certNotBefore ? null, certNotAfter ? null, name ? "doh-interceptor" }:
 
 let
   lib = pkgs.lib;
@@ -58,6 +63,8 @@ let
   certs = import ./test-cert.nix { inherit pkgs; } {
     name = "${name}-doh";
     sans = dohDomains;
+    notBefore = certNotBefore;
+    notAfter = certNotAfter;
   };
   inherit (certs) caFile certFile keyFile;
 

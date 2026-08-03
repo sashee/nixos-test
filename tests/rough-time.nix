@@ -1,69 +1,101 @@
-{ nixpkgs, pkgs, stateVersion, machineModule, dohStamps, globalTimeout ? 900 }:
+{ nixpkgs, pkgs, stateVersion, machineModule, dohStamps, globalTimeout ? 1200 }:
 
-# The boot-time rough clock, end to end against a REAL TLS path.
+# The boot-time rough clock, end to end over both of its TLS legs.
 #
-# A second node impersonates the deployed DoH providers on their real addresses with a real
-# certificate the machine trusts (tests/doh-interceptor.nix), so rough-time performs the
-# handshake, the two-pass certificate check and the Date parse it performs in production. The
-# only thing the test controls is what the servers say, which is exactly the input whose
-# mishandling would be invisible: a Date outside the certificate's validity, a Date from a
-# cache, two providers disagreeing, one provider answering twice from two addresses.
+# The machine runs the deployed configuration and is told nothing: it resolves the real NTS
+# hostnames through the real DoH provider addresses, does real NTS key establishment, and gets a
+# real authenticated NTPv4 timestamp. What the test owns is the other end -- impersonated DoH
+# resolvers and impersonated NTS servers, each with a certificate the machine trusts.
 #
-# Why so much of this drives the CLI wrapper rather than the unit: the unit samples two
-# providers at random, and a test that has to hold a specific pair cannot be built on a random
-# draw without either pinning the seed (which tests the shuffle, not the decision) or retrying
-# until the draw cooperates (which turns an assertion into a coin flip). `rough-time` is on
-# PATH preloaded with the unit's own flags, so `--only` picks the pair while everything else
-# stays exactly what the unit would use. The unit itself is driven where the integration is the
-# point: that it retries until the network appears, and that it succeeds unattended.
+# The subject is the deferred certificate check. Both legs hand their chain to `Deferred`, and
+# the time is believed only once every chain re-verifies at the instant the NTS server reported.
+# That is tested on each leg separately, by giving one impersonated server a certificate whose
+# validity window excludes the present *while leaving its clock correct* -- possible only
+# because tests/test-cert.nix takes notBefore/notAfter. Making a server lie about the time
+# instead would put it outside its own certificate and it would fail for the wrong reason.
 #
-# NOT covered here, because it needs a clock that something has genuinely synchronised: the
-# STA_UNSYNC no-op path. tests/nts-sync.nix has a real NTS server and covers it there.
+# Why so much of this drives the CLI wrapper rather than the unit: the unit samples operators at
+# random, and a test that must hold a specific pair cannot be built on a random draw. `--only`
+# pins the choice while every other flag stays exactly what the unit uses. The unit itself is
+# driven where the integration is the point -- that it retries until the network appears, and
+# that it converges unattended.
+#
+# Not covered here: operators disagreeing, one operator failing to outvote itself, and the
+# tolerance boundary. Those are decisions taken by `quorum::decide`, which is pure and has
+# fixtures for each; reproducing them with real servers would need a third and fourth NTS node
+# for no additional confidence.
 
 let
   lib = nixpkgs.lib;
 
-  # Well before any plausible build time, so it never blocks a real answer, while still being a
-  # real value rather than 0 -- the floor is only exercised by passing a different one below.
-  floor = 1700000000;
+  floor = 1000000000;
 
-  interceptor = import ./doh-interceptor.nix {
-    inherit pkgs dohStamps;
-    name = "rough-time";
+  goodHost = "time.cloudflare.com";
+  staleHost = "nts.netnod.se";
+
+  # Valid now, so the NTS leg's pass 2 succeeds.
+  ntsCert = import ./test-cert.nix { inherit pkgs; } {
+    name = "nts-good";
+    sans = [ goodHost ];
+  };
+
+  # Well formed, chains to a CA the machine trusts, matches the hostname -- and expired in 2021.
+  # Pass 1 accepts it, which is the whole point of deferring the date check; pass 2 must not.
+  staleCert = import ./test-cert.nix { inherit pkgs; } {
+    name = "nts-stale";
+    sans = [ staleHost ];
+    notBefore = "20200101000000Z";
+    notAfter = "20210101000000Z";
+  };
+
+  mkNtsServer = cert: { ... }: {
+    virtualisation.memorySize = 512;
+    networking.firewall.enable = false;
+    services.chrony = {
+      enable = true;
+      servers = [ ];
+      extraConfig = ''
+        local stratum 10
+        allow all
+        ntsserverkey ${cert.keyFile}
+        ntsservercert ${cert.certFile}
+        ntsprocesses 0
+      '';
+    };
+    system.stateVersion = stateVersion;
+  };
+
+  # Answers the two NTS hostnames with the addresses passed as argv. Two instances of this exist
+  # on the network, differing only in certificate validity; the driver routes the provider
+  # addresses to whichever one a subtest needs.
+  # Both families, because rough-time asks for both: querying A alone would resolve an
+  # IPv6-only host to an address it has no way to reach.
+  respond = ''
+    def respond(query, meta):
+        name, qtype, _, _ = read_question(query)
+        v4 = {"${goodHost}": ARGS[0], "${staleHost}": ARGS[1]}
+        v6 = {"${goodHost}": ARGS[2], "${staleHost}": ARGS[3]}
+        if name not in v4:
+            return nxdomain(query)
+        if qtype == 1:
+            return a(query, v4[name])
+        if qtype == 28:
+            return aaaa(query, v6[name])
+        return nodata(query)
+  '';
+
+  dohGood = import ./doh-interceptor.nix {
+    inherit pkgs dohStamps respond;
+    name = "rough-time-doh";
     readyFile = "/tmp/fake-doh-ready";
+  };
 
-    # The DNS payload is irrelevant here -- nothing on the machine resolves through this node
-    # during the test -- but it has to be well formed, because rough-time reads the response
-    # like any HTTP client and a handler that raised would close the connection instead.
-    respond = ''
-      def respond(query, meta):
-          return a(query, "192.0.2.1")
-    '';
-
-    # The actual subject of the test. Driven by a JSON file the test driver rewrites between
-    # subtests, keyed on the Host header so each impersonated provider can be given a different
-    # answer -- which is what the disagreement and one-provider-two-families cases need.
-    responseHeaders = ''
-      CONTROL = pathlib.Path("/tmp/rough-time-control.json")
-
-      def header_overrides(meta):
-          if not CONTROL.exists():
-              return {}
-          control = json.loads(CONTROL.read_text())
-          # A per-host entry wins over "*", so a subtest can change one provider and leave the
-          # others answering normally.
-          entry = control.get(meta.get("host") or "", control.get("*", {}))
-          out = {}
-          if entry.get("omit_date"):
-              out["Date"] = None
-          elif "epoch" in entry:
-              out["Date"] = http_date(entry["epoch"])
-          elif "offset" in entry:
-              out["Date"] = http_date(time.time() + entry["offset"])
-          if "age" in entry:
-              out["Age"] = str(entry["age"])
-          return out
-    '';
+  dohStale = import ./doh-interceptor.nix {
+    inherit pkgs dohStamps respond;
+    name = "rough-time-doh-stale";
+    readyFile = "/tmp/fake-doh-ready";
+    certNotBefore = "20200101000000Z";
+    certNotAfter = "20210101000000Z";
   };
 in
 
@@ -71,22 +103,50 @@ nixpkgs.lib.nixos.runTest {
   name = "rough-time";
   hostPkgs = pkgs;
   skipTypeCheck = true;
-
-  # Ceiling, not a wait: the rpi variant runs under TCG emulation on the KVM-less aarch64 CI
-  # runner, where the retry-until-success subtest alone spans several 30s restarts.
   inherit globalTimeout;
 
-  # Impersonates all four DoH providers on their real addresses. Binds 0.0.0.0:443, so it needs
-  # its own node.
-  nodes.dohpeer = { ... }: {
+  nodes.dohgood = { nodes, ... }: {
     networking = {
-      hostName = "dohpeer";
+      hostName = "dohgood";
       firewall.enable = false;
     };
-    # Helper node, tiny workload: keeps the two-VM run affordable under aarch64 TCG.
     virtualisation.memorySize = 512;
-    systemd.services.fake-doh = interceptor.mkService { };
+    systemd.services.fake-doh = dohGood.mkService {
+      args = [
+        nodes.ntsgood.networking.primaryIPAddress
+        nodes.ntsstale.networking.primaryIPAddress
+        nodes.ntsgood.networking.primaryIPv6Address
+        nodes.ntsstale.networking.primaryIPv6Address
+      ];
+    };
     system.stateVersion = stateVersion;
+  };
+
+  nodes.dohstale = { nodes, ... }: {
+    networking = {
+      hostName = "dohstale";
+      firewall.enable = false;
+    };
+    virtualisation.memorySize = 512;
+    systemd.services.fake-doh = dohStale.mkService {
+      args = [
+        nodes.ntsgood.networking.primaryIPAddress
+        nodes.ntsstale.networking.primaryIPAddress
+        nodes.ntsgood.networking.primaryIPv6Address
+        nodes.ntsstale.networking.primaryIPv6Address
+      ];
+    };
+    system.stateVersion = stateVersion;
+  };
+
+  nodes.ntsgood = { ... }: {
+    imports = [ (mkNtsServer ntsCert) ];
+    networking.hostName = "ntsgood";
+  };
+
+  nodes.ntsstale = { ... }: {
+    imports = [ (mkNtsServer staleCert) ];
+    networking.hostName = "ntsstale";
   };
 
   nodes.machine = { lib, ... }: {
@@ -94,81 +154,91 @@ nixpkgs.lib.nixos.runTest {
 
     networking.hostName = "rough-time-test";
 
-    # Off in the VM: no network for upgrades, no credentials for reporting/iroh.
     common.autoUpgrade.enable = lib.mkForce false;
     common.monitoring.enable = lib.mkForce false;
     common.irohSsh.enable = lib.mkForce false;
 
-    # The real module, with only the floor supplied (it has no default by design) and the
-    # timeout shortened so an unreachable address costs seconds rather than tens of them --
-    # every subtest below waits on at least one.
     # mkForce: the shared test-node layer switches time sync off on every node (see
-    # testNodeTimeSyncOff in flake.nix), which for this test is the thing under test.
+    # testNodeTimeSyncOff in flake.nix), which here is the thing under test.
     common.timeSync = {
       enable = lib.mkForce true;
+      # Only the two hosts this test impersonates, so no unreachable name adds delay.
+      servers = lib.mkForce [ goodHost staleHost ];
       # mkForce because the host layer supplies the real floor (nixpkgs.lastModified). A 2026
-      # floor would put the 2024 date in the certificate-validity subtest below it, so that
-      # subtest would pass by being rejected for the wrong reason -- the exact confusion the
-      # `assert ... > FLOOR` guard in the test script exists to catch.
+      # floor would reject the deliberately-stale fixtures for the wrong reason.
       floor = lib.mkForce floor;
+      # Only one operator can ever succeed here (the other's certificate is expired), so the
+      # deployed sample of two could never converge. The quorum arithmetic itself is covered by
+      # fixtures in quorum.rs; what this test is for is the two TLS legs.
+      sample = lib.mkForce 1;
       timeoutSeconds = 3;
     };
 
-    # Only this CA, so the two-pass verification is doing real work: pass 1 still has to build
-    # a chain to a trusted root, and pass 2 still has to place the reported Date inside the
-    # leaf's validity.
-    security.pki.certificateFiles = [ interceptor.caFile ];
+    # All four CAs. Verification is still real -- pass 1 must build a chain to a trusted root on
+    # both legs -- so an impersonated server without a trusted CA would fail before any of this
+    # became interesting.
+    security.pki.certificateFiles = [
+      dohGood.caFile
+      dohStale.caFile
+      ntsCert.caFile
+      staleCert.caFile
+    ];
 
     system.stateVersion = stateVersion;
   };
 
   testScript = ''
-    import json
-
-    doh_ipv4 = ${builtins.toJSON interceptor.dohIpv4}
-    doh_ipv6 = ${builtins.toJSON interceptor.dohIpv6}
-    providers = ${builtins.toJSON (lib.mapAttrs (_: p: p.hostname) dohStamps.providers)}
+    doh_ipv4 = ${builtins.toJSON dohGood.dohIpv4}
+    doh_ipv6 = ${builtins.toJSON dohGood.dohIpv6}
     FLOOR = ${toString floor}
 
-    dohpeer.start()
-    dohpeer.wait_for_unit("fake-doh.service")
-    dohpeer.succeed(
-        "${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c "
-        "'until test -e /tmp/fake-doh-ready; do sleep 0.2; done'"
-    )
+    start_all()
 
-    def control(entries):
-        # Rewritten between subtests and read per request, so no server restart is needed and
-        # a subtest cannot inherit the previous one's answers.
-        dohpeer.succeed(
-            "${pkgs.coreutils}/bin/install -m 644 /dev/stdin /tmp/rough-time-control.json <<'EOF'\n"
-            + json.dumps(entries)
-            + "\nEOF"
+    for peer in (dohgood, dohstale):
+        peer.wait_for_unit("fake-doh.service")
+        peer.succeed(
+            "${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c "
+            "'until test -e /tmp/fake-doh-ready; do sleep 0.2; done'"
         )
+    ntsgood.wait_for_unit("chronyd.service")
+    ntsstale.wait_for_unit("chronyd.service")
+    machine.wait_for_unit("multi-user.target")
 
-    def clear_control():
-        dohpeer.succeed("rm -f /tmp/rough-time-control.json")
-
-    def peer_ip():
-        return dohpeer.wait_until_succeeds(
+    def peer_ip(node):
+        return node.wait_until_succeeds(
             "${pkgs.iproute2}/bin/ip -j -4 addr show dev eth1 "
             "| ${pkgs.jq}/bin/jq -r '.[0].addr_info[] | select(.prefixlen==24) | .local' "
             "| ${pkgs.gnugrep}/bin/grep .",
             timeout=120,
         ).strip()
 
-    def connect_upstream():
-        # Runtime routes, exactly as tests/iroh-ssh.nix installs them: the machine's own config
-        # is untouched, so it dials the providers' real addresses believing nothing has changed.
-        via = peer_ip()
-        for ip in doh_ipv4:
-            machine.succeed(f"${pkgs.iproute2}/bin/ip route replace {ip}/32 via {via} dev eth1")
-        for ip in doh_ipv6:
-            machine.succeed(f"${pkgs.iproute2}/bin/ip -6 route replace {ip}/128 dev eth1")
+    def peer_ip6(node):
+        return node.wait_until_succeeds(
+            "${pkgs.iproute2}/bin/ip -j -6 addr show dev eth1 "
+            "| ${pkgs.jq}/bin/jq -r '.[0].addr_info[] "
+            "| select(.prefixlen==64 and .scope==\"global\") | .local' "
+            "| ${pkgs.gnugrep}/bin/grep .",
+            timeout=120,
+        ).strip()
 
-    def disconnect_upstream(v4=True, v6=True):
-        # `unreachable` rather than deleting the route: an unreachable route fails immediately
-        # instead of costing the full connect timeout, which keeps the v4-only subtest quick.
+    def use_resolver(node):
+        # Runtime routes, so the machine's own configuration is untouched: it dials the
+        # providers' real addresses and reaches whichever interceptor the test points them at.
+        #
+        # The IPv6 routes need an explicit gateway rather than being on-link. Both interceptor
+        # nodes hold the same provider /128s on the same segment, so an on-link route would let
+        # neighbour discovery pick either one -- and which resolver answers is exactly what
+        # these subtests are choosing between.
+        via4 = peer_ip(node)
+        via6 = peer_ip6(node)
+        for ip in doh_ipv4:
+            machine.succeed(f"${pkgs.iproute2}/bin/ip route replace {ip}/32 via {via4} dev eth1")
+        for ip in doh_ipv6:
+            machine.succeed(f"${pkgs.iproute2}/bin/ip -6 route replace {ip}/128 via {via6} dev eth1")
+
+
+    def disconnect(v4=True, v6=True):
+        # `unreachable` rather than deleting: it fails at once instead of costing the timeout.
         if v4:
             for ip in doh_ipv4:
                 machine.succeed(f"${pkgs.iproute2}/bin/ip route replace unreachable {ip}/32")
@@ -180,151 +250,110 @@ nixpkgs.lib.nixos.runTest {
         return int(machine.succeed("date +%s").strip())
 
     def rough_time(args, expect_success):
-        # --force because the wrapper is used on a machine whose clock this test has often just
-        # set; the unit's own STA_UNSYNC short-circuit is covered in tests/nts-sync.nix.
-        # --dry-run because these subtests are about the decision, not about stepping the clock.
+        # --force because the machine's clock is often already fine here; the STA_UNSYNC no-op
+        # path is covered in tests/nts-sync.nix, which has a real chrony to clear the bit.
         command = f"rough-time --force --dry-run {args} 2>&1"
-        if expect_success:
-            return machine.succeed(command)
-        return machine.fail(command)
+        return machine.succeed(command) if expect_success else machine.fail(command)
 
-    machine.wait_for_unit("multi-user.target")
-
-    with subtest("a host that cannot reach any provider keeps trying and changes nothing"):
-        # No routes have been installed yet, so this is the state a real cold boot starts in.
+    with subtest("a host that cannot reach any resolver keeps trying and changes nothing"):
         before = clock()
-        # The unit must be retrying rather than dead: a terminal failure here would mean a box
-        # that never gets a clock, never gets DNS, and cannot be reached to be told so.
         machine.wait_until_succeeds(
-            "systemctl show -p NRestarts --value rough-time.service | grep -qvx 0", timeout=180
+            "systemctl show -p NRestarts --value rough-time.service | grep -qvx 0", timeout=240
         )
-        state = machine.succeed("systemctl show -p ActiveState --value rough-time.service").strip()
-        assert state in ("activating", "failed"), f"unexpected state {state}"
-        # `failed` here is the between-restarts state, not a give-up: systemd only stops
-        # retrying when the start limit trips, and RestartSec keeps it clear of that.
         assert (
             "start-limit" not in machine.succeed("systemctl status rough-time.service || true")
         ), "the restart rate limit stopped the retries"
-        drift = abs(clock() - before)
-        assert drift < 120, f"the clock moved {drift}s with no reachable provider"
-        # The whole point of ordering rather than requiring: a box with no time still boots.
+        assert abs(clock() - before) < 120, "the clock moved with nothing reachable"
+        # Ordering, not requiring: a box with no time still boots.
         machine.succeed("systemctl is-active multi-user.target")
 
-    connect_upstream()
+    use_resolver(dohgood)
 
-    with subtest("the clock is set once the providers are reachable"):
-        clear_control()
-        # Unattended: the driver does not start the unit, it only repairs the network, so this
-        # asserts the retry loop converges on its own.
-        machine.wait_for_unit("rough-time.service", timeout=300)
-        served = int(dohpeer.succeed("date +%s").strip())
+    with subtest("the clock is set once the whole chain is reachable"):
+        # Unattended: the driver only repairs the network, so this asserts the retry loop gets
+        # through DoH resolution, NTS key establishment and an authenticated NTP exchange on its
+        # own -- which is also the only place the exporter-derived AEAD keys are exercised
+        # against a real server rather than a fixture.
+        machine.wait_for_unit("rough-time.service", timeout=420)
+        served = int(ntsgood.succeed("date +%s").strip())
         drift = abs(clock() - served)
-        assert drift < 120, f"clock is {drift}s from what the providers served"
+        assert drift < 120, f"clock is {drift}s from what the NTS server serves"
 
-    with subtest("a Date outside the certificate's validity is refused"):
-        # The single most important case: this is what stops "ignore the dates during the
-        # handshake" from becoming "accept a chain from anyone holding any old certificate".
-        #
-        # 2024-01-01, chosen to sit ABOVE the floor and below the test CA's notBefore (its
-        # build time). An earlier date would also be rejected, but by the floor -- so the
-        # subtest would still pass with pass 2 deleted entirely, which is precisely the bug it
-        # exists to catch. Verified by mutation: removing the pass 2 call makes this fail.
-        assert 1704067200 > FLOOR, "the date below must exercise validity, not the floor"
-        control({"*": {"epoch": 1704067200}})
-        output = rough_time("--only cloudflare,google", expect_success=False)
+    with subtest("an NTS server outside its certificate's validity is refused"):
+        # The heart of it. ntsstale's certificate chains to a trusted CA, matches the hostname
+        # and is accepted by pass 1 -- and expired in 2021, while the server's own clock is
+        # correct. Only pass 2 can catch this.
+        output = rough_time("--only netnod", expect_success=False)
         assert "not valid at the time the server reported" in output, output
+        assert "NTS-KE" in output, f"the failing leg should be named: {output}"
 
-    with subtest("a Date below the floor is refused even though the certificate allows it"):
-        # Distinct from the case above: the chain is perfectly valid at this instant. Only the
-        # floor rejects it, which is what bounds a rollback by a once-valid certificate.
-        clear_control()
-        output = rough_time(f"--only cloudflare,google --floor {2 ** 40}", expect_success=False)
+    with subtest("a DoH resolver outside its certificate's validity is refused"):
+        # The other leg, and it must fail even though the NTS server is beyond reproach: the
+        # resolver that produced the address is part of what vouches for the answer, so its
+        # certificate has to hold at the same instant.
+        use_resolver(dohstale)
+        output = rough_time("--only cloudflare", expect_success=False)
+        assert "not valid at the time the server reported" in output, output
+        assert "DoH" in output, f"the failing leg should be named: {output}"
+        use_resolver(dohgood)
+
+    with subtest("a time below the floor is refused"):
+        # Distinct from the two above: every chain is valid at this instant, and only the floor
+        # rejects it. That is what bounds a rollback by a once-valid certificate.
+        output = rough_time(f"--only cloudflare --floor {2 ** 40}", expect_success=False)
         assert "earlier than the build-time floor" in output, output
 
-    with subtest("providers that disagree set nothing"):
-        control({
-            providers["cloudflare"]: {"offset": 0},
-            providers["google"]: {"offset": 300},
-        })
-        output = rough_time("--only cloudflare,google", expect_success=False)
-        assert "providers disagree" in output, output
-
-    with subtest("the tolerance boundary is where it says it is"):
-        control({
-            providers["cloudflare"]: {"offset": 0},
-            providers["google"]: {"offset": 59},
-        })
-        rough_time("--only cloudflare,google --tolerance 60", expect_success=True)
-
-        control({
-            providers["cloudflare"]: {"offset": 0},
-            providers["google"]: {"offset": 61},
-        })
-        output = rough_time("--only cloudflare,google --tolerance 60", expect_success=False)
-        assert "providers disagree" in output, output
-
-    with subtest("one provider answering on both families is still one vote"):
-        # cloudflare answers over IPv4 and IPv6; quad9 says nothing. Two answers arrive, but
-        # from one operator, and a quorum of two must not be satisfied by that.
-        clear_control()
-        control({providers["quad9"]: {"omit_date": True}})
-        output = rough_time("--only cloudflare,quad9", expect_success=False)
-        assert "of 2 providers gave no usable answer" in output, output
-        assert "quad9" in output, output
-
-    with subtest("a cached response is ignored"):
-        clear_control()
-        control({providers["google"]: {"age": 122}})
-        output = rough_time("--only cloudflare,google", expect_success=False)
-        assert "served from a cache" in output, output
-
-    with subtest("a provider that sends no Date at all is reported as such"):
-        clear_control()
-        control({"*": {"omit_date": True}})
-        output = rough_time("--only cloudflare,google", expect_success=False)
-        assert "no Date header" in output, output
-
     with subtest("a v4-only host still gets a clock"):
-        # The rpi5 has no IPv6 route in practice, so every v6 endpoint fails. Those failures
-        # must count as "no answer from that address", never as a provider disagreeing.
-        clear_control()
-        disconnect_upstream(v4=False, v6=True)
-        rough_time("--only cloudflare,google", expect_success=True)
-        connect_upstream()
+        disconnect(v4=False, v6=True)
+        rough_time("--only cloudflare", expect_success=True)
+        use_resolver(dohgood)
 
     with subtest("a v6-only host still gets a clock"):
-        # The mirror, and not redundant: the two families are separate code paths all the way
-        # down -- separate addresses in lib/doh-stamps.nix, separate sockets, separate routes --
-        # and this repo already treats an asymmetry between them as serious enough to run a
-        # dedicated v6-only client in tests/doh-upstream.nix. With only v4 blackholed, a
-        # provider is reachable solely over IPv6, so this also proves an address the v4-only
-        # subtest never needs is genuinely dialled rather than merely configured.
-        clear_control()
-        disconnect_upstream(v4=True, v6=False)
-        rough_time("--only cloudflare,google", expect_success=True)
-        connect_upstream()
+        # Not redundant with the above: the two families are separate addresses, sockets and
+        # routes all the way down, and this repo already treats an asymmetry between them as
+        # serious enough to run a dedicated v6-only client in tests/doh-upstream.nix.
+        #
+        # Retried rather than attempted once. Installing a route is not the same as being able
+        # to use it -- neighbour discovery for the gateway still has to complete, and under TCG
+        # that took long enough for this to fail about one run in three, while the IPv4 path
+        # the preceding subtests had already warmed kept working. There is no cheap independent
+        # probe to wait on either: the interceptor answers TLS on 443 and nothing else, not
+        # even ICMPv6. So retry the operation itself.
+        disconnect(v4=True, v6=False)
+        machine.wait_until_succeeds(
+            "rough-time --force --dry-run --only cloudflare", timeout=120
+        )
+        use_resolver(dohgood)
+
+    with subtest("an NTS server reachable only over IPv6 still gives the time"):
+        # The v4-only/v6-only pair above covers the DoH leg -- reaching the resolver. This
+        # covers the other one: the resolver is reachable, but the NTS server it names is not
+        # reachable over IPv4. Querying A alone (as this program once did) resolves to an
+        # address the host cannot use and the whole chain fails.
+        ntsgood_v4 = ntsgood.succeed(
+            "${pkgs.iproute2}/bin/ip -j -4 addr show dev eth1 "
+            "| ${pkgs.jq}/bin/jq -r '.[0].addr_info[] | select(.prefixlen==24) | .local'"
+        ).strip()
+        machine.succeed(f"${pkgs.iproute2}/bin/ip route replace unreachable {ntsgood_v4}/32")
+        # Retried for the same reason as the subtest above: this is the first traffic to the
+        # NTS server over IPv6, so its neighbour entry is cold.
+        machine.wait_until_succeeds(
+            "rough-time --force --dry-run --only cloudflare", timeout=120
+        )
+        machine.succeed(f"${pkgs.iproute2}/bin/ip route del unreachable {ntsgood_v4}/32")
 
     with subtest("the unit keeps exactly the privilege it needs"):
-        # Setting the clock is why this unit is not sandboxed like the others, so the shape of
-        # that exception is worth pinning: everything here is deliberate, and a later refactor
-        # that widened it would otherwise pass every test in the repo.
         def unit_property(name):
             return machine.succeed(
                 f"systemctl show -p {name} --value rough-time.service"
             ).strip()
 
-        # Exactly one capability. `CAP_SYS_TIME` alone is the whole reason the unit is
-        # privileged; anything else in the bounding set is scope it does not need.
         bounding = unit_property("CapabilityBoundingSet")
-        assert bounding == "cap_sys_time", f"bounding set is {bounding!r}, expected cap_sys_time"
-        ambient = unit_property("AmbientCapabilities")
-        assert ambient == "cap_sys_time", f"ambient set is {ambient!r}, expected cap_sys_time"
-
-        # Deliberately off -- the unit exists to change the clock -- so pin it rather than
-        # leave it looking like an oversight someone should "fix".
-        protect_clock = unit_property("ProtectClock")
-        assert protect_clock == "no", f"ProtectClock is {protect_clock!r}; the unit cannot set the clock with it on"
-
+        assert bounding == "cap_sys_time", f"bounding set is {bounding!r}"
+        assert unit_property("AmbientCapabilities") == "cap_sys_time"
+        # Deliberately off -- the unit exists to change the clock -- so pin it rather than leave
+        # it looking like an oversight someone should tidy up.
+        assert unit_property("ProtectClock") == "no"
         for name in [
             "NoNewPrivileges",
             "RestrictSUIDSGID",
@@ -333,37 +362,20 @@ nixpkgs.lib.nixos.runTest {
             "ProtectKernelTunables",
             "LockPersonality",
         ]:
-            value = unit_property(name)
-            assert value == "yes", f"{name} is {value!r}, expected yes"
-
-        # Reaching the providers needs the internet and nothing else.
+            assert unit_property(name) == "yes", f"{name} is not enabled"
         families = unit_property("RestrictAddressFamilies")
         assert set(families.split()) == {"AF_INET", "AF_INET6"}, families
 
-    with subtest("the deployed provider set still converges"):
-        # Reproduces production: quad9 and mullvad send no Date, so only one draw in six can
-        # succeed. The unit must still get there on its own, which is the property that makes
-        # shipping the full DoH list acceptable rather than curating a list of what works.
-        control({
-            providers["quad9"]: {"omit_date": True},
-            providers["mullvad"]: {"omit_date": True},
-        })
+    with subtest("the unit converges unattended after a large step"):
         machine.succeed("date -s '2001-01-01 00:00:00'")
         machine.succeed("systemctl reset-failed rough-time.service || true")
         machine.succeed("systemctl restart rough-time.service || true")
-        # Wait on the clock, not on the unit. `systemctl show -p Result` reports the last
-        # FINISHED run, and `reset-failed` resets it to "success" -- so polling it returns
-        # immediately on the previous run's result and the assertion below then races the
-        # retry loop. Observed exactly that: a draw that needed several retries failed here
-        # while the unit was still working.
+        # Wait on the clock, not the unit: `systemctl show -p Result` reports the last FINISHED
+        # run and `reset-failed` resets it to "success", so polling it races the retry loop.
         machine.wait_until_succeeds(f"test $(date +%s) -gt {FLOOR}", timeout=600)
-        assert clock() > FLOOR, "the clock was never brought forward"
 
     with subtest("nothing was left broken"):
-        # A step of a quarter century just happened. Anything that ended up failed because of
-        # it is a real finding, not test noise.
         failed = machine.succeed("systemctl list-units --state=failed --no-legend || true").strip()
-        # chrony-wait is expected: there is no NTS server on this network for it to wait for.
         remaining = [
             line for line in failed.splitlines() if "chrony-wait" not in line and line.strip()
         ]
