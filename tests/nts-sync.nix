@@ -1,4 +1,7 @@
-{ nixpkgs, pkgs, stateVersion, machineModule, dohStamps, globalTimeout ? 1200 }:
+# Raised from 1200 when the unwedge node arrived: its three subtests are two 120s countdowns
+# plus a real reboot, and the ceiling should stay above the sum of the waits inside the test so a
+# slow run fails on the subtest that was slow rather than on the global deadline.
+{ nixpkgs, pkgs, stateVersion, machineModule, dohStamps, globalTimeout ? 1800 }:
 
 # The whole time chain, on the real host config: rough clock -> DNS -> chrony over NTS.
 #
@@ -188,10 +191,77 @@ nixpkgs.lib.nixos.runTest {
       # here exercises an unreachable provider, so the short timeout that keeps
       # tests/rough-time.nix brisk buys nothing.
       timeoutSeconds = 10;
+      # No unwedge unit on THIS node. Several subtests below deliberately leave the machine
+      # unsynchronised for 60-90s at a stretch -- a blocked NTS port, a skewed source -- and a
+      # unit whose whole job is to reboot an unsynchronised host would fire in the middle of
+      # them. The unwedge node below owns that behaviour instead.
+      unwedgeSeconds = null;
     };
 
     # Both CAs: the DoH interceptor's, so dnscrypt-proxy and rough-time accept it, and the NTS
     # servers', so chrony's NTS-KE does. Nothing else about the node changes.
+    security.pki.certificateFiles = [ interceptor.caFile ntsCert.caFile ];
+
+    system.stateVersion = stateVersion;
+  };
+
+  # A second machine, for the reboot failsafe alone. Its own node because the behaviour under
+  # test is a reboot on a timer, which cannot share a machine with subtests that need the host to
+  # sit unsynchronised on purpose -- and because it has to survive two reboots with its network
+  # intact, which runtime routes do not.
+  nodes.unwedge = { lib, nodes, ... }: {
+    imports = [ machineModule ];
+
+    networking.hostName = "unwedge-test";
+
+    common.autoUpgrade.enable = lib.mkForce false;
+    common.monitoring.enable = lib.mkForce false;
+    common.irohSsh.enable = lib.mkForce false;
+    common.systemMetrics.enable = lib.mkForce false;
+
+    common.timeSync = {
+      enable = lib.mkForce true;
+      servers = lib.mkForce [ goodHost liarHost ];
+      floor = lib.mkForce 1000000000;
+      timeoutSeconds = 10;
+      # The module's floor, so the run is as short as the assertion allows.
+      unwedgeSeconds = 120;
+    };
+
+    # Started by the driver, not by the boot. The countdown is 120s from the moment rough-time
+    # succeeds, which on a normal boot is before the driver has finished attaching to this node
+    # at all -- so left to start itself, the reboot lands in the middle of whichever driver call
+    # is in flight and the test dies of a broken pipe rather than of anything it meant to check
+    # (observed). Everything the unit actually decides -- the Requires on rough-time, the wait,
+    # the breadcrumb, the stand-down -- is exercised either way; only the clock starts on cue.
+    systemd.services.time-sync-unwedge.wantedBy = lib.mkForce [ ];
+
+    # In the configuration rather than applied by the driver, because this node reboots twice and
+    # each boot has to come back with the resolver reachable. The v6 provider addresses are made
+    # unreachable for the same reason connect_upstream does it: this network has no v6 route to
+    # them, and failing fast beats paying timeoutSeconds per address.
+    #
+    # Its own unit rather than networking.localCommands: that runs `before network.target` and
+    # therefore before network-addresses-eth1 has assigned anything, so installing a route via a
+    # gateway on eth1's subnet fails with "Nexthop has invalid gateway" (observed). What this
+    # needs is to be after the addresses and before the first rough-time attempt.
+    systemd.services.doh-routes = {
+      description = "Point the DoH provider addresses at the interceptor";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network.target" ];
+      before = [ "rough-time.service" ];
+      path = [ pkgs.iproute2 ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script =
+        lib.concatMapStrings
+          (ip: "ip route replace ${ip}/32 via ${nodes.dohpeer.networking.primaryIPAddress} dev eth1\n")
+          interceptor.dohIpv4
+        + lib.concatMapStrings (ip: "ip -6 route replace unreachable ${ip}/128\n") interceptor.dohIpv6;
+    };
+
     security.pki.certificateFiles = [ interceptor.caFile ntsCert.caFile ];
 
     system.stateVersion = stateVersion;
@@ -217,6 +287,76 @@ nixpkgs.lib.nixos.runTest {
         "${pkgs.chrony}/bin/chronyc tracking | grep -q 'Leap status.*Normal'", timeout=180
     )
     machine.wait_for_unit("multi-user.target")
+
+    # The reboot failsafe, on its own node. Everything below happens on `unwedge`.
+    STATE = "/var/lib/time-sync-unwedge/rebooted-boot-id"
+    UNWEDGE_JOURNAL = "journalctl -b -u time-sync-unwedge --no-pager -o cat"
+
+    def wedge_chrony():
+        # The state the failsafe is defined by: the rough clock has succeeded, and nothing is
+        # disciplining the clock. In production that is reached by the asymmetry the module
+        # documents -- rough-time resolves the NTS names itself at a pinned address while chronyd
+        # goes through dnscrypt-proxy, so a wedged resolver stops one and not the other. Staging
+        # the cause instead of the state does not work here: a desktop configuration with no
+        # resolver at all never reaches multi-user.target, so the node cannot be driven (observed).
+        unwedge.succeed("systemctl stop chrony-wait.service || true")
+        unwedge.succeed("systemctl reset-failed chrony-wait.service || true")
+        unwedge.succeed("systemctl stop chronyd.service")
+        unwedge.succeed("rm -f /run/chrony-wait/synchronized")
+        # Stopping chronyd does not by itself make the kernel report an unsynchronised clock --
+        # STA_UNSYNC stays clear for hours once something has cleared it, because the kernel only
+        # re-sets it when maxerror crawls up to NTP_PHASE_LIMIT. A step does set it immediately,
+        # via ntp_clear() in do_settimeofday64(), which is also why rough-time's own step leaves
+        # the bit set. Two minutes keeps the clock well inside the fixtures' validity.
+        unwedge.succeed("date -s '+2 minutes'")
+        unwedge.fail("rough-time --check-synced")
+
+    with subtest("the failsafe will not count anything without a successful rough clock"):
+        # The ordering IS the safety property: a host with no network must be retried, not
+        # rebooted, and the only thing between those two outcomes is that this unit requires
+        # rough-time to have succeeded first.
+        unwedge.wait_for_unit("multi-user.target")
+        requires = unwedge.succeed(
+            "systemctl show -p Requires --value time-sync-unwedge.service"
+        )
+        assert "rough-time.service" in requires, requires
+        after = unwedge.succeed("systemctl show -p After --value time-sync-unwedge.service")
+        assert "rough-time.service" in after, after
+        unwedge.wait_for_unit("rough-time.service", timeout=600)
+
+    with subtest("a rough clock that succeeded while nothing synchronises reboots the host"):
+        wedge_chrony()
+        unwedge.succeed("systemctl start --no-block time-sync-unwedge.service")
+        unwedge.wait_for_shutdown()
+
+        unwedge.start()
+        unwedge.wait_for_unit("multi-user.target")
+        previous = unwedge.succeed(
+            "journalctl -b -1 -u time-sync-unwedge --no-pager -o cat || true"
+        )
+        assert "; rebooting" in previous, previous
+        # The breadcrumb is what bounds the next round. Written before the reboot on purpose, so
+        # a /var that cannot be written produces no reboot rather than an endless series of them.
+        unwedge.succeed(f"test -s {STATE}")
+
+    with subtest("a second stuck boot stands down instead of rebooting again"):
+        # The failure this bounds is the one a reboot cannot fix. Rebooting helps a wedged
+        # resolver; it does nothing for a chrony that persistently refuses sources whose
+        # intervals do not overlap, and an unbounded rule would then reboot this host every
+        # unwedgeSeconds forever -- the shape of the 2026-07-27 bootloop that
+        # modules/connectivity-watchdog.nix exists to avoid repeating.
+        unwedge.wait_for_unit("rough-time.service", timeout=600)
+        wedge_chrony()
+        unwedge.succeed("systemctl start time-sync-unwedge.service")
+        journal = unwedge.succeed(f"{UNWEDGE_JOURNAL} || true")
+        assert "standing down" in journal, journal
+        assert "; rebooting" not in journal, journal
+        # And it is still the same boot: a reboot would have emptied this journal.
+        assert "; rebooting" in unwedge.succeed(
+            "journalctl -b -1 -u time-sync-unwedge --no-pager -o cat || true"
+        ), "the previous boot's reboot verdict went missing"
+        unwedge.succeed("systemctl is-active multi-user.target")
+
 
     def peer_ip(node):
         return node.wait_until_succeeds(
@@ -530,5 +670,6 @@ nixpkgs.lib.nixos.runTest {
 
         sources = machine.succeed("${pkgs.chrony}/bin/chronyc sources")
         machine.log("sources with one skewed server:\n" + sources)
+
   '';
 }

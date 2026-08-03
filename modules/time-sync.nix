@@ -23,7 +23,14 @@
 #
 # rough-time asks the kernel (STA_UNSYNC) before touching anything, so on a host whose clock
 # is already disciplined -- a laptop with a working RTC, or any warm reboot where chrony got
-# there first -- it is a no-op.
+# there first -- it is a no-op. It also stands down when the clock, however wrong, already sits
+# inside the validity of every certificate it just checked: TLS works at that point, which is
+# the only thing this program exists to arrange, and stepping would replace an error chrony is
+# about to correct precisely with a whole-second approximation of the same instant.
+#
+# That leans on chrony being able to step a large error, which it can because nixpkgs defaults
+# `services.chrony.makestep` to `0.1 3` -- the first three updates step, with no size limit. A
+# host that turned makestep off would slew instead, and an error of weeks would take weeks.
 #
 # It reaches the same NTS servers chrony does, which is the point: bootstrap and steady state
 # rest on one set of parties. It gets there by resolving their names through a DoH resolver
@@ -95,6 +102,64 @@ let
     name = "rough-time";
     text = ''
       exec ${lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ roughTimeArgs)} "$@"
+    '';
+  };
+
+  # Where the boot that already spent this episode's one reboot is recorded. Persistent, unlike
+  # the /run markers elsewhere in this repo, because the whole question spans a reboot.
+  unwedgeState = "/var/lib/time-sync-unwedge/rebooted-boot-id";
+
+  # `null` disables the unit, but the script below is still a well-formed derivation in the `let`
+  # block, so it must not interpolate an empty string into arithmetic. Zero is never used.
+  unwedgeSeconds = toString (if cfg.unwedgeSeconds == null then 0 else cfg.unwedgeSeconds);
+
+  unwedge = pkgs.writeShellApplication {
+    name = "time-sync-unwedge";
+    runtimeInputs = [ pkgs.coreutils pkgs.systemd ];
+    text = ''
+      # "Synchronised" is asked of the kernel through rough-time itself rather than of chronyc,
+      # so this unit and the program it follows cannot disagree about what the word means. The
+      # kernel's STA_UNSYNC is also the honest question here: chronyc would report chrony's own
+      # opinion, and a chrony that believes it has synchronised without telling the kernel is
+      # exactly one of the states worth catching.
+      synced() {
+        ${lib.getExe cfg.package} --check-synced >/dev/null 2>&1
+      }
+
+      deadline=$(( $(cut -d. -f1 /proc/uptime) + ${unwedgeSeconds} ))
+      while [ "$(cut -d. -f1 /proc/uptime)" -lt "$deadline" ]; do
+        if synced; then
+          # Episode over. Clearing the breadcrumb is what makes the guard below "one reboot per
+          # stuck episode" rather than "one reboot ever".
+          rm -f ${unwedgeState}
+          echo "time-sync-unwedge: the clock is synchronised; nothing to do"
+          exit 0
+        fi
+        sleep 10
+      done
+
+      boot_id="$(cat /proc/sys/kernel/random/boot_id)"
+
+      # Bounded to one reboot per episode. Rebooting is only a remedy for a wedged resolver or
+      # daemon; when the cause is something a restart cannot fix -- chrony persistently refusing
+      # sources whose intervals do not overlap, say -- an unbounded rule would reboot this host
+      # every ${unwedgeSeconds}s forever, which is the shape of the 2026-07-27
+      # bootloop that modules/connectivity-watchdog.nix was written to avoid repeating.
+      #
+      # Note the direction each failure falls in, which is the opposite of that module's: a read
+      # that fails here means "no record of a previous reboot", so the worst case is one extra
+      # reboot rather than a disabled failsafe -- and the write below happens BEFORE the reboot
+      # precisely so a full or read-only /var cannot produce an unbounded loop.
+      if [ -r ${unwedgeState} ] && [ "$(cat ${unwedgeState})" != "$boot_id" ]; then
+        echo "time-sync-unwedge: still unsynchronised, but a previous boot already rebooted for this; standing down"
+        exit 0
+      fi
+
+      # journald is persistent (services.journald.storage), so this verdict survives the reboot
+      # and is readable afterwards with `journalctl -b -1 -u time-sync-unwedge`.
+      echo "time-sync-unwedge: the rough clock succeeded but chrony has not synchronised in ${unwedgeSeconds}s; rebooting"
+      printf '%s' "$boot_id" > ${unwedgeState}
+      systemctl reboot
     '';
   };
 in
@@ -203,6 +268,27 @@ in
       '';
     };
 
+    unwedgeSeconds = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = 3600;
+      description = ''
+        How long to wait for chrony to synchronise after the rough clock has succeeded, before
+        rebooting. `null` installs no such unit at all.
+
+        Note where this sits: it only starts once rough-time has obtained an authenticated
+        timestamp, so by the time it is counting, the network and the NTS servers demonstrably
+        work. A host with no network never gets here -- rough-time fails and systemd retries it
+        every [](#opt-common.timeSync.restartSeconds) instead, which is the right response to an
+        outage and is why this is not a general "the clock is wrong" reboot.
+
+        What it does catch is the state where the rough clock worked but chrony still cannot:
+        rough-time resolves the NTS hostnames itself over DoH at a pinned address, while chrony
+        resolves them through dnscrypt-proxy, so a wedged resolver leaves chrony unable to reach
+        servers rough-time just talked to. A reboot fixes that and nothing else on the host would
+        notice.
+      '';
+    };
+
     syncedMarker = lib.mkOption {
       type = lib.types.path;
       default = "/run/chrony-wait/synchronized";
@@ -253,6 +339,20 @@ in
           chrony would use it, but rough-time could not: it needs the operator that file carries,
           because the operator is what decides whether two answers count as one source or two.
           Add the host there rather than only here.
+        '';
+      }
+      {
+        # chronyd polls with `iburst` (services.chrony.serverOption's default), so its first
+        # synchronisation after the rough clock is seconds away, not minutes. What this floor
+        # protects against is a window shorter than that first exchange, which would reboot a
+        # host that was about to synchronise -- and since the clock is unsynchronised again from
+        # zero on the next boot, that is a loop rather than a single wasted reboot.
+        assertion = cfg.unwedgeSeconds == null || cfg.unwedgeSeconds >= 120;
+        message = ''
+          common.timeSync.unwedgeSeconds (${toString cfg.unwedgeSeconds}) must be at least 120:
+          chrony needs a key establishment and a few polls per source before it can synchronise,
+          and rebooting inside that window reboots a host that was about to succeed -- every
+          boot, since the clock starts unsynchronised again each time.
         '';
       }
     ];
@@ -358,6 +458,31 @@ in
         # oneshot's process exits. Same reasoning as the watchdog marker in
         # modules/connectivity-watchdog.nix.
         RuntimeDirectoryPreserve = true;
+      };
+    };
+
+    # Last resort for the one state the retry loop above cannot fix: the rough clock succeeded,
+    # so the network and the NTS servers work, and chrony still has not synchronised. See the
+    # `unwedgeSeconds` description for why that is a narrow and specific failure rather than
+    # "the clock is wrong", and why a host with no network never reaches this unit at all.
+    systemd.services.time-sync-unwedge = lib.mkIf (cfg.unwedgeSeconds != null) {
+      description = "Reboot if chrony cannot synchronise after the rough clock succeeded";
+      # Requires, not just after: this must only count while the rough clock has actually
+      # succeeded. That ordering is the entire reason the trigger means what it says.
+      after = [ "rough-time.service" ];
+      requires = [ "rough-time.service" ];
+      wantedBy = [ "multi-user.target" ];
+
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = lib.getExe unwedge;
+        StateDirectory = "time-sync-unwedge";
+        # The script owns the deadline, so systemd's must sit outside it -- otherwise systemd
+        # kills the script at the moment it was about to decide, and the reboot never happens.
+        TimeoutStartSec = "${toString (cfg.unwedgeSeconds + 120)}s";
+        # One verdict per boot. Restart=on-failure would re-arm the wait after a stand-down and
+        # turn "at most one reboot per stuck episode" back into a loop.
+        Restart = "no";
       };
     };
 

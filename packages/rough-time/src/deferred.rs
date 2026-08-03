@@ -33,16 +33,31 @@ pub struct Deferred {
     pending: Vec<Pending>,
 }
 
-/// A timestamp that has been checked against every chain gathered on the way to it.
+/// A timestamp that has been checked against every chain gathered on the way to it, plus the
+/// span over which those chains are simultaneously valid.
 ///
-/// The field is private and the only constructor is `Deferred::accept`, so this type existing
-/// is itself the evidence that pass 2 ran.
+/// The fields are private and the only constructor is `Deferred::accept`, so this type existing
+/// is itself the evidence that pass 2 ran. The window rides along for the same reason the
+/// timestamp does: it is derived from the very chains pass 2 just checked, so a caller cannot
+/// obtain one that no verified chain vouches for.
 #[derive(Debug)]
-pub struct Verified(i64);
+pub struct Verified {
+    seconds: i64,
+    window: Option<(i64, i64)>,
+}
 
 impl Verified {
     pub fn seconds(&self) -> i64 {
-        self.0
+        self.seconds
+    }
+
+    /// When every chain behind this timestamp is valid at once.
+    ///
+    /// `None` if the chains have no common instant. `verify_at` would already have rejected such
+    /// a set at the timestamp itself, so this should be unreachable; callers must nonetheless
+    /// treat it as "no window is known" rather than "any time is fine".
+    pub fn window(&self) -> Option<(i64, i64)> {
+        self.window
     }
 }
 
@@ -73,13 +88,42 @@ impl Deferred {
             return Err("no certificate chains were recorded, so nothing vouches for this time".to_string());
         }
 
+        // The window is collected in the same pass, from the same chains, so the two cannot
+        // describe different sets of certificates.
+        //
+        // A single chain of unknown window makes the whole window unknown, rather than merely
+        // dropping out of the intersection. That distinction is load-bearing: `intersect` over an
+        // empty slice is `Some((i64::MIN, i64::MAX))`, so silently skipping unknowns would turn
+        // "we could not tell" into "every instant is inside", which is the one wrong answer a
+        // caller deciding whether the clock is already good enough must never be given.
+        let mut windows: Vec<(i64, i64)> = Vec::with_capacity(self.pending.len());
+        let mut window_known = true;
         for pending in &self.pending {
             verifier
                 .verify_at(&pending.chain, &pending.server_name, seconds)
                 .map_err(|e| format!("{}: {e}", pending.leg))?;
+
+            // `verify_at` has just accepted this chain, so it has a leaf.
+            let (leaf, intermediates) = pending
+                .chain
+                .split_first()
+                .ok_or_else(|| format!("{}: an empty chain was recorded", pending.leg))?;
+            match crate::verify::chain_window(leaf, intermediates)
+                .map_err(|e| format!("{}: {e}", pending.leg))?
+            {
+                Some(window) => windows.push(window),
+                None => window_known = false,
+            }
         }
 
-        Ok(Verified(seconds))
+        Ok(Verified {
+            seconds,
+            window: if window_known {
+                crate::verify::intersect(&windows)
+            } else {
+                None
+            },
+        })
     }
 }
 

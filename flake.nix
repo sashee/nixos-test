@@ -484,7 +484,8 @@
           imports = [ rpiConnectivitySystemModule ./modules/time-sync.nix ];
           common.connectivityFallback.bootGrace = "3h";
         };
-        globalTimeout = 2400;
+        # Five VMs under TCG, and the unwedge node adds two 120s countdowns and a real reboot.
+        globalTimeout = 3000;
       };
       # Production timer constants under icount time-warp, on the real rpi config. Composes
       # rpiNodeBase rather than rpiSystemModule so this node owns the sole -rtc flag (it

@@ -14,6 +14,12 @@
 # because tests/test-cert.nix takes notBefore/notAfter. Making a server lie about the time
 # instead would put it outside its own certificate and it would fail for the wrong reason.
 #
+# Those same windows are what decides whether the clock gets set at all, so the driver moves the
+# machine's clock in and out of them deliberately. The fixtures are 100-year certificates issued
+# at build time and these nodes boot at tomorrow 10:00 (lib/test-rtc-base.nix), i.e. already
+# inside -- so any subtest that means to watch the clock being SET has to put it outside first,
+# or it passes while rough-time does nothing.
+#
 # Why so much of this drives the CLI wrapper rather than the unit: the unit samples operators at
 # random, and a test that must hold a specific pair cannot be built on a random draw. `--only`
 # pins the choice while every other flag stays exactly what the unit uses. The unit itself is
@@ -172,6 +178,11 @@ nixpkgs.lib.nixos.runTest {
       # fixtures in quorum.rs; what this test is for is the two TLS legs.
       sample = lib.mkForce 1;
       timeoutSeconds = 3;
+      # No unwedge unit here. This test has no chrony that can ever synchronise -- the NTS nodes
+      # are the subject, not sources this machine polls -- so the unit would wait out its window
+      # and reboot the machine in the middle of the run. The unit is covered in
+      # tests/nts-sync.nix, which has a real chrony to satisfy or to wedge on purpose.
+      unwedgeSeconds = null;
     };
 
     # All four CAs. Verification is still real -- pass 1 must build a chain to a trusted root on
@@ -267,6 +278,14 @@ nixpkgs.lib.nixos.runTest {
         # Ordering, not requiring: a box with no time still boots.
         machine.succeed("systemctl is-active multi-user.target")
 
+    # Outside the good certificates' validity, which is what makes the next subtest test
+    # anything. The fixtures are 100-year certificates (tests/test-cert.nix) issued at build
+    # time, so the tomorrow-10:00 clock these nodes boot with sits comfortably INSIDE them -- and
+    # rough-time now stands down when the clock is already inside, because TLS works there and
+    # there is nothing left for it to fix. 2001 is before every fixture's notBefore, so the unit
+    # has to do the whole job.
+    machine.succeed("date -s '2001-01-01 00:00:00'")
+
     use_resolver(dohgood)
 
     with subtest("the clock is set once the whole chain is reachable"):
@@ -302,6 +321,31 @@ nixpkgs.lib.nixos.runTest {
         # rejects it. That is what bounds a rollback by a once-valid certificate.
         output = rough_time(f"--only cloudflare --floor {2 ** 40}", expect_success=False)
         assert "earlier than the build-time floor" in output, output
+
+    with subtest("a clock already inside the certificates' validity is left alone"):
+        # Not --force and not --dry-run: the decision AND its effect are the subject. The kernel
+        # still reports STA_UNSYNC here (nothing on this machine has synchronised anything), so
+        # the adjtimex check cannot be what stands this down -- only the certificate window can.
+        #
+        # 2030 is wrong by years and inside every fixture's validity, which is exactly the state
+        # the rule is about: TLS works, so chrony can reach its sources and make the accurate
+        # correction itself, and stepping here would only replace one wrong time with a
+        # whole-second approximation of a different one.
+        machine.succeed("date -s '2030-01-01 00:00:00'")
+        output = machine.succeed("rough-time --only cloudflare 2>&1")
+        assert "already inside the certificates' validity" in output, output
+        # Still in 2030, i.e. not stepped back to what the NTS server serves.
+        assert 1893456000 <= clock() < 1900000000, f"the clock moved to {clock()}"
+
+    with subtest("a clock outside the certificates' validity is set"):
+        # The converse, so the subtest above cannot pass by rough-time having simply stopped
+        # setting clocks. Same command, same flags, only the starting clock differs.
+        machine.succeed("date -s '2001-01-01 00:00:00'")
+        output = machine.succeed("rough-time --only cloudflare 2>&1")
+        assert "clock set to" in output, output
+        served = int(ntsgood.succeed("date +%s").strip())
+        drift = abs(clock() - served)
+        assert drift < 120, f"clock is {drift}s from what the NTS server serves"
 
     with subtest("a v4-only host still gets a clock"):
         disconnect(v4=False, v6=True)

@@ -279,18 +279,43 @@ believable time except by consuming the recorded chains. Two independent
 operators must agree within a minute, so moving this clock means compromising
 two at once, and only ever within a certificate's validity window — with
 `nixpkgs.lastModified` passed in from `flake.nix` as a floor bounding how far
-back a once-valid certificate could roll things. Before doing anything it asks
-the kernel via `adjtimex` whether `STA_UNSYNC` is clear, and asks again before
-writing, so on a laptop with a working RTC or any warm reboot it is a no-op.
-`rough-time --force --dry-run` on a live host asks exactly what the boot service
-asks and prints the answer without setting anything.
+back a once-valid certificate could roll things. `rough-time --force --dry-run`
+on a live host asks exactly what the boot service asks and prints the answer
+without setting anything.
+
+It steps the clock only when it has to, which is narrower than it sounds. It asks
+the kernel via `adjtimex` whether `STA_UNSYNC` is clear — before the exchange and
+again before writing, since the exchange takes seconds during which chrony may
+get there first — so on a laptop with a working RTC or any warm reboot it is a
+no-op. It also stands down when the current clock, however wrong, already falls
+inside the validity of every certificate it just checked: TLS works at that
+point, which is the only thing this program exists to arrange, and chrony will
+make the accurate correction itself rather than have a whole-second approximation
+imposed on it first. That leans on chrony being able to step a large error, which
+it can, because nixpkgs defaults `services.chrony.makestep` to `0.1 3` — the
+first three updates step, with no size limit.
+
+One failure remains after all that: the rough clock succeeded, so the network and
+the NTS servers demonstrably work, and chrony still has not synchronised. That is
+what `common.timeSync.unwedgeSeconds` (default one hour) catches, by rebooting.
+Note where it sits — it only starts counting once rough-time has succeeded, so a
+host that is simply offline is retried every 30s and never reaches it, which is
+the right response to an outage. What it does catch is the asymmetry between the
+two: rough-time resolves the NTS hostnames itself at a pinned address, while
+chrony goes through dnscrypt-proxy, so a wedged resolver stops one and not the
+other. It reboots at most once per episode, recording the boot ID before it goes
+so a second stuck boot stands down instead — because rebooting fixes a wedged
+daemon and does nothing for, say, a chrony persistently refusing sources whose
+intervals do not overlap, and an unbounded rule would then reboot hourly forever.
 
 It is opt-in (`common.timeSync.enable`) and enabled on both hosts. Two VM checks
-cover it on x86 and aarch64: `rough-time` exercises the binary's quorum, floor
-and deferred certificate checks against controlled DoH resolvers and NTS
-servers, and `nts-sync` reproduces the deadlock end to end on the real host
-config — the machine boots years out, cannot resolve anything, and has to climb
-out through rough-time to chrony on its own.
+cover it on x86 and aarch64: `rough-time` exercises the binary's quorum, floor,
+deferred certificate checks and stand-down rules against controlled DoH resolvers
+and NTS servers, and `nts-sync` reproduces the deadlock end to end on the real
+host config — the machine boots years out, cannot resolve anything, and has to
+climb out through rough-time to chrony on its own. `nts-sync` also carries a
+second machine for the reboot failsafe alone, which needs a host that can sit
+unsynchronised on purpose and survive two reboots.
 
 `modules/restic.nix` configures named restic backups using systemd credentials.
 Each backup must specify the user that runs the service. Backup paths are bound
@@ -743,13 +768,15 @@ x86 and aarch64. `rough-time` covers the boot clock in isolation against
 impersonated DoH resolvers and NTS servers, including the cases that only ever
 matter once: an expired certificate on either leg while that server's clock stays
 correct (so the answer it gives is right and must still be refused), a time below
-the build-time floor, no reachable resolver at all, and v4-only, v6-only and
-NTS-reachable-only-over-v6 hosts. `nts-sync` boots a machine years out of date on
-the deployed configuration and asserts it climbs out on its own, then that chrony
-refuses a falseticker, keeps cookies across a reboot, and will not fall back to
-unauthenticated NTP when NTS-KE is blocked. Their aarch64 variants get a raised
-`globalTimeout` (1800s and 2400s), since under TCG a run of either is measured in
-tens of minutes.
+the build-time floor, a clock already inside the certificates' validity (left
+alone) and one outside it (set), no reachable resolver at all, and v4-only,
+v6-only and NTS-reachable-only-over-v6 hosts. `nts-sync` boots a machine years out
+of date on the deployed configuration and asserts it climbs out on its own, then
+that chrony refuses a falseticker, keeps cookies across a reboot, and will not
+fall back to unauthenticated NTP when NTS-KE is blocked — and on a second machine,
+that the reboot failsafe fires once and only once. Their aarch64 variants get a
+raised `globalTimeout` (1800s and 3000s), since under TCG a run of either is
+measured in tens of minutes.
 
 `nix flake check` also works, but it evaluates every check in one nix process
 (~15 GiB peak) and leaves no output symlinks — prefer the `make run-*` targets,

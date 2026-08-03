@@ -23,6 +23,10 @@
         * retroactively verifies the certificates and errors if they are not valid for the received time
     * compares the received times from all of the sets and verify that they are after a known floor (nixpkgs.lastModified)
     * if they agree within tolerance:
-        * check if the system time is already synchronized (checked via adjtimex)
-        * if not, set the system time to the received timestamp
+        * check if the system time needs synchronization
+            * if the system time is already synchronized (checked via adjtimex) => no
+            * if the current system time is within the validity times of all TLS certificates => no
+        * if the system time needs synchronization
+            * set the system time to the received timestamp
+        * wait for up to an hour and if the system time does not get synchronized => reboot
     * must work on IPv4-only and IPv6-only networks
