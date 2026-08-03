@@ -188,6 +188,12 @@ nixpkgs.lib.nixos.runTest {
     common.monitoring.enable = lib.mkForce false;
     common.irohSsh.enable = lib.mkForce false;
 
+    # This test moves the clock by decades, and nix-gc.timer is Persistent -- so a forward jump
+    # past a missed OnCalendar fires it immediately, putting a store-wide delete underneath the
+    # timing-sensitive subtests below (observed mid-run on the aarch64 runner). Same reasoning
+    # and same remedy as tests/restic.nix, which advances the clock for its own purposes.
+    nix.gc.automatic = lib.mkForce false;
+
     # mkForce: the shared test-node layer switches time sync off on every node (see
     # testNodeTimeSyncOff in flake.nix), which here is the thing under test.
     common.timeSync = {
@@ -422,12 +428,19 @@ nixpkgs.lib.nixos.runTest {
         # routes all the way down, and this repo already treats an asymmetry between them as
         # serious enough to run a dedicated v6-only client in tests/doh-upstream.nix.
         #
-        # Retried rather than attempted once. Installing a route is not the same as being able
-        # to use it -- neighbour discovery for the gateway still has to complete, and under TCG
-        # that took long enough for this to fail about one run in three, while the IPv4 path
-        # the preceding subtests had already warmed kept working. There is no cheap independent
-        # probe to wait on either: the interceptor answers TLS on 443 and nothing else, not
-        # even ICMPv6. So retry the operation itself.
+        # Retried rather than attempted once, because installing a route is not the same as
+        # being able to use it: neighbour discovery for the gateway still has to complete, and
+        # this is the first traffic this host sends over IPv6. There is no cheap independent
+        # probe to wait on -- the interceptor answers TLS on 443 and nothing else, not even
+        # ICMPv6 -- so retry the operation itself.
+        #
+        # This retry used to be here for the wrong reason, and the reason is worth recording
+        # because it made the failure unreadable for a while. Both interceptors add the same
+        # provider /128s, so before tests/doh-interceptor.nix passed `nodad` each run left a
+        # random subset of each node's addresses `dadfailed`. Rerolling the draw -- rough-time
+        # picks its resolver at random per run -- eventually found a surviving address, so a
+        # partial loss looked exactly like slow neighbour discovery. The aarch64 run where
+        # dohgood lost all four failed outright and no timeout would have helped.
         disconnect(v4=True, v6=False)
         machine.wait_until_succeeds(
             "rough-time --force --dry-run --only cloudflare", timeout=120
