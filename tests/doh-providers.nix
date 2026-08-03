@@ -1,5 +1,5 @@
 # Eval-only guard on lib/doh-stamps.nix `providers` as seen by modules/time-sync.nix -- the
-# `--provider NAME=HOSTNAME@ADDR[,ADDR]` arguments the rough clock is handed.
+# `--doh NAME=HOSTNAME@ADDR[,ADDR]` arguments the rough clock is handed.
 #
 # tests/doh-endpoints.nix guards the sibling `endpoints` attrset, and deliberately never parses
 # an address: everything downstream of it is a `sdns://` stamp, where an unparseable address
@@ -119,7 +119,7 @@ let
 
   countDrift = lib.optional (
     builtins.length names < 2
-  ) "only ${toString names} provider(s): the rough clock samples two and requires both to agree, so fewer than two can never set a clock";
+  ) "only ${toString (builtins.length names)} provider(s) (${toString names}): the rough clock samples two and requires both to agree, so fewer than two can never set a clock";
 
   errors = providerDrift ++ specDrift ++ countDrift;
 in
@@ -129,7 +129,7 @@ if errors != [ ] then
 
     ${lib.concatStringsSep "\n  " errors}
 
-    These become the --provider arguments of rough-time.service on every host. A bad entry
+    These become the --doh arguments of rough-time.service on every host. A bad entry
     does not fail the build: it fails at boot, on the one host that has no other way to learn
     what time it is, and it fails there forever.
   ''

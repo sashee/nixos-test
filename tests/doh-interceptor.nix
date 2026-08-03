@@ -66,7 +66,7 @@ let
   # framing helpers; the main loop owns TLS, GET/POST decode, the per-family
   # tag, and the readiness signal. Extra argv is exposed as meta["args"].
   serverScript = pkgs.writeText "${name}-server.py" ''
-    import base64, http.server, json, pathlib, socket, ssl, sys, threading, time, urllib.parse
+    import base64, http.server, json, pathlib, socket, ssl, sys, threading, urllib.parse
 
     ARGS = sys.argv[1:]
 

@@ -129,20 +129,28 @@ pub fn parse_response(
 
     let fields = extension_fields(packet)?;
 
+    let (_, auth_start, auth_end) = *fields
+        .iter()
+        .find(|(kind, _, _)| *kind == EF_AUTHENTICATOR)
+        .ok_or_else(|| "response is not authenticated".to_string())?;
+
     let unique = fields
         .iter()
         .find(|(kind, _, _)| *kind == EF_UNIQUE_IDENTIFIER)
         .ok_or_else(|| "response carries no unique identifier".to_string())?;
+    // Only the bytes before the authenticator are covered by its tag, so an identifier after it
+    // is unauthenticated and must not be the one that satisfies the check below. Taking the
+    // FIRST match already makes an appended forgery inert whenever the server echoed the
+    // identifier itself; this closes the remaining case, where it did not and the only
+    // identifier present is one an attacker appended to a genuine packet.
+    if unique.2 > auth_start {
+        return Err("response unique identifier is not covered by the authenticator".to_string());
+    }
     if &packet[unique.1..unique.2] != expected_unique_id.as_slice() {
         // The replay/mismatch guard: without this, any authenticated packet from this server,
         // including an old one, would be accepted as an answer to this request.
         return Err("response unique identifier does not match the request".to_string());
     }
-
-    let (_, auth_start, auth_end) = *fields
-        .iter()
-        .find(|(kind, _, _)| *kind == EF_AUTHENTICATOR)
-        .ok_or_else(|| "response is not authenticated".to_string())?;
 
     let body = &packet[auth_start..auth_end];
     if body.len() < 4 {
@@ -275,6 +283,36 @@ mod tests {
         let response = server_response(&[4u8; UNIQUE_ID_LENGTH], 1_785_000_000, &S2C);
         let error = parse_response(&response, &S2C, &UID).unwrap_err();
         assert!(error.contains("unique identifier"), "{error}");
+    }
+
+    #[test]
+    fn a_unique_identifier_after_the_authenticator_is_not_believed() {
+        // Everything after the authenticator is outside its associated data, so an identifier
+        // there is attacker-supplied. Built from a genuine packet that carries no identifier of
+        // its own, which is the only shape where the "first match" rule would not already have
+        // made the appended one inert.
+        let mut packet = vec![0u8; HEADER_LENGTH];
+        packet[0] = 0x24;
+        packet[1] = 3;
+        let ntp = (1_785_000_000i64 + NTP_TO_UNIX) as u32;
+        packet[40..44].copy_from_slice(&ntp.to_be_bytes());
+
+        let nonce = [11u8; NONCE_LENGTH];
+        let mut siv = Aes128Siv::new_from_slice(&S2C).unwrap();
+        let ciphertext = siv
+            .encrypt([packet.as_slice(), nonce.as_slice()], &[])
+            .unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&(NONCE_LENGTH as u16).to_be_bytes());
+        body.extend_from_slice(&(ciphertext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&nonce);
+        body.extend_from_slice(&ciphertext);
+        packet.extend_from_slice(&extension_field(EF_AUTHENTICATOR, &body));
+        // The tag over everything above is genuine; this is not covered by it.
+        packet.extend_from_slice(&extension_field(EF_UNIQUE_IDENTIFIER, &UID));
+
+        let error = parse_response(&packet, &S2C, &UID).unwrap_err();
+        assert!(error.contains("not covered by the authenticator"), "{error}");
     }
 
     #[test]

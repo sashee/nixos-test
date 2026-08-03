@@ -138,7 +138,7 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
   skipTypeCheck = true;
 
-  # Ceiling, not a wait: four VMs, a reboot, and several chrony synchronisations, all under
+  # Ceiling, not a wait: five VMs, two reboots, and several chrony synchronisations, all under
   # TCG emulation on the KVM-less aarch64 runner.
   inherit globalTimeout;
 

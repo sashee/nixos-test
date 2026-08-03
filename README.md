@@ -268,7 +268,7 @@ synchronisation at once and neither can recover the other — and an RTC-less
 Raspberry Pi is in exactly that state on every cold boot. chrony cannot break it
 alone, because whatever its certificate policy it still has to *resolve* the NTS
 hostnames, and that is DoH. So `packages/rough-time`, a small Rust binary, runs
-first as a oneshot that retries every 30s until it succeeds: it dials a DoH
+as a oneshot that retries every 30s until it succeeds: it dials a DoH
 resolver at a pinned address (the same addresses `modules/doh.nix` pins, read
 from `lib/doh-stamps.nix`) to resolve an NTS server's name, does NTS key
 establishment with that server, takes an authenticated NTPv4 timestamp — and
@@ -294,6 +294,23 @@ make the accurate correction itself rather than have a whole-second approximatio
 imposed on it first. That leans on chrony being able to step a large error, which
 it can, because nixpkgs defaults `services.chrony.makestep` to `0.1 3` — the
 first three updates step, with no size limit.
+
+It is deliberately not ordered against chronyd, though `Before=chronyd.service`
+reads like the obvious thing to write. What that would buy is chronyd's *first*
+name resolution happening with a usable clock, so it never enters its own retry
+backoff — `7 × 2^n` seconds with `n` clamped to `[2,9]`, i.e. 28s to ~60min, and
+`n` resets only on a successful resolve. What it costs is a full DoH+NTS exchange
+before chronyd may start, on every boot of every host — including the laptop,
+where `STA_UNSYNC` is set at boot like everywhere else, so the exchange runs in
+full before the program concludes it had nothing to do. And it only holds for the
+first attempt: `Restart=` does not keep the start job open, so from the second
+attempt on chronyd is already up and already backing off — which on a cold boot
+is the usual case, since `After=network.target` does not mean an address exists.
+The case the ordering fixes is the one that needed no fixing. The accepted
+consequence is that on an RTC-less cold boot chrony's first synchronisation is
+gated by its own 28s retry floor. `tests/rough-time.nix` pins that chronyd runs
+while the rough clock is still failing, on the node that never reaches a
+resolver.
 
 One failure remains after all that: the rough clock succeeded, so the network and
 the NTS servers demonstrably work, and chrony still has not synchronised. That is
@@ -763,8 +780,8 @@ make run-tests MAX_JOBS=1
 becomes an HTTPS `/dns-query` request to one of the configured DoH hostnames.
 
 `rough-time` and `nts-sync` are hermetic in the same way and are among the
-slowest checks in the suite — five and four VMs respectively, both existing on
-x86 and aarch64. `rough-time` covers the boot clock in isolation against
+slowest checks in the suite — five VMs each, both existing on x86 and aarch64.
+`rough-time` covers the boot clock in isolation against
 impersonated DoH resolvers and NTS servers, including the cases that only ever
 matter once: an expired certificate on either leg while that server's clock stays
 correct (so the answer it gives is right and must still be refused), a time below
