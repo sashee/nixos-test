@@ -28,6 +28,11 @@ rustls-native-certs = "0.8"
 x509-parser = "0.16"
 # clock_settime. AGENTS.md asks for no unsafe blocks, and std cannot set the clock.
 rustix = { version = "1", features = ["time"] }
+# AEAD_AES_SIV_CMAC_256, the only algorithm NTS requires a client to implement. RustCrypto,
+# but note its own README says no security audit has been performed and constant-time
+# operation has not been thoroughly assessed -- worth knowing for a boot-critical path, and
+# there is no alternative implementation of this construction in the ecosystem.
+aes-siv = "0.7"
 # adjtimex, to ask the kernel whether the clock is already disciplined. rustix 1.x does not
 # bind it and the crates that do are unvetted single-purpose packages, so this is the one
 # place the crate makes a raw call; see the SAFETY note in main.rs.

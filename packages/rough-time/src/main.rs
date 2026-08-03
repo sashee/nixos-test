@@ -4,19 +4,37 @@
 //! The hosts in this repo resolve names over DoH and synchronise time over NTS. Both are TLS,
 //! so a clock outside certificate validity blocks name resolution and time synchronisation at
 //! once, and neither can recover the other. A Raspberry Pi with no RTC battery starts in
-//! exactly that state on every cold boot.
+//! exactly that state on every cold boot, and chrony cannot break the deadlock itself: whatever
+//! its certificate policy, it still has to *resolve* the NTS hostnames, and that is DoH.
 //!
-//! So: ask two of the configured DoH providers what time it is over HTTPS, believe them only
-//! if they agree, and step the clock. The answer is a seed, not a time source -- it only has
-//! to land inside certificate validity. chrony takes over from there and is authoritative.
+//! So this program does the whole chain with certificate time checks deferred:
+//!
+//!   1. ask a DoH resolver, dialled by pinned address, to resolve an NTS server's hostname;
+//!   2. do NTS key establishment with that server;
+//!   3. get an authenticated timestamp over NTPv4;
+//!   4. re-verify both certificate chains at the time that was reported.
+//!
+//! Step 4 is the whole security argument, and `deferred::Deferred` is what makes it structural
+//! rather than a step someone can forget: there is no way to obtain a believable time except by
+//! consuming the recorded chains.
+//!
+//! Two independent pairs must agree, so moving this clock means compromising two operators at
+//! once -- and even then only within a certificate's validity window, with the build-time floor
+//! bounding how far back it can go. That is the same bound the previous Date-header design had:
+//! the deferred check is what is being traded on, and NTS does not change it. What NTS buys is
+//! that every configured server can answer, rather than the two of four that emitted a `Date`.
 //!
 //! Runs as a systemd oneshot that restarts until it succeeds (see `modules/time-sync.nix`).
 //! A failed run exits non-zero and is retried, which keeps the failure visible in
 //! `systemctl status` rather than hidden in an internal retry loop.
 
-mod fetch;
-mod httpdate;
+mod deferred;
+mod dns;
+mod doh;
+mod ntp;
+mod nts;
 mod quorum;
+mod timeserver;
 mod verify;
 
 use std::io::Read;
@@ -27,15 +45,29 @@ use std::time::Duration;
 
 use quorum::Answer;
 
+/// A DoH resolver: pinned addresses, dialled directly, hostname used for SNI and verification.
 #[derive(Debug, Clone)]
-struct Provider {
+struct Resolver {
     name: String,
     hostname: String,
     addresses: Vec<IpAddr>,
 }
 
+/// An NTS server. Hostnames only -- `time.cloudflare.com` is anycast, `nts.netnod.se` is a
+/// round-robin across sites that redirects during key establishment anyway, and only the PTB
+/// pair is pinnable at all. `operator` is the voting identity: two hostnames belonging to one
+/// organisation are one source, and nothing in the names says so.
+#[derive(Debug, Clone)]
+struct TimeServer {
+    name: String,
+    hostname: String,
+    operator: String,
+}
+
+#[derive(Debug)]
 struct Options {
-    providers: Vec<Provider>,
+    resolvers: Vec<Resolver>,
+    servers: Vec<TimeServer>,
     sample: usize,
     tolerance: i64,
     floor: i64,
@@ -48,62 +80,80 @@ struct Options {
 const USAGE: &str = "\
 usage: rough-time [options]
 
-  --provider NAME=HOSTNAME@ADDR[,ADDR]  a DoH provider to ask; repeatable. The addresses are
-                                        dialled directly and the hostname is used for SNI and
-                                        certificate verification -- nothing here resolves names
-  --sample N                            how many providers to ask (default: 2). They must all
-                                        answer and agree
-  --tolerance SECONDS                   how far apart two answers may be (default: 60)
-  --floor EPOCH                         refuse any time earlier than this (default: 0)
-  --only NAME[,NAME]                    ask exactly these providers instead of sampling; for
-                                        tests, which need the choice to be deterministic
-  --timeout SECONDS                     per-connection connect and read timeout (default: 10)
-  --force                               ask the providers even if the clock is already
-                                        synchronised. With --dry-run, this is how to check
-                                        that the configured providers still answer usably on
-                                        a host whose clock is fine
-  --dry-run                             report the decision without touching the clock
-  --help                                this text
+  --doh NAME=HOSTNAME@ADDR[,ADDR]  a DoH resolver, dialled at the given addresses with the
+                                   hostname used for SNI and certificate verification.
+                                   Repeatable. Nothing else in this program resolves a name,
+                                   which is what lets it run before DNS works
+  --nts NAME=HOSTNAME@OPERATOR     an NTS server and the organisation that runs it. Repeatable.
+                                   The operator is the unit of agreement: two servers run by
+                                   the same organisation count as one source
+  --sample N                       how many operators to ask (default: 2). All must answer and
+                                   agree, so this is also how many would have to be
+                                   compromised at once to move the clock
+  --tolerance SECONDS              how far apart two answers may be (default: 60)
+  --floor EPOCH                    refuse any time earlier than this (default: 0)
+  --only NAME[,NAME]               ask exactly these NTS servers instead of sampling; for
+                                   tests, which need the choice to be deterministic
+  --timeout SECONDS                per-connection connect and read timeout (default: 10)
+  --force                          ask even if the clock is already synchronised. With
+                                   --dry-run, this is how to check that the configured servers
+                                   still answer on a host whose clock is fine
+  --dry-run                        report the decision without touching the clock
+  --help                           this text
 ";
 
-fn parse_provider(spec: &str) -> Result<Provider, String> {
+fn split_spec(spec: &str, kind: &str) -> Result<(String, String, String), String> {
     let (name, rest) = spec
         .split_once('=')
-        .ok_or_else(|| format!("provider {spec:?} is not NAME=HOSTNAME@ADDR[,ADDR]"))?;
-    let (hostname, addresses) = rest
+        .ok_or_else(|| format!("{kind} {spec:?} is not NAME=HOSTNAME@..."))?;
+    let (hostname, tail) = rest
         .split_once('@')
-        .ok_or_else(|| format!("provider {spec:?} has no @ADDR list"))?;
-
+        .ok_or_else(|| format!("{kind} {spec:?} has nothing after @"))?;
     if name.is_empty() {
-        return Err(format!("provider {spec:?} has an empty name"));
+        return Err(format!("{kind} {spec:?} has an empty name"));
     }
     if hostname.is_empty() {
-        return Err(format!("provider {spec:?} has an empty hostname"));
+        return Err(format!("{kind} {spec:?} has an empty hostname"));
     }
+    if tail.is_empty() {
+        return Err(format!("{kind} {spec:?} has nothing after @"));
+    }
+    Ok((name.to_string(), hostname.to_string(), tail.to_string()))
+}
 
-    let addresses: Vec<IpAddr> = addresses
+fn parse_resolver(spec: &str) -> Result<Resolver, String> {
+    let (name, hostname, tail) = split_spec(spec, "resolver")?;
+    let addresses: Vec<IpAddr> = tail
         .split(',')
         .filter(|a| !a.is_empty())
         .map(|a| {
             a.parse::<IpAddr>()
-                .map_err(|_| format!("provider {name}: {a:?} is not an IP address"))
+                .map_err(|_| format!("resolver {name}: {a:?} is not an IP address"))
         })
         .collect::<Result<_, _>>()?;
-
     if addresses.is_empty() {
-        return Err(format!("provider {name} has no addresses"));
+        return Err(format!("resolver {name} has no addresses"));
     }
-
-    Ok(Provider {
-        name: name.to_string(),
-        hostname: hostname.to_string(),
+    Ok(Resolver {
+        name,
+        hostname,
         addresses,
+    })
+}
+
+fn parse_server(spec: &str) -> Result<TimeServer, String> {
+    let (name, hostname, operator) = split_spec(spec, "server")?;
+    Ok(TimeServer {
+        name,
+        hostname,
+        operator,
     })
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
     let mut options = Options {
-        providers: Vec::new(),
+        resolvers: Vec::new(),
+        servers: Vec::new(),
         sample: 2,
         tolerance: 60,
         floor: 0,
@@ -120,7 +170,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
         };
         match arg.as_str() {
             "--help" | "-h" => return Ok(None),
-            "--provider" => options.providers.push(parse_provider(&value("--provider")?)?),
+            "--doh" => options.resolvers.push(parse_resolver(&value("--doh")?)?),
+            "--nts" => options.servers.push(parse_server(&value("--nts")?)?),
             "--sample" => {
                 options.sample = value("--sample")?
                     .parse()
@@ -157,17 +208,29 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
         }
     }
 
-    if options.providers.is_empty() {
-        return Err("no --provider given".to_string());
+    if options.resolvers.is_empty() {
+        return Err("no --doh resolver given".to_string());
+    }
+    if options.servers.is_empty() {
+        return Err("no --nts server given".to_string());
     }
     if options.sample == 0 {
         return Err("--sample must be at least 1".to_string());
     }
-    if options.sample > options.providers.len() {
+
+    let operators = distinct_operators(&options.servers);
+    if options.sample > operators.len() {
         return Err(format!(
-            "--sample {} exceeds the {} configured providers",
+            "--sample {} exceeds the {} distinct NTS operators configured; servers run by the same organisation cannot cross-check each other",
             options.sample,
-            options.providers.len()
+            operators.len()
+        ));
+    }
+    if options.sample > options.resolvers.len() {
+        return Err(format!(
+            "--sample {} exceeds the {} DoH resolvers configured; each pair uses a different one",
+            options.sample,
+            options.resolvers.len()
         ));
     }
     if let Some(only) = &options.only {
@@ -175,7 +238,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
             return Err("--only needs at least one name".to_string());
         }
         for name in only {
-            if !options.providers.iter().any(|p| &p.name == name) {
+            if !options.servers.iter().any(|s| &s.name == name) {
                 return Err(format!("--only names {name:?}, which is not configured"));
             }
         }
@@ -184,18 +247,26 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
     Ok(Some(options))
 }
 
+fn distinct_operators(servers: &[TimeServer]) -> Vec<String> {
+    let mut operators: Vec<String> = Vec::new();
+    for server in servers {
+        if !operators.contains(&server.operator) {
+            operators.push(server.operator.clone());
+        }
+    }
+    operators
+}
+
 /// True when the kernel reports the clock as disciplined, in which case an authenticated
-/// source already owns it and a `Date` header must not overwrite it.
+/// source already owns it and this program must not overwrite it.
 ///
-/// `STA_UNSYNC` is the kernel's own answer rather than a proxy for it: it is clear only
-/// because something synchronised the clock and told the kernel so, which chrony does and this
-/// program does not. Asking the kernel keeps the check independent of *which* daemon is
-/// running and of any marker file we might write about ourselves.
+/// `STA_UNSYNC` is the kernel's own answer rather than a proxy for it: it is clear only because
+/// something synchronised the clock and told the kernel so, which chrony does (via `rtcsync`;
+/// see the comment in modules/time-sync.nix) and this program does not.
 ///
-/// This can never be true because of a previous run of this program: `ntp_clear()`, which the
-/// kernel calls from `do_settimeofday64()`, re-sets `STA_UNSYNC` on every clock step. "Rough
-/// time set" and "synchronised" therefore stay distinct states, which is what makes the check
-/// meaningful at all.
+/// This can never be true because of a previous run: `ntp_clear()`, which the kernel calls from
+/// `do_settimeofday64()`, re-sets `STA_UNSYNC` on every clock step. "Rough time set" and
+/// "synchronised" therefore stay distinct states, which is what makes the check meaningful.
 fn clock_is_disciplined() -> bool {
     // SAFETY: the one raw call in this crate. `adjtimex` reads the caller's `timex` and writes
     // its result back into it; `modes = 0` makes that a pure query, so no other field is
@@ -225,21 +296,139 @@ fn set_clock(seconds: i64) -> Result<(), String> {
     .map_err(|e| format!("cannot set the clock: {e}"))
 }
 
+/// Random bytes for the sampling seed and for each exchange's unique identifier and nonce.
+///
+/// The identifier is not merely nice to randomise: it is what matches a response to its request
+/// and therefore what makes a replayed packet detectable, so a predictable one would quietly
+/// remove the replay guard.
+fn random_bytes(buffer: &mut [u8]) -> Result<(), String> {
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(buffer))
+        .map_err(|e| format!("cannot read /dev/urandom: {e}"))
+}
+
 fn seed() -> u64 {
-    // /dev/urandom rather than a time-derived seed, for the obvious reason.
     let mut bytes = [0u8; 8];
-    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)) {
+    match random_bytes(&mut bytes) {
         Ok(()) => u64::from_ne_bytes(bytes),
-        // Not fatal. A fixed seed still draws distinct providers; it only makes which two
-        // predictable, and an attacker who knows the pair still has to compromise both.
+        // Not fatal for the draw itself -- a fixed seed still picks distinct operators, it only
+        // makes which ones predictable, and an attacker who knows the pair still has to
+        // compromise both.
         Err(e) => {
-            eprintln!("warning: cannot read /dev/urandom ({e}); falling back to a fixed draw");
+            eprintln!("warning: {e}; falling back to a fixed draw");
             0
         }
     }
 }
 
-fn collect_answers(options: &Options, chosen: &[Provider]) -> Vec<Answer> {
+/// One (resolver, server) pair, taken all the way from a hostname to a verified timestamp.
+fn ask_pair(
+    verifier: Arc<verify::Verifier>,
+    resolver: &Resolver,
+    server: &TimeServer,
+    timeout: Duration,
+) -> Result<i64, String> {
+    let mut deferred = deferred::Deferred::new();
+    let mut id_bytes = [0u8; 2];
+    random_bytes(&mut id_bytes)?;
+    let mut query_id = u16::from_be_bytes(id_bytes);
+
+    // Both families, and both are optional individually. A host with no IPv6 route gets
+    // nothing usable from AAAA and vice versa, so a family that yields nothing is not a
+    // failure as long as the other did -- only an empty union is. Asking for both is what
+    // makes an IPv6-only host work at all: querying A alone resolves to an address it has no
+    // way to reach.
+    let resolve = |deferred: &mut deferred::Deferred, name: &str, id: u16| {
+        let mut found: Vec<IpAddr> = Vec::new();
+        let mut last = format!("{} has no usable address", resolver.name);
+
+        for (offset, qtype) in [(0u16, dns::TYPE_A), (1u16, dns::TYPE_AAAA)] {
+            // Whichever address of the resolver answers first. Being unreachable over one
+            // family is normal on these hosts; unreachable over both is the failure.
+            for address in &resolver.addresses {
+                match doh::resolve(
+                    verifier.clone(),
+                    deferred,
+                    &resolver.hostname,
+                    *address,
+                    name,
+                    qtype,
+                    id.wrapping_add(offset),
+                    timeout,
+                ) {
+                    Ok(addresses) => {
+                        found.extend(addresses);
+                        break;
+                    }
+                    Err(e) => last = e,
+                }
+            }
+        }
+
+        if found.is_empty() {
+            Err(last)
+        } else {
+            Ok(found)
+        }
+    };
+
+    let addresses = resolve(&mut deferred, &server.hostname, query_id)?;
+
+    // Each candidate in turn. On a single-stack host the other family's addresses fail
+    // immediately with ENETUNREACH rather than costing a timeout, so trying them all is cheap
+    // and avoids having to guess which family this host actually has.
+    let mut key_address = None;
+    let mut established = None;
+    let mut last = format!("{} resolved to nothing", server.hostname);
+    for address in &addresses {
+        match timeserver::establish(
+            verifier.clone(),
+            &mut deferred,
+            &server.hostname,
+            *address,
+            timeout,
+        ) {
+            Ok(session) => {
+                key_address = Some(*address);
+                established = Some(session);
+                break;
+            }
+            Err(e) => last = e,
+        }
+    }
+    let (key_address, established) = match (key_address, established) {
+        (Some(a), Some(e)) => (a, e),
+        _ => return Err(last),
+    };
+
+    let (redirect, mut address, port) = timeserver::ntp_target(&established, key_address);
+    if let Some(name) = redirect {
+        // Offset by two so the A/AAAA pair above cannot collide with this pair's ids.
+        query_id = query_id.wrapping_add(2);
+        let candidates = resolve(&mut deferred, &name, query_id)?;
+        // Match the family that key establishment worked over: the redirect target is the same
+        // operator's timestamping host, so if only one family was reachable for the first hop
+        // it is the one to use for the second.
+        address = *candidates
+            .iter()
+            .find(|a| a.is_ipv4() == key_address.is_ipv4())
+            .or_else(|| candidates.first())
+            .ok_or_else(|| format!("the redirect to {name} resolved to nothing"))?;
+    }
+
+    let mut unique_id = [0u8; ntp::UNIQUE_ID_LENGTH];
+    let mut nonce = [0u8; ntp::NONCE_LENGTH];
+    random_bytes(&mut unique_id)?;
+    random_bytes(&mut nonce)?;
+
+    let seconds = timeserver::ask_time(&established, address, port, unique_id, nonce, timeout)?;
+
+    // Pass 2, on every chain gathered on the way here. There is no other way to get a number
+    // out of this function.
+    Ok(deferred.accept(&verifier, seconds)?.seconds())
+}
+
+fn collect_answers(options: &Options, pairs: &[(Resolver, TimeServer)]) -> Vec<Answer> {
     let verifier = match verify::Verifier::new(Arc::new(rustls::crypto::ring::default_provider()))
     {
         Ok(v) => v,
@@ -249,32 +438,17 @@ fn collect_answers(options: &Options, chosen: &[Provider]) -> Vec<Answer> {
         }
     };
 
-    // One thread per address, so an unreachable endpoint costs the timeout once rather than
-    // once per provider in series. A v4-only host has every IPv6 address time out, and that
-    // must not add up to a boot delay.
-    //
-    // Flattened into (name, hostname, address) up front: building the list inside nested
-    // closures would move the shared Arcs out of an FnMut, which does not borrow-check.
-    let tasks: Vec<(String, String, IpAddr)> = chosen
-        .iter()
-        .flat_map(|provider| {
-            provider
-                .addresses
-                .iter()
-                .map(|address| (provider.name.clone(), provider.hostname.clone(), *address))
-        })
-        .collect();
-
+    // One thread per pair: a pair that cannot be reached costs its timeouts once rather than
+    // delaying the others.
     std::thread::scope(|scope| {
-        let handles: Vec<_> = tasks
-            .into_iter()
-            .map(|(name, hostname, address)| {
+        let handles: Vec<_> = pairs
+            .iter()
+            .map(|(resolver, server)| {
                 let verifier = verifier.clone();
                 let timeout = options.timeout;
-
                 scope.spawn(move || {
-                    let outcome = fetch::probe(verifier, &hostname, address, timeout);
-                    (name, address, outcome)
+                    let outcome = ask_pair(verifier, resolver, server, timeout);
+                    (server.clone(), resolver.name.clone(), outcome)
                 })
             })
             .collect();
@@ -282,37 +456,21 @@ fn collect_answers(options: &Options, chosen: &[Provider]) -> Vec<Answer> {
         handles
             .into_iter()
             .filter_map(|handle| {
-                let (name, address, outcome) = handle.join().ok()?;
+                let (server, resolver, outcome) = handle.join().ok()?;
                 match outcome {
-                    Ok(response) => {
-                        if let Some(age) = response.age {
-                            // A cached response was stamped when it was first generated, which
-                            // may be arbitrarily long ago. Dropping it is safer than trusting
-                            // it: the remaining provider then fails the quorum and we retry.
-                            eprintln!(
-                                "{name} via {address}: ignoring a response served from a cache (Age: {age})"
-                            );
-                            return None;
-                        }
-                        let seconds = match httpdate::parse(&response.date) {
-                            Ok(seconds) => seconds,
-                            Err(e) => {
-                                eprintln!("{name} via {address}: {e}");
-                                return None;
-                            }
-                        };
-                        eprintln!(
-                            "{name} via {address}: {} ({seconds}) over {}",
-                            response.date, response.version
-                        );
+                    Ok(seconds) => {
+                        eprintln!("{} via {resolver}: {seconds}", server.name);
                         Some(Answer {
-                            provider: name,
-                            endpoint: address.to_string(),
+                            operator: server.operator,
+                            endpoint: format!("{} via {resolver}", server.hostname),
                             seconds,
                         })
                     }
                     Err(e) => {
-                        eprintln!("{name} via {address}: {e}");
+                        // The message already names the leg -- resolution, key establishment and
+                        // the NTP exchange are three different faults, and a summary that
+                        // collapsed them would send whoever reads it to the wrong place.
+                        eprintln!("{} via {resolver}: {e}", server.name);
                         None
                     }
                 }
@@ -321,32 +479,100 @@ fn collect_answers(options: &Options, chosen: &[Provider]) -> Vec<Answer> {
     })
 }
 
+/// Choose which (resolver, server) pairs to ask.
+///
+/// Distinct operators, so two hostnames from one organisation cannot form a quorum with each
+/// other, and a distinct resolver per pair, so one compromised resolver cannot sit in the path
+/// of every answer.
+fn choose(options: &Options, seed: u64) -> Result<Vec<(Resolver, TimeServer)>, String> {
+    let chosen: Vec<TimeServer> = match &options.only {
+        Some(only) => options
+            .servers
+            .iter()
+            .filter(|s| only.contains(&s.name))
+            .cloned()
+            .collect(),
+        None => {
+            let operators = distinct_operators(&options.servers);
+            quorum::sample(&operators, options.sample, seed)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, operator)| {
+                    // Draw among that operator's servers rather than taking the first. Taking
+                    // the first made a second server for an operator dead weight: ptbtime2 was
+                    // configured, passed to the binary and never asked, so the redundancy it
+                    // exists for -- ptbtime1 being down -- did not work. The seed is varied per
+                    // position so two operators drawn in one run do not both take the same
+                    // index into their own lists.
+                    let theirs: Vec<&TimeServer> = options
+                        .servers
+                        .iter()
+                        .filter(|s| s.operator == operator)
+                        .collect();
+                    let names: Vec<String> = theirs.iter().map(|s| s.name.clone()).collect();
+                    let picked = quorum::sample(&names, 1, seed.wrapping_add(index as u64 + 2));
+                    let name = picked.first()?;
+                    theirs.iter().find(|s| &s.name == name).map(|s| (*s).clone())
+                })
+                .collect()
+        }
+    };
+
+    let resolver_names: Vec<String> = options.resolvers.iter().map(|r| r.name.clone()).collect();
+    let resolvers = quorum::sample(&resolver_names, chosen.len(), seed.wrapping_add(1));
+    if resolvers.len() < chosen.len() {
+        return Err("not enough DoH resolvers to give each server its own".to_string());
+    }
+
+    Ok(chosen
+        .into_iter()
+        .zip(resolvers)
+        .map(|(server, resolver_name)| {
+            let resolver = options
+                .resolvers
+                .iter()
+                .find(|r| r.name == resolver_name)
+                .cloned()
+                .expect("sampled from the configured names");
+            (resolver, server)
+        })
+        .collect())
+}
+
 fn run(options: Options) -> Result<(), String> {
     if !options.force && clock_is_disciplined() {
         println!("the clock is already synchronised; leaving it alone");
         return Ok(());
     }
 
-    let names: Vec<String> = options.providers.iter().map(|p| p.name.clone()).collect();
-    let sampled = match &options.only {
-        Some(only) => only.clone(),
-        None => quorum::sample(&names, options.sample, seed()),
-    };
+    let pairs = choose(&options, seed())?;
+    let sampled: Vec<String> = pairs.iter().map(|(_, s)| s.operator.clone()).collect();
+    eprintln!(
+        "asking {}",
+        pairs
+            .iter()
+            .map(|(r, s)| format!("{} via {}", s.name, r.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
-    let chosen: Vec<Provider> = options
-        .providers
-        .iter()
-        .filter(|p| sampled.contains(&p.name))
-        .cloned()
-        .collect();
-
-    eprintln!("asking {}", sampled.join(", "));
-
-    let answers = collect_answers(&options, &chosen);
+    let answers = collect_answers(&options, &pairs);
     let seconds = quorum::decide(&sampled, &answers, options.tolerance, options.floor)?;
 
     if options.dry_run {
         println!("would set the clock to {seconds}");
+        return Ok(());
+    }
+
+    // Asked again, right before stepping. The check at the top of this function is only an
+    // optimization -- it saves the exchange on a host whose clock is already fine -- and it
+    // cannot cover the common case on its own: STA_UNSYNC is always set at boot, so on a warm
+    // reboot the early check never fires, while chronyd starts concurrently (the ordering
+    // dependency is not a barrier) and with cached NTS cookies can synchronise in well under a
+    // second. Without this, the exchange finishes moments later and overwrites an accurate
+    // clock with a whole-second approximation of it.
+    if !options.force && clock_is_disciplined() {
+        println!("something synchronised the clock while we were asking; leaving it alone");
         return Ok(());
     }
 
@@ -379,103 +605,211 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    fn args(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
     fn parse(items: &[&str]) -> Result<Option<Options>, String> {
-        parse_args(args(items).into_iter())
+        parse_args(items.iter().map(|s| s.to_string()))
     }
 
-    const ONE: &str = "--provider";
     const CF: &str = "cloudflare=cloudflare-dns.com@1.1.1.1,2606:4700:4700::1111";
     const Q9: &str = "quad9=dns10.quad9.net@9.9.9.10";
+    const NTS_CF: &str = "cloudflare=time.cloudflare.com@cloudflare";
+    const NTS_PTB1: &str = "ptb1=ptbtime1.ptb.de@ptb";
+    const NTS_PTB2: &str = "ptb2=ptbtime2.ptb.de@ptb";
+
+    fn full(extra: &[&str]) -> Vec<String> {
+        let mut v = vec!["--doh", CF, "--doh", Q9, "--nts", NTS_CF, "--nts", NTS_PTB1];
+        v.extend_from_slice(extra);
+        v.into_iter().map(str::to_string).collect()
+    }
 
     #[test]
-    fn parses_a_provider_with_both_families() {
-        let options = parse(&[ONE, CF, ONE, Q9]).unwrap().unwrap();
-        assert_eq!(options.providers.len(), 2);
-        assert_eq!(options.providers[0].name, "cloudflare");
-        assert_eq!(options.providers[0].hostname, "cloudflare-dns.com");
-        assert_eq!(options.providers[0].addresses.len(), 2);
-        assert_eq!(options.providers[1].addresses.len(), 1);
+    fn parses_both_populations() {
+        let options = parse_args(full(&[]).into_iter()).unwrap().unwrap();
+        assert_eq!(options.resolvers.len(), 2);
+        assert_eq!(options.resolvers[0].addresses.len(), 2);
+        assert_eq!(options.servers.len(), 2);
+        assert_eq!(options.servers[0].operator, "cloudflare");
     }
 
     #[test]
     fn defaults_match_the_documented_ones() {
-        let options = parse(&[ONE, CF, ONE, Q9]).unwrap().unwrap();
+        let options = parse_args(full(&[]).into_iter()).unwrap().unwrap();
         assert_eq!(options.sample, 2);
         assert_eq!(options.tolerance, 60);
         assert_eq!(options.floor, 0);
         assert_eq!(options.timeout, Duration::from_secs(10));
-        assert!(!options.dry_run);
-        assert!(options.only.is_none());
+        assert!(!options.force && !options.dry_run && options.only.is_none());
     }
 
     #[test]
-    fn rejects_malformed_provider_specs() {
+    fn rejects_malformed_specs() {
         for spec in [
-            "cloudflare",                        // no =
-            "cloudflare=cloudflare-dns.com",     // no @
-            "=cloudflare-dns.com@1.1.1.1",       // empty name
-            "cloudflare=@1.1.1.1",               // empty hostname
-            "cloudflare=cloudflare-dns.com@",    // no addresses
-            "cloudflare=cloudflare-dns.com@nope", // not an address
+            "cloudflare",
+            "cloudflare=cloudflare-dns.com",
+            "=cloudflare-dns.com@1.1.1.1",
+            "cloudflare=@1.1.1.1",
+            "cloudflare=cloudflare-dns.com@",
+            "cloudflare=cloudflare-dns.com@nope",
         ] {
-            assert!(parse(&[ONE, spec]).is_err(), "{spec:?} should be rejected");
+            assert!(parse(&["--doh", spec]).is_err(), "{spec:?} should be rejected");
+        }
+        for spec in ["ptb1", "ptb1=ptbtime1.ptb.de", "=h@o", "ptb1=@o", "ptb1=h@"] {
+            assert!(parse(&["--nts", spec]).is_err(), "{spec:?} should be rejected");
         }
     }
 
     #[test]
-    fn requires_at_least_one_provider() {
-        assert!(parse(&[]).is_err());
+    fn requires_both_populations() {
+        assert!(parse(&["--doh", CF]).is_err(), "no NTS server");
+        assert!(parse(&["--nts", NTS_CF]).is_err(), "no DoH resolver");
     }
 
     #[test]
-    fn rejects_a_sample_larger_than_the_pool() {
-        assert!(parse(&[ONE, CF, "--sample", "2"]).is_err());
-        assert!(parse(&[ONE, CF, "--sample", "0"]).is_err());
-        assert!(parse(&[ONE, CF, ONE, Q9, "--sample", "2"]).is_ok());
+    fn a_sample_cannot_exceed_the_distinct_operators() {
+        // The property the operator field exists for: ptb1 and ptb2 are two servers but one
+        // source, so a sample of two cannot be satisfied by them alone.
+        let two_ptb = vec!["--doh", CF, "--doh", Q9, "--nts", NTS_PTB1, "--nts", NTS_PTB2];
+        let error = parse(&two_ptb).unwrap_err();
+        assert!(error.contains("distinct NTS operators"), "{error}");
+
+        // Adding a genuinely independent operator makes the same sample legal.
+        let mixed = vec![
+            "--doh", CF, "--doh", Q9, "--nts", NTS_PTB1, "--nts", NTS_PTB2, "--nts", NTS_CF,
+        ];
+        assert!(parse(&mixed).is_ok());
     }
 
     #[test]
-    fn rejects_only_naming_an_unconfigured_provider() {
-        // Left unchecked this would silently sample nothing and report "did not answer",
-        // which points at the network rather than at the typo.
-        assert!(parse(&[ONE, CF, ONE, Q9, "--only", "google"]).is_err());
-        assert!(parse(&[ONE, CF, ONE, Q9, "--only", ""]).is_err());
-        assert!(parse(&[ONE, CF, ONE, Q9, "--only", "quad9"]).is_ok());
+    fn a_sample_cannot_exceed_the_resolvers() {
+        let one_resolver = vec!["--doh", CF, "--nts", NTS_CF, "--nts", NTS_PTB1];
+        let error = parse(&one_resolver).unwrap_err();
+        assert!(error.contains("DoH resolvers"), "{error}");
+    }
+
+    #[test]
+    fn rejects_only_naming_an_unconfigured_server() {
+        assert!(parse_args(full(&["--only", "netnod"]).into_iter()).is_err());
+        assert!(parse_args(full(&["--only", ""]).into_iter()).is_err());
+        assert!(parse_args(full(&["--only", "ptb1"]).into_iter()).is_ok());
     }
 
     #[test]
     fn rejects_unknown_arguments_and_missing_values() {
-        assert!(parse(&[ONE, CF, "--nope"]).is_err());
-        assert!(parse(&[ONE, CF, "--tolerance"]).is_err());
-        assert!(parse(&[ONE, CF, "--tolerance", "soon"]).is_err());
-        assert!(parse(&[ONE]).is_err());
+        assert!(parse_args(full(&["--nope"]).into_iter()).is_err());
+        assert!(parse_args(full(&["--tolerance"]).into_iter()).is_err());
+        assert!(parse_args(full(&["--tolerance", "soon"]).into_iter()).is_err());
     }
 
     #[test]
     fn force_is_off_by_default() {
-        // A default-on --force would make the service overwrite a chrony-disciplined clock on
-        // every boot, which is the one thing the adjtimex check exists to prevent.
-        assert!(!parse(&[ONE, CF, ONE, Q9]).unwrap().unwrap().force);
-        assert!(parse(&[ONE, CF, ONE, Q9, "--force"]).unwrap().unwrap().force);
+        // A default-on --force would overwrite a chrony-disciplined clock on every boot, which
+        // is the one thing the adjtimex check exists to prevent.
+        assert!(!parse_args(full(&[]).into_iter()).unwrap().unwrap().force);
+        assert!(parse_args(full(&["--force"]).into_iter()).unwrap().unwrap().force);
     }
 
     #[test]
     fn help_short_circuits_before_validation() {
-        // --help must work without a valid configuration, or it is useless for finding out
-        // what a valid configuration looks like.
         assert!(parse(&["--help"]).unwrap().is_none());
     }
 
     #[test]
-    fn accepts_a_negative_floor_but_not_a_word() {
+    fn choosing_pairs_distinct_operators_with_distinct_resolvers() {
+        let options = parse_args(full(&[]).into_iter()).unwrap().unwrap();
+        for seed in 0..200u64 {
+            let pairs = choose(&options, seed).unwrap();
+            assert_eq!(pairs.len(), 2);
+            assert_ne!(
+                pairs[0].1.operator, pairs[1].1.operator,
+                "seed {seed} drew one operator twice"
+            );
+            assert_ne!(
+                pairs[0].0.name, pairs[1].0.name,
+                "seed {seed} routed both pairs through one resolver"
+            );
+        }
+    }
+
+    #[test]
+    fn both_servers_of_an_operator_get_used() {
+        // ptb1 and ptb2 are one operator, so they never appear together -- but each must be
+        // reachable, or the second is dead weight and the redundancy it exists for (the first
+        // being down) does not work. Regression: `.find()` used to return the first match
+        // always, so ptb2 was configured, passed to the binary and never asked.
+        let options = parse_args(
+            vec![
+                "--doh", CF, "--doh", Q9, "--nts", NTS_CF, "--nts", NTS_PTB1, "--nts", NTS_PTB2,
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut seen: Vec<String> = Vec::new();
+        for seed in 0..500u64 {
+            for (_, server) in choose(&options, seed).unwrap() {
+                if !seen.contains(&server.name) {
+                    seen.push(server.name);
+                }
+            }
+        }
+        seen.sort();
         assert_eq!(
-            parse(&[ONE, CF, ONE, Q9, "--floor", "0"]).unwrap().unwrap().floor,
-            0
+            seen,
+            vec!["cloudflare".to_string(), "ptb1".to_string(), "ptb2".to_string()],
+            "every configured server should be reachable by some draw"
         );
-        assert!(parse(&[ONE, CF, ONE, Q9, "--floor", "yesterday"]).is_err());
+    }
+
+    #[test]
+    fn one_operator_never_appears_twice_in_a_draw() {
+        // The other half, kept separate so neither property can be traded for the other: now
+        // that a draw picks among an operator's servers, it must still never pick two servers
+        // belonging to the same operator.
+        let options = parse_args(
+            vec![
+                "--doh", CF, "--doh", Q9, "--nts", NTS_CF, "--nts", NTS_PTB1, "--nts", NTS_PTB2,
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap()
+        .unwrap();
+        for seed in 0..500u64 {
+            let pairs = choose(&options, seed).unwrap();
+            assert_eq!(pairs.len(), 2);
+            assert_ne!(
+                pairs[0].1.operator, pairs[1].1.operator,
+                "seed {seed} drew one operator twice"
+            );
+        }
+    }
+
+    #[test]
+    fn only_bypasses_sampling() {
+        let options = parse_args(full(&["--only", "ptb1"]).into_iter())
+            .unwrap()
+            .unwrap();
+        let pairs = choose(&options, 7).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].1.name, "ptb1");
+    }
+
+    #[test]
+    fn one_operator_with_two_servers_yields_one_choice() {
+        // Sampling draws operators, so a pool of ptb1+ptb2 can only ever produce one pair --
+        // which is what makes the --sample check above a real constraint rather than advice.
+        let options = parse_args(
+            vec![
+                "--doh", CF, "--doh", Q9, "--nts", NTS_PTB1, "--nts", NTS_PTB2, "--sample", "1",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap()
+        .unwrap();
+        let pairs = choose(&options, 3).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].1.operator, "ptb");
     }
 }

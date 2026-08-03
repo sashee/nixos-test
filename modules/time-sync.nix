@@ -23,6 +23,13 @@
 # is already disciplined -- a laptop with a working RTC, or any warm reboot where chrony got
 # there first -- it is a no-op.
 #
+# It reaches the same NTS servers chrony does, which is the point: bootstrap and steady state
+# rest on one set of parties. It gets there by resolving their names through a DoH resolver
+# dialled at a pinned address, because that is the one thing on this host that needs neither
+# DNS nor a clock. Certificate time checks are deferred on BOTH legs and re-applied against the
+# time the NTS server reports -- so a chain that was not valid at that instant is rejected, and
+# the build-time floor bounds how far back a once-valid certificate could roll things.
+#
 # Not covered here, deliberately: nothing removes the synchronised marker if chrony later
 # loses all its sources. The marker means "this boot reached synchronisation once", which is
 # what its consumers actually want -- a gate that reopened mid-run would make measurements
@@ -34,27 +41,40 @@ let
   dohStamps = import ../lib/doh-stamps.nix { inherit lib; };
   ntsServers = import ../lib/nts-servers.nix { inherit lib; };
 
-  # "<name>=<hostname>@<addr>[,<addr>]" per provider, straight off lib/doh-stamps.nix so the
-  # addresses rough-time dials are the same ones dnscrypt-proxy dials and cannot drift.
-  #
-  # Every provider is passed, including the ones that cannot currently answer: quad9 and
-  # mullvad send no Date header (see packages/rough-time/src/fetch.rs for the measurements).
-  # They are left in because the list is the DoH list -- keeping a second, hand-curated
-  # "providers that work today" list is a thing to maintain and get wrong, and a provider that
-  # starts or stops sending Date should change behaviour without changing code. The cost is
-  # retries: with two of four usable and a sample of two, one draw in six succeeds, so a cold
-  # boot typically spends a couple of minutes here.
-  providerArgs = lib.concatMap (
+  # "--doh <name>=<hostname>@<addr>[,<addr>]", straight off lib/doh-stamps.nix so the addresses
+  # rough-time dials are the same ones dnscrypt-proxy dials and cannot drift. These are only
+  # used to RESOLVE: the time itself comes from NTS.
+  dohArgs = lib.concatMap (
     name:
     let
       p = dohStamps.providers.${name};
       addresses = [ p.v4 ] ++ lib.optional (p ? v6) p.v6;
     in
-    [ "--provider" "${name}=${p.hostname}@${lib.concatStringsSep "," addresses}" ]
+    [ "--doh" "${name}=${p.hostname}@${lib.concatStringsSep "," addresses}" ]
   ) (builtins.attrNames dohStamps.providers);
 
+  # "--nts <name>=<hostname>@<operator>" -- the same servers chrony uses in steady state, so
+  # bootstrap and steady state rest on one set of parties rather than two. The operator is the
+  # unit of agreement: ptbtime1 and ptbtime2 are one organisation and must not be able to form a
+  # quorum with each other.
+  #
+  # Derived from `cfg.servers` rather than straight from lib/nts-servers.nix, so that overriding
+  # the server list moves BOTH consumers. A test that pointed chrony at two impersonated servers
+  # while rough-time kept dialling the real four would be testing two different configurations
+  # at once, and the halves would disagree about what the host is even talking to.
+  selected = lib.filterAttrs (_: p: lib.elem p.hostname cfg.servers) ntsServers.providers;
+
+  ntsArgs = lib.concatMap (
+    name:
+    let
+      p = selected.${name};
+    in
+    [ "--nts" "${name}=${p.hostname}@${p.operator}" ]
+  ) (builtins.attrNames selected);
+
   roughTimeArgs =
-    providerArgs
+    dohArgs
+    ++ ntsArgs
     ++ [
       "--sample"
       (toString cfg.sample)
@@ -114,8 +134,12 @@ in
       type = lib.types.ints.positive;
       default = 2;
       description = ''
-        How many providers to ask. All of them must answer and agree, so this is also the
-        number of operators that would have to be compromised at once to move the clock.
+        How many NTS operators to ask. All of them must answer and agree, so this is also the
+        number that would have to be compromised at once to move the clock.
+
+        Each is asked through a different DoH resolver, so a single compromised resolver cannot
+        sit in the path of every answer either -- it could point one lookup at a host it
+        controls, but that host would still need a certificate for the NTS server's name.
       '';
     };
 
@@ -202,16 +226,31 @@ in
         '';
       }
       {
-        assertion = cfg.sample <= builtins.length (builtins.attrNames dohStamps.providers);
+        assertion =
+          cfg.sample <= builtins.length (lib.unique (lib.mapAttrsToList (_: p: p.operator) selected))
+          && cfg.sample <= builtins.length (builtins.attrNames dohStamps.providers);
         message = ''
-          common.timeSync.sample (${toString cfg.sample}) exceeds the number of DoH providers
-          in lib/doh-stamps.nix, so the rough clock could never assemble a quorum.
+          common.timeSync.sample (${toString cfg.sample}) exceeds either the number of distinct
+          NTS operators reachable from common.timeSync.servers or the number of DoH resolvers in
+          lib/doh-stamps.nix, so the rough clock could never assemble a quorum.
         '';
       }
       {
         assertion = cfg.servers != [ ];
         message = ''
           common.timeSync.servers is empty; chrony would start with no time source at all.
+        '';
+      }
+      {
+        assertion =
+          lib.all (h: lib.any (p: p.hostname == h) (lib.attrValues ntsServers.providers)) cfg.servers;
+        message = ''
+          common.timeSync.servers names a host that lib/nts-servers.nix does not describe:
+          ${toString (lib.subtractLists (lib.mapAttrsToList (_: p: p.hostname) ntsServers.providers) cfg.servers)}
+
+          chrony would use it, but rough-time could not: it needs the operator that file carries,
+          because the operator is what decides whether two answers count as one source or two.
+          Add the host there rather than only here.
         '';
       }
     ];

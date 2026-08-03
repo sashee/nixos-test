@@ -14,14 +14,15 @@
 * initial correction of time
     * a separate service starts on boot
     * and gets restarted until it succeeds
-    * it makes a query to 2 random providers on the DoH list
-        * use all IPs configured
-        * must disable the cache
-    * for each server
+    * it chooses 2 distinct sets of providers, one from the DoH list, one from the NTS
+    * for each set
+        * resolve the IP address of the NTS using the DoH
         * it bypasses the time checks for the received TLS certificates
-        * inspects the Date header of the HTTP response
+        * get the NTS session tokens, also bypassing time checks for the certificates
+        * get the authenticated time from the NTP
         * retroactively verifies the certificates and errors if they are not valid for the received time
-    * compares all the received times
-    * if they agree (checked via adjtimex):
-        * checks if the system time is already set correctly
+    * compares the received times from all of the sets and verify that they are after a known floor (nixpkgs.lastModified)
+    * if they agree within tolerance:
+        * check if the system time is already synchronized (checked via adjtimex)
         * if not, set the system time to the received timestamp
+    * must work on IPv4-only and IPv6-only networks
