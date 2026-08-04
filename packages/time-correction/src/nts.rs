@@ -17,7 +17,7 @@ pub const ALPN: &[u8] = b"ntske/1";
 /// RFC 8915 §4.3. The context is five bytes: next-protocol, AEAD id, and a direction byte.
 pub const EXPORTER_LABEL: &[u8] = b"EXPORTER-network-time-security";
 
-pub const NEXT_PROTOCOL_NTPV4: u16 = 0;
+const NEXT_PROTOCOL_NTPV4: u16 = 0;
 /// AEAD_AES_SIV_CMAC_256. Note the crate that implements it calls this `Aes128Siv`: the 256 is
 /// the *key* size, which SIV splits into two AES-128 keys. Everyone trips over this once.
 pub const AEAD_AES_SIV_CMAC_256: u16 = 15;

@@ -138,7 +138,6 @@ nixpkgs.lib.nixos.runTest {
 
   nodes.machine = { lib, ... }: {
     imports = [ machineModule ];
-    environment.systemPackages = [ pkgs.iproute2 ];
 
     networking.hostName = "nts-sync-test";
 
@@ -224,6 +223,36 @@ nixpkgs.lib.nixos.runTest {
         # them -- taking the machine down for a reason the failing subtest would not name.
         machine.fail("systemctl cat time-sync-unwedge.service")
 
+        # The check above is a cheap canary and nothing more: it only catches the failsafe coming
+        # back under the name it had. What follows is the name-agnostic half. A unit that reboots
+        # an unsynchronised host has to find out that the host is unsynchronised, and the only two
+        # things here that know are the correction service and the marker chrony-wait writes -- so
+        # anything ordered off either of them is the shape being guarded against, whatever it is
+        # called. Not asserted by enumerating units that invoke `reboot`: connectivity-watchdog
+        # and connectivity-fallback legitimately do, and an allowlist of those would make this
+        # subtest fail whenever an unrelated module gained a reboot.
+        def pullers(unit, prop):
+            # One property per call with --value: `systemctl show -p NAME` omits properties whose
+            # value is empty unless --all is passed, so asking for several at once and matching on
+            # the output silently tests nothing when one of them is unset.
+            return machine.succeed(
+                f"systemctl show -p {prop} --value {unit}"
+            ).split()
+
+        assert pullers("time-correction.service", "TriggeredBy") == ["time-correction.timer"]
+        for prop in ["WantedBy", "RequiredBy", "BoundBy"]:
+            assert pullers("time-correction.service", prop) == [], (
+                f"something now pulls in the correction service via {prop}: "
+                f"{pullers('time-correction.service', prop)}"
+            )
+        # chrony-wait is wantedBy multi-user.target and that is all it may be.
+        assert pullers("chrony-wait.service", "WantedBy") == ["multi-user.target"]
+        for prop in ["RequiredBy", "BoundBy", "TriggeredBy"]:
+            assert pullers("chrony-wait.service", prop) == [], (
+                f"something now keys off the sync marker via {prop}: "
+                f"{pullers('chrony-wait.service', prop)}"
+            )
+
     def peer_ip(node):
         return node.wait_until_succeeds(
             "${pkgs.iproute2}/bin/ip -j -4 addr show dev eth1 "
@@ -243,6 +272,15 @@ nixpkgs.lib.nixos.runTest {
 
     def clock(node=None):
         return int((node or machine).succeed("date +%s").strip())
+
+    def chrony_conf():
+        # Read out of the unit rather than from a fixed path: the nixpkgs module passes the file
+        # as an -f argument from the store, so there is nothing in /etc to read and the store
+        # path changes with the config.
+        return machine.succeed(
+            "systemctl cat chronyd.service | grep -o '/nix/store/[^ ]*chrony.conf' "
+            "| head -1 | xargs cat"
+        )
 
     def rtc():
         # hwclock prints an ISO-8601 instant and has no epoch output of its own, so `date` does
@@ -358,6 +396,8 @@ nixpkgs.lib.nixos.runTest {
             machine.log("SOURCES:\n" + machine.succeed("${pkgs.chrony}/bin/chronyc -N sources -v || true"))
             machine.log("CHRONYD:\n" + machine.succeed("journalctl -u chronyd -o cat --no-pager | tail -40 || true"))
             machine.log("RESOLVES:\n" + machine.succeed("${pkgs.dig}/bin/dig +short @127.0.0.1 ${goodHost} || true"))
+            # Not chrony_conf(): this runs while an exception is in flight, and a failing
+            # succeed() here would replace the real failure with this one.
             machine.log("CONF:\n" + machine.succeed("systemctl cat chronyd.service | grep -o '/nix/store/[^ ]*chrony.conf' | head -1 | xargs cat || true"))
             ntsgood.log("SERVERJOURNAL:\n" + ntsgood.succeed("journalctl -u chronyd -o cat --no-pager | tail -40 || true"))
             ntsgood.log("SERVERPORTS:\n" + ntsgood.succeed("${pkgs.iproute2}/bin/ss -lntu | head -20 || true"))
@@ -369,6 +409,31 @@ nixpkgs.lib.nixos.runTest {
         # silently did not happen.
         authdata = machine.succeed("${pkgs.chrony}/bin/chronyc -N authdata")
         assert "NTS" in authdata, authdata
+
+        # Spec: "must use multiple servers to detect incorrect servers". The falseticker subtest
+        # at the end of this run is the behavioural half, but it can only fail for the right
+        # reason if this directive is present -- with chrony's default of 1, a single reachable
+        # source is authoritative and that subtest would be asserting nothing. Pinned here rather
+        # than there so config drift fails in the first minute of a four-VM run instead of the
+        # last, and pinned as a directive because nothing else in the suite would notice it
+        # vanishing.
+        conf = chrony_conf()
+        assert "minsources 2" in conf, conf
+        # Each hostname must become exactly one `server` line ending in `nts`. Both halves can
+        # drift independently: nixpkgs emits `pool` instead of `server` for any hostname
+        # containing "pool" (one name, several sources, which defeats the counting minsources
+        # does), and `nts` is appended only under enableNTS. tests/nts-servers.nix guards the
+        # deployed list against the pool spelling at eval time; this is the consequence that
+        # check exists to prevent, read off the daemon that is actually running.
+        sources = [
+            l.strip() for l in conf.splitlines()
+            if l.strip().startswith(("server ", "pool "))
+        ]
+        for host in ["${goodHost}", "${liarHost}"]:
+            own = [l for l in sources if l.split()[1] == host]
+            assert len(own) == 1, f"{host} is not exactly one source line: {sources}"
+            assert own[0].startswith("server "), f"{host} became a pool: {own[0]}"
+            assert own[0].split()[-1] == "nts", f"{host} is not authenticated: {own[0]}"
 
     with subtest("the collector is released once chrony has synchronised"):
         # The other half of the gate. Asserting only the closed side would pass just as well
@@ -455,10 +520,7 @@ nixpkgs.lib.nixos.runTest {
         # The directive itself is pinned too, because it is one we do not write: the nixpkgs chrony
         # module emits `driftfile <stateDir>/chrony.drift`, and if that ever moved or vanished this
         # whole feature would switch itself off with nothing else in the suite noticing.
-        conf = machine.succeed(
-            "systemctl cat chronyd.service | grep -o '/nix/store/[^ ]*chrony.conf' "
-            "| head -1 | xargs cat"
-        )
+        conf = chrony_conf()
         assert "driftfile ${driftFile}" in conf, conf
         # `-s` is the other half, and it is ours.
         assert "-s" in machine.succeed(

@@ -201,9 +201,13 @@ in
       type = lib.types.ints.positive;
       default = 10;
       description = ''
-        Per-connection connect and read timeout. Every address is dialled in parallel, so this
-        is roughly the whole run's duration when a provider is unreachable rather than a cost
-        per address -- which matters on a v4-only host, where every IPv6 endpoint times out.
+        Per-connection connect and read timeout, and it is paid per address rather than once
+        per run. The chosen provider pairs are dialled concurrently, but within a pair every
+        address is tried in turn on both the DoH and the NTS leg -- so a network that
+        BLACKHOLES one family, dropping silently rather than answering ENETUNREACH, waits out
+        this timeout on each of them before the family that works is reached. Budget for that
+        rather than for one timeout: the unit's `TimeoutStartSec` below is sized on the same
+        arithmetic.
       '';
     };
 
@@ -374,7 +378,11 @@ in
       #
       # The `interval` argument is left at chrony's default because the nixpkgs module hardcodes
       # the directive with no way to pass one. An hour matches this module's own correction
-      # cadence; do not try to override it by emitting a second `driftfile` line below.
+      # cadence, so nothing here needs to change it. It CAN be changed, though: chrony's parser
+      # takes the last `driftfile` line, and `extraConfig` lands after the module's, so a second
+      # line overrides rather than duplicates. tests/nts-sync.nix does exactly that to make the
+      # write observable inside a test run -- a tempo change, not a mechanism change. Deployed
+      # hosts have no reason to.
       extraFlags = [ "-s" ];
       extraConfig = ''
         minsources ${toString cfg.minSources}

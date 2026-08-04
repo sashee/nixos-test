@@ -339,7 +339,10 @@ and nothing else, the hourly run now surfaces the same class of fault as a plain
 failing unit, and an unbounded reboot rule is the shape of the 2026-07-27 bootloop
 `modules/connectivity-watchdog.nix` exists to avoid repeating.
 
-It is opt-in (`common.timeSync.enable`) and enabled on both hosts. Two VM checks
+It is opt-in (`common.timeSync.enable`) and enabled on every host that gets the
+common desktop layer as well as on the Pi — `timeSyncSettings` in `flake.nix` is
+composed into all three module lists, which is also where `floor` comes from
+(`nixpkgs.lastModified` is only in scope there). Two VM checks
 cover it on x86 and aarch64: `time-correction` exercises the binary's quorum, floor,
 deferred certificate checks and stand-down rule, and the unit's timer, against
 controlled DoH resolvers and NTS servers; `nts-sync` reproduces the deadlock end to
@@ -809,6 +812,15 @@ a falseticker, keeps cookies across a reboot, and will not fall back to
 unauthenticated NTP when NTS-KE is blocked. Their aarch64 variants get a raised
 `globalTimeout` (1800s and 2400s), since under TCG a run of either is measured in
 tens of minutes.
+
+Both of those override the timer's cadence so a timed run cannot land in the
+middle of a subtest that places the clock by hand — which leaves the values the
+hosts actually ship uncovered by either. `time-sync-cadence` is the eval-only
+check that closes that: it renders `time-correction.timer` from both deployed
+host configs and asserts `OnBootSec=1min`, `OnUnitActiveSec=1h`, no `OnCalendar`
+and no `Persistent`, throwing during evaluation on drift. It reads the rendered
+unit rather than `common.timeSync.interval`, since the claim worth making is that
+systemd was told the value, not that the option holds it.
 
 `nix flake check` also works, but it evaluates every check in one nix process
 (~15 GiB peak) and leaves no output symlinks — prefer the `make run-*` targets,

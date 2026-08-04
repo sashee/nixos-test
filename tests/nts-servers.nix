@@ -55,7 +55,7 @@ let
       dupes = lib.unique (lib.filter (h: lib.count (x: x == h) hostnames > 1) hostnames);
     in
     lib.optional (dupes != [ ])
-      "duplicate hostnames ${toString (lib.unique dupes)}: a repeated name adds a source to the count without adding one to the vote";
+      "duplicate hostnames ${toString dupes}: a repeated name adds a source to the count without adding one to the vote";
 
   countDrift = lib.optional (
     builtins.length names < 4

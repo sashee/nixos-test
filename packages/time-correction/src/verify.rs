@@ -1,9 +1,9 @@
 //! Certificate verification at an instant we choose, twice.
 //!
 //! The bootstrap problem: this program runs when the clock may be years wrong, so a normal
-//! TLS handshake fails on `notBefore`/`notAfter` before any `Date` header can be read. But
-//! simply not checking the dates would accept a chain from anyone holding any once-valid
-//! certificate.
+//! TLS handshake fails on `notBefore`/`notAfter` before it can get far enough to be told the
+//! time. But simply not checking the dates would accept a chain from anyone holding any
+//! once-valid certificate.
 //!
 //! So the check is deferred rather than dropped:
 //!
@@ -15,8 +15,8 @@
 //!     precedes every notBefore, and a far-future value follows every notAfter.
 //!
 //!   pass 2, after the response is read -- verify the same chain again, through the same
-//!     verifier, at the time the server claimed. This is the real check, and it is what makes
-//!     a `Date` header outside the chain's validity a hard failure.
+//!     verifier, at the time the exchange reported. This is the real check, and it is what
+//!     makes an authenticated timestamp outside the chain's validity a hard failure.
 //!
 //! Both passes run the identical `WebPkiServerVerifier`, so pass 2 cannot accidentally be
 //! weaker than pass 1 -- and hostname and chain validation stay inside the library rather than
@@ -30,7 +30,11 @@
 //!
 //! Revocation is deliberately not checked. CRL and OCSP freshness are themselves
 //! time-dependent, and fetching either needs another TLS connection with the same bad clock.
-//! The build-time floor in `quorum::decide` is what bounds the resulting exposure.
+//! What bounds the resulting exposure is the build-time floor, applied in `main::ask_pair` to
+//! each provider's own reported timestamp BEFORE that timestamp re-verifies any chain here --
+//! so a revoked-but-once-valid certificate can only be replayed within its own validity and
+//! above the floor. Not in `quorum::decide`: the agreed time is checked nowhere, because every
+//! input to the agreement was already checked (see the note there).
 
 use std::sync::{Arc, Mutex};
 
@@ -198,7 +202,7 @@ impl ServerCertVerifier for TimeAgnosticVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
         let window = chain_window(end_entity, intermediates)
-            .map_err(|e| Error::General(e))?
+            .map_err(Error::General)?
             .ok_or_else(|| {
                 Error::General(
                     "the certificate chain has no instant at which all of it is valid".to_string(),
