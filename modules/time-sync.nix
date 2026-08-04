@@ -1,6 +1,6 @@
 { config, lib, pkgs, ... }:
 
-# Time synchronisation: chrony over NTS, plus the boot-time rough clock that makes NTS
+# Time synchronisation: chrony over NTS, plus the time-correction service that makes NTS
 # reachable in the first place.
 #
 # One module rather than two, because the two halves only make sense together. These hosts
@@ -9,25 +9,48 @@
 # neither can recover the other. A Raspberry Pi with no RTC battery is in exactly that state
 # on every cold boot.
 #
-# The way out of that deadlock is, in causal order -- not in unit ordering, which deliberately
-# does not constrain these against each other; see the comment on the rough-time unit below:
+# There are two independent ways out, and the cheap one is tried first:
 #
-#   rough-time  dials the DoH providers' PINNED ADDRESSES over HTTPS to resolve an NTS
-#               server's name, then takes an authenticated timestamp from that server --
-#               ignoring certificate dates during both handshakes and re-checking them against
-#               the timestamp afterwards. No name resolution to start with, so it does not need
-#               DNS; no trust in the clock, so it does not need the clock. Sets a rough time
-#               and exits.
-#   dnscrypt    now that the clock is inside certificate validity, DoH works, so names resolve.
-#   chronyd     resolves the NTS hostnames and takes over. It is authoritative; whatever
-#               rough-time set is only a seed accurate to a minute or so.
+#   chronyd -s       sets the clock from the RTC, or -- when there is no usable RTC, or the RTC
+#                    reads EARLIER than the last modification time of chrony's own driftfile,
+#                    which is what a dead battery looks like -- steps the clock forward to that
+#                    mtime instead. chronyd rewrites the driftfile whenever it computes a new
+#                    drift value (at most hourly) and unconditionally on exit, and only ever
+#                    while it is disciplining the clock, so the mtime is an instant at which this
+#                    host was demonstrably right. No network, no DNS, one stat. It recovers a
+#                    host that was merely off for a while; it cannot help one that was off for
+#                    longer than a certificate's validity, and being forward-only it can never
+#                    drag a good clock backwards.
+#   time-correction  dials the DoH providers' PINNED ADDRESSES over HTTPS to resolve an NTS
+#                    server's name, then takes an authenticated timestamp from that server --
+#                    ignoring certificate dates during both handshakes and re-checking them
+#                    against the timestamp afterwards. No name resolution to start with, so it
+#                    does not need DNS; no trust in the clock, so it does not need the clock.
+#                    This one works however long the host was off.
 #
-# rough-time asks the kernel (STA_UNSYNC) before touching anything, so on a host whose clock
-# is already disciplined -- a laptop with a working RTC, or any warm reboot where chrony got
-# there first -- it is a no-op. It also stands down when the clock, however wrong, already sits
-# inside the validity of every certificate it just checked: TLS works at that point, which is
-# the only thing this program exists to arrange, and stepping would replace an error chrony is
-# about to correct precisely with a whole-second approximation of the same instant.
+# and then, once either has put the clock inside certificate validity:
+#
+#   dnscrypt         DoH works, so names resolve.
+#   chronyd          resolves the NTS hostnames and takes over. It is authoritative; whatever
+#                    time-correction set is only a seed accurate to a minute or so.
+#
+# time-correction runs once after boot and then every hour, on a timer -- not a retry loop, and
+# not only at boot. Two consequences worth stating, because both are the point rather than a
+# side-effect:
+#
+#   * The hourly run is a check, not just a repair. It does the whole DoH + NTS exchange even
+#     when the clock is demonstrably fine, so a provider that stopped answering, a pinned
+#     address that moved or an expired trust store is discovered while the host is still
+#     healthy enough to say so -- instead of at the next cold boot, when nothing works and
+#     nobody can reach the box. That is why the program no longer asks the kernel whether the
+#     clock is already synchronised and skips the exchange when it is: the skip was the whole
+#     failure mode.
+#   * It still steps the clock only when it has to. It stands down when the clock, however
+#     wrong, already sits inside the validity of every certificate it just checked: TLS works
+#     at that point, which is the only thing this program exists to arrange, and stepping would
+#     replace an error chrony is about to correct precisely with a whole-second approximation
+#     of the same instant. On a host chrony has disciplined that rule always fires, which is
+#     why dropping the kernel check costs nothing.
 #
 # That leans on chrony being able to step a large error, which it can because nixpkgs defaults
 # `services.chrony.makestep` to `0.1 3` -- the first three updates step, with no size limit. A
@@ -38,12 +61,20 @@
 # dialled at a pinned address, because that is the one thing on this host that needs neither
 # DNS nor a clock. Certificate time checks are deferred on BOTH legs and re-applied against the
 # time the NTS server reports -- so a chain that was not valid at that instant is rejected, and
-# the build-time floor bounds how far back a once-valid certificate could roll things.
+# the build-time floor, applied to each provider's own answer before anything is re-verified
+# against it, bounds how far back a once-valid certificate could roll things.
 #
 # Not covered here, deliberately: nothing removes the synchronised marker if chrony later
 # loses all its sources. The marker means "this boot reached synchronisation once", which is
 # what its consumers actually want -- a gate that reopened mid-run would make measurements
 # vanish rather than make them more correct.
+#
+# Also gone deliberately: there is no reboot failsafe for "the correction service succeeded
+# and chrony still has not synchronised". It used to live here as `unwedgeSeconds`, and the
+# spec dropped it. A reboot is a remedy for a wedged resolver and nothing else, the hourly run
+# now surfaces the same class of fault as a plain failing unit instead, and an unbounded reboot
+# rule is the shape of the 2026-07-27 bootloop that modules/connectivity-watchdog.nix exists to
+# avoid repeating.
 
 let
   cfg = config.common.timeSync;
@@ -52,8 +83,8 @@ let
   ntsServers = import ../lib/nts-servers.nix { inherit lib; };
 
   # "--doh <name>=<hostname>@<addr>[,<addr>]", straight off lib/doh-stamps.nix so the addresses
-  # rough-time dials are the same ones dnscrypt-proxy dials and cannot drift. These are only
-  # used to RESOLVE: the time itself comes from NTS.
+  # time-correction dials are the same ones dnscrypt-proxy dials and cannot drift. These are
+  # only used to RESOLVE: the time itself comes from NTS.
   dohArgs = lib.concatMap (
     name:
     let
@@ -70,8 +101,8 @@ let
   #
   # Derived from `cfg.servers` rather than straight from lib/nts-servers.nix, so that overriding
   # the server list moves BOTH consumers. A test that pointed chrony at two impersonated servers
-  # while rough-time kept dialling the real four would be testing two different configurations
-  # at once, and the halves would disagree about what the host is even talking to.
+  # while time-correction kept dialling the real four would be testing two different
+  # configurations at once, and the halves would disagree about what the host is even talking to.
   selected = lib.filterAttrs (_: p: lib.elem p.hostname cfg.servers) ntsServers.providers;
 
   ntsArgs = lib.concatMap (
@@ -82,7 +113,7 @@ let
     [ "--nts" "${name}=${p.hostname}@${p.operator}" ]
   ) (builtins.attrNames selected);
 
-  roughTimeArgs =
+  correctionArgs =
     dohArgs
     ++ ntsArgs
     ++ [
@@ -97,105 +128,28 @@ let
     ];
 
   # A wrapper named after the binary and preloaded with the unit's own flags, so
-  # `rough-time --force --dry-run` on a live host asks exactly what the boot service asks.
+  # `time-correction --force --dry-run` on a live host asks exactly what the timed service asks.
   # Same idea as the `system-metrics` wrapper in modules/system-metrics.nix.
-  roughTimeCommand = pkgs.writeShellApplication {
-    name = "rough-time";
+  correctionCommand = pkgs.writeShellApplication {
+    name = "time-correction";
     text = ''
-      exec ${lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ roughTimeArgs)} "$@"
+      exec ${lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ correctionArgs)} "$@"
     '';
   };
 
-  # Where the boot that already spent this episode's one reboot is recorded. Persistent, unlike
-  # the /run markers elsewhere in this repo, because the whole question spans a reboot.
-  unwedgeState = "/var/lib/time-sync-unwedge/rebooted-boot-id";
-
-  # `null` disables the unit, but the script below is still a well-formed derivation in the `let`
-  # block, so it must not interpolate an empty string into arithmetic. Zero is never used.
-  unwedgeSeconds = toString (if cfg.unwedgeSeconds == null then 0 else cfg.unwedgeSeconds);
-
-  unwedge = pkgs.writeShellApplication {
-    name = "time-sync-unwedge";
-    runtimeInputs = [ pkgs.coreutils pkgs.systemd ];
-    text = ''
-      # "Synchronised" is asked of the kernel through rough-time itself rather than of chronyc,
-      # so this unit and the program it follows cannot disagree about what the word means. The
-      # kernel's STA_UNSYNC is also the honest question here: chronyc would report chrony's own
-      # opinion, and a chrony that believes it has synchronised without telling the kernel is
-      # exactly one of the states worth catching.
-      synced() {
-        ${lib.getExe cfg.package} --check-synced >/dev/null 2>&1
-      }
-
-      # Counted in sleeps rather than measured against a clock, and that is the point rather than
-      # laziness. `sleep` waits on CLOCK_MONOTONIC, which does not advance while the machine is
-      # suspended, so this counts time the host was actually AWAKE and able to synchronise.
-      #
-      # /proc/uptime (or any wall clock) would be wrong here in a way that reboots laptops: it
-      # includes suspended time, so a lid closed for two hours resumes with the deadline already
-      # long past, and the verdict lands in the same second the lid opened -- before chrony has
-      # polled anything. The remedy is a reboot, so getting this wrong is not a cosmetic bug.
-      #
-      # Integer division, so a value that is not a multiple of the interval rounds down; the
-      # assertion in modules/time-sync.nix keeps it far enough above the interval to matter.
-      remaining=$(( ${unwedgeSeconds} / 10 ))
-      while [ "$remaining" -gt 0 ]; do
-        if synced; then
-          # Episode over. Clearing the breadcrumb is what makes the guard below "one reboot per
-          # stuck episode" rather than "one reboot ever".
-          rm -f ${unwedgeState}
-          echo "time-sync-unwedge: the clock is synchronised; nothing to do"
-          exit 0
-        fi
-        sleep 10
-        remaining=$(( remaining - 1 ))
-      done
-
-      # Asked once more, because the last sleep is as good a moment to synchronise as any and
-      # the alternative is rebooting a host that just succeeded.
-      if synced; then
-        rm -f ${unwedgeState}
-        echo "time-sync-unwedge: the clock is synchronised; nothing to do"
-        exit 0
-      fi
-
-      boot_id="$(cat /proc/sys/kernel/random/boot_id)"
-
-      # Bounded to one reboot per episode. Rebooting is only a remedy for a wedged resolver or
-      # daemon; when the cause is something a restart cannot fix -- chrony persistently refusing
-      # sources whose intervals do not overlap, say -- an unbounded rule would reboot this host
-      # every ${unwedgeSeconds}s forever, which is the shape of the 2026-07-27
-      # bootloop that modules/connectivity-watchdog.nix was written to avoid repeating.
-      #
-      # Note the direction each failure falls in, which is the opposite of that module's: a read
-      # that fails here means "no record of a previous reboot", so the worst case is one extra
-      # reboot rather than a disabled failsafe -- and the write below happens BEFORE the reboot
-      # precisely so a full or read-only /var cannot produce an unbounded loop.
-      if [ -r ${unwedgeState} ] && [ "$(cat ${unwedgeState})" != "$boot_id" ]; then
-        echo "time-sync-unwedge: still unsynchronised, but a previous boot already rebooted for this; standing down"
-        exit 0
-      fi
-
-      # journald is persistent (services.journald.storage), so this verdict survives the reboot
-      # and is readable afterwards with `journalctl -b -1 -u time-sync-unwedge`.
-      echo "time-sync-unwedge: the rough clock succeeded but chrony has not synchronised in ${unwedgeSeconds}s; rebooting"
-      printf '%s' "$boot_id" > ${unwedgeState}
-      systemctl reboot
-    '';
-  };
 in
 
 {
   options.common.timeSync = {
     # Opt-in like the other common.* modules, so a host that has not been thought about does
-    # not silently acquire a service that steps its clock at boot.
-    enable = lib.mkEnableOption "chrony over NTS plus the boot-time rough clock";
+    # not silently acquire a service that steps its clock.
+    enable = lib.mkEnableOption "chrony over NTS plus the periodic time-correction service";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ../packages/rough-time/package.nix { };
-      defaultText = lib.literalExpression "pkgs.callPackage ../packages/rough-time/package.nix { }";
-      description = "The rough-clock binary the boot service runs.";
+      default = pkgs.callPackage ../packages/time-correction/package.nix { };
+      defaultText = lib.literalExpression "pkgs.callPackage ../packages/time-correction/package.nix { }";
+      description = "The clock-correction binary the timed service runs.";
     };
 
     floor = lib.mkOption {
@@ -253,16 +207,32 @@ in
       '';
     };
 
-    restartSeconds = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 30;
+    interval = lib.mkOption {
+      type = lib.types.str;
+      default = "1h";
+      example = "30m";
       description = ''
-        Delay between attempts at the rough clock. It retries until it succeeds: there is no
-        useful terminal state, because a host that never learns the time never gets DNS either.
+        How often the time-correction service runs, as a systemd time span. It also runs once
+        shortly after every boot; see [](#opt-common.timeSync.bootDelay).
 
-        Also keeps the unit clear of systemd's start rate limit, which would otherwise stop
-        retrying after five attempts -- at 30s the default window of five starts in ten
-        seconds can never fill.
+        The cadence is not only about how quickly a wrong clock is corrected. Each run does the
+        whole DoH + NTS exchange even when the clock is fine, so it is also the only thing on
+        this host that regularly proves those two paths still work -- a provider that stopped
+        answering or a pinned address that moved shows up as a failing unit while the host is
+        still healthy, rather than at the next cold boot when nothing works at all.
+      '';
+    };
+
+    bootDelay = lib.mkOption {
+      type = lib.types.str;
+      default = "1min";
+      description = ''
+        How long after boot the first run happens, as a systemd time span.
+
+        Short, because on an RTC-less host nothing else can put the clock inside certificate
+        validity once the persisted last-known-good time is too old -- but not zero, because the
+        unit waits for `network-online.target` anyway and firing before there is any chance of
+        an address only spends a run on a failure.
       '';
     };
 
@@ -272,7 +242,7 @@ in
       defaultText = lib.literalExpression "(import ../lib/nts-servers.nix { inherit lib; }).hostnames";
       description = ''
         The NTS servers chrony synchronises against. Hostnames, resolved through this host's
-        own DoH resolver once the rough clock has made that possible.
+        own DoH resolver once the correction service has made that possible.
       '';
     };
 
@@ -286,33 +256,6 @@ in
         misconfigured, or impersonated -- set the time unchallenged. That is the failure the
         spec's "must use multiple servers to detect incorrect servers" is about, and this is
         the directive that enforces it.
-      '';
-    };
-
-    unwedgeSeconds = lib.mkOption {
-      type = lib.types.nullOr lib.types.ints.positive;
-      default = 3600;
-      description = ''
-        How long to wait for chrony to synchronise after the rough clock has succeeded, before
-        rebooting. `null` installs no such unit at all.
-
-        Counted in time the host was AWAKE, not wall clock: the wait is a series of sleeps, and
-        sleeping does not advance while the machine is suspended. On a laptop the difference is
-        the whole behaviour -- a lid closed for longer than this would otherwise resume with the
-        deadline already past and reboot in the second the lid opened, before chrony had polled
-        anything.
-
-        Note where this sits: it only starts once rough-time has obtained an authenticated
-        timestamp, so by the time it is counting, the network and the NTS servers demonstrably
-        work. A host with no network never gets here -- rough-time fails and systemd retries it
-        every [](#opt-common.timeSync.restartSeconds) instead, which is the right response to an
-        outage and is why this is not a general "the clock is wrong" reboot.
-
-        What it does catch is the state where the rough clock worked but chrony still cannot:
-        rough-time resolves the NTS hostnames itself over DoH at a pinned address, while chrony
-        resolves them through dnscrypt-proxy, so a wedged resolver leaves chrony unable to reach
-        servers rough-time just talked to. A reboot fixes that and nothing else on the host would
-        notice.
       '';
     };
 
@@ -347,7 +290,7 @@ in
         message = ''
           common.timeSync.sample (${toString cfg.sample}) exceeds either the number of distinct
           NTS operators reachable from common.timeSync.servers or the number of DoH resolvers in
-          lib/doh-stamps.nix, so the rough clock could never assemble a quorum.
+          lib/doh-stamps.nix, so the correction service could never assemble a quorum.
         '';
       }
       {
@@ -363,9 +306,9 @@ in
           common.timeSync.servers names a host that lib/nts-servers.nix does not describe:
           ${toString (lib.subtractLists (lib.mapAttrsToList (_: p: p.hostname) ntsServers.providers) cfg.servers)}
 
-          chrony would use it, but rough-time could not: it needs the operator that file carries,
-          because the operator is what decides whether two answers count as one source or two.
-          Add the host there rather than only here.
+          chrony would use it, but time-correction could not: it needs the operator that file
+          carries, because the operator is what decides whether two answers count as one source
+          or two. Add the host there rather than only here.
         '';
       }
       {
@@ -384,23 +327,9 @@ in
           is never written.
         '';
       }
-      {
-        # chronyd polls with `iburst` (services.chrony.serverOption's default), so its first
-        # synchronisation after the rough clock is seconds away, not minutes. What this floor
-        # protects against is a window shorter than that first exchange, which would reboot a
-        # host that was about to synchronise -- and since the clock is unsynchronised again from
-        # zero on the next boot, that is a loop rather than a single wasted reboot.
-        assertion = cfg.unwedgeSeconds == null || cfg.unwedgeSeconds >= 120;
-        message = ''
-          common.timeSync.unwedgeSeconds (${toString cfg.unwedgeSeconds}) must be at least 120:
-          chrony needs a key establishment and a few polls per source before it can synchronise,
-          and rebooting inside that window reboots a host that was about to succeed -- every
-          boot, since the clock starts unsynchronised again each time.
-        '';
-      }
     ];
 
-    environment.systemPackages = [ roughTimeCommand ];
+    environment.systemPackages = [ correctionCommand ];
 
     services.chrony = {
       enable = true;
@@ -417,28 +346,77 @@ in
       #
       # On Linux `rtcsync` works by having the kernel copy the system time to the RTC every 11
       # minutes, and the kernel only does that while `STA_UNSYNC` is clear, so enabling it is
-      # what clears the bit. Without it chronyd synchronises perfectly and the kernel still
-      # reports the clock as unsynchronised forever -- which would make rough-time re-run and
-      # step the clock on every boot despite chrony already having it right, and would make
-      # `timedatectl` report NTPSynchronized=no on a host that is synchronised.
-      # Confirmed by tests/nts-sync.nix, whose "stands down once something has synchronised"
-      # subtest fails outright with the nixpkgs default.
+      # what clears the bit. Two things follow, and the first is the one that matters here: the
+      # RTC is kept current, so on a host that has one the next boot starts close to correct and
+      # `chronyd -s` has a good value to read. The second is that `timedatectl` reports
+      # NTPSynchronized=yes rather than no on a host that is in fact synchronised.
       #
       # Nothing here needs a trimmed RTC. The Pi has no RTC battery at all, and what the
       # laptop needs is that the next boot starts close to correct -- which an 11-minute copy
       # gives, and which tests/boot-clock.nix asserts by checking the RTC is read in the
       # initrd, not by checking its precision.
       enableRTCTrimming = false;
+      # Spec: "must write the last known good time regularly and bump the time forward to this
+      # persisted value on boot". Both halves are chronyd's own, which is why no unit of ours
+      # implements either.
+      #
+      # Writing: the nixpkgs module emits `driftfile /var/lib/chrony/chrony.drift`, and
+      # chrony.conf(5) says that file "is written only on an update of the local clock", at most
+      # once per the directive's `interval` (default 3600s). So its mtime is a timestamp at which
+      # this host was demonstrably synchronised -- not merely running -- refreshed hourly.
+      #
+      # Bumping: `-s` sets the clock from the RTC, and per chronyd(8), "if the last modification
+      # time of the drift file is later than both the current time and the RTC time, the system
+      # time will be set to it to restore the time when chronyd was previously stopped. This is
+      # useful on computers that have no RTC or the RTC is broken" -- i.e. the Pi. Forward-only,
+      # so it can never move a good clock backwards, and it needs no network at all, which is
+      # what makes it the cheap half of the recovery described at the top of this file.
+      #
+      # The `interval` argument is left at chrony's default because the nixpkgs module hardcodes
+      # the directive with no way to pass one. An hour matches this module's own correction
+      # cadence; do not try to override it by emitting a second `driftfile` line below.
+      extraFlags = [ "-s" ];
       extraConfig = ''
         minsources ${toString cfg.minSources}
         rtcsync
       '';
     };
 
-    systemd.services.rough-time = {
-      description = "Establish a rough system clock from an authenticated NTS timestamp";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
+    # Timed rather than triggered by a target, and monotonic rather than calendar-based.
+    #
+    # `OnCalendar=hourly` + `Persistent=true` is the obvious shape and is wrong here in a way
+    # that matters: `Persistent` decides whether a run was missed by comparing a stored wall-clock
+    # timestamp against the current clock, and a wildly wrong clock is precisely the state this
+    # unit exists to fix. A host booting at the systemd epoch would see every hour since the stamp
+    # as missed, fire immediately, then step its own clock forward and see them missed again.
+    # Monotonic timers ask the kernel how long this boot has been running, which no clock error can
+    # distort -- so "after boot, then every hour" comes out exactly as the spec states it, and
+    # every boot is guaranteed one run rather than one that may or may not be considered due.
+    #
+    # `Persistent` is also meaningless on a monotonic timer, so its absence here is not an
+    # oversight: catch-up is inherent, since the count restarts from this boot.
+    systemd.timers.time-correction = {
+      description = "Run the time-correction service after boot and every ${cfg.interval}";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = cfg.bootDelay;
+        OnUnitActiveSec = cfg.interval;
+        AccuracySec = "1m";
+        Unit = "time-correction.service";
+      };
+    };
+
+    systemd.services.time-correction = {
+      description = "Correct the system clock from an authenticated NTS timestamp";
+      # No `wantedBy`: the timer's OnBootSec is the boot run. Starting it from a target as well
+      # would run it twice on every boot and reset the hourly count from the later of the two.
+      #
+      # network-online.target rather than network.target alone, and this is load-bearing now that
+      # nothing retries. `network.target` does not mean an address exists, which is why the boot
+      # attempt "usually fails on a cold boot" -- true and harmless while a failed run was retried
+      # every 30s, and a wasted hour now that the next attempt is the timer's.
+      wants = [ "network-online.target" ];
+      after = [ "network.target" "network-online.target" ];
       # Deliberately NOT ordered against chronyd, though the temptation is obvious: chronyd
       # needs DNS, DNS needs DoH, DoH needs a plausible clock, so `Before=chronyd.service`
       # reads like the right thing. It buys much less than it costs.
@@ -449,28 +427,36 @@ in
       # chronyd after this unit means its FIRST resolve happens with a usable clock, so it
       # never enters that backoff.
       #
-      # Why that is not worth it: the ordering only holds for the first attempt. `Restart=`
-      # does not keep the start job open (the unit reaches `failed`, which finishes the job,
-      # and each retry is a fresh one), so from attempt two onward chronyd is already up and
-      # already backing off -- and on a cold boot attempt one usually fails, since
-      # `After=network.target` does not mean an address exists. So the case the ordering fixes
-      # is the case that needed no fixing, while the delay it imposes -- one full DoH+NTS
-      # exchange before chronyd may start -- is paid on every boot of every host, including
-      # the laptop, where STA_UNSYNC is set at boot like everywhere else and this unit
-      # therefore runs the whole exchange before deciding it had nothing to do.
+      # Why that is not worth it: it would hold chronyd back through a full DoH + NTS exchange on
+      # every boot of every host -- and the exchange now happens unconditionally, even where the
+      # clock is already fine, so that delay would be paid on the laptop too. It would also
+      # postpone `chronyd -s`, which is the half of the recovery that needs no network and is
+      # therefore the half most likely to be the one that works. Worse, the boot run waits for
+      # `network-online.target`, so the ordering would make chronyd wait for the network as well.
       #
-      # The consequence, accepted knowingly: on an RTC-less cold boot chrony's first
-      # synchronisation is gated by its own 28s retry floor rather than by this unit.
-      # tests/rough-time.nix pins that chronyd runs while this unit is still failing.
+      # The consequence, accepted knowingly: on an RTC-less cold boot where the persisted
+      # last-known-good time is too stale to help, chrony's first synchronisation is gated by its
+      # own 28s retry floor rather than by this unit. tests/time-correction.nix pins that
+      # chronyd runs regardless of whether this unit succeeds.
 
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ roughTimeArgs);
-        # Retry until the clock is set. RemainAfterExit so a success is visible in
-        # `systemctl status` for the rest of the boot rather than looking like a dead unit.
-        RemainAfterExit = true;
-        Restart = "on-failure";
-        RestartSec = cfg.restartSeconds;
+        ExecStart = lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ correctionArgs);
+        # No Restart= and no RemainAfterExit. The spec makes any error fail the run, and the
+        # timer owns the next attempt -- so a failure has to be a plain terminal failure that
+        # `systemctl status` and the journal report, rather than a unit perpetually mid-retry.
+        # RemainAfterExit would additionally make the timer's next trigger a no-op on a unit
+        # still "active" from its last success.
+
+        # Well above any exchange that could still succeed, and that matters more than it used to.
+        # systemd's default is 90s, and the program's own worst case can exceed it: every address
+        # of every chosen provider is tried in turn, so a network that BLACKHOLES one family --
+        # dropping silently rather than answering ENETUNREACH -- pays the full
+        # [](#opt-common.timeSync.timeoutSeconds) per address on both the DoH and the NTS leg.
+        # While the unit retried every 30s, being killed at 90s cost one attempt; now it costs an
+        # hour, and reads in the journal as a failure of the providers rather than of the ceiling.
+        # Still far below the interval, so a run can never overlap its successor.
+        TimeoutStartSec = "5min";
 
         # Setting the clock is the entire point, so unlike every other hardened unit in this
         # repo ProtectClock must stay off and CAP_SYS_TIME must survive the bounding set.
@@ -520,31 +506,6 @@ in
         # oneshot's process exits. Same reasoning as the watchdog marker in
         # modules/connectivity-watchdog.nix.
         RuntimeDirectoryPreserve = true;
-      };
-    };
-
-    # Last resort for the one state the retry loop above cannot fix: the rough clock succeeded,
-    # so the network and the NTS servers work, and chrony still has not synchronised. See the
-    # `unwedgeSeconds` description for why that is a narrow and specific failure rather than
-    # "the clock is wrong", and why a host with no network never reaches this unit at all.
-    systemd.services.time-sync-unwedge = lib.mkIf (cfg.unwedgeSeconds != null) {
-      description = "Reboot if chrony cannot synchronise after the rough clock succeeded";
-      # Requires, not just after: this must only count while the rough clock has actually
-      # succeeded. That ordering is the entire reason the trigger means what it says.
-      after = [ "rough-time.service" ];
-      requires = [ "rough-time.service" ];
-      wantedBy = [ "multi-user.target" ];
-
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = lib.getExe unwedge;
-        StateDirectory = "time-sync-unwedge";
-        # The script owns the deadline, so systemd's must sit outside it -- otherwise systemd
-        # kills the script at the moment it was about to decide, and the reboot never happens.
-        TimeoutStartSec = "${toString (cfg.unwedgeSeconds + 120)}s";
-        # One verdict per boot. Restart=on-failure would re-arm the wait after a stand-down and
-        # turn "at most one reboot per stuck episode" back into a loop.
-        Restart = "no";
       };
     };
 

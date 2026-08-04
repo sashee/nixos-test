@@ -5,8 +5,8 @@
 # this list and neither wants addresses:
 #
 #   chronyd runs after the clock is already inside certificate validity, so a name resolves;
-#   rough-time runs before that, and resolves these names itself through a DoH resolver dialled
-#     at a pinned address -- which is why lib/doh-stamps.nix pins and this file does not.
+#   time-correction runs before that, and resolves these names itself through a DoH resolver
+#     dialled at a pinned address -- which is why lib/doh-stamps.nix pins and this file does not.
 #
 # Pinning would not work here anyway, which is the substantive reason. Measured 2026-08-02:
 # time.cloudflare.com is anycast across a few hundred sites, nts.netnod.se is a ten-way DNS
@@ -18,7 +18,7 @@
 # establishment itself and hand the timestamping to a different host and port, using records
 # marked CRITICAL, which a client that does not understand them must abort on. nts.netnod.se
 # does exactly that -- it redirects to 194.58.207.80:4123. chronyd handles it transparently;
-# packages/rough-time implements it explicitly (see src/nts.rs).
+# packages/time-correction implements it explicitly (see src/nts.rs).
 #
 # `operator` is carried explicitly rather than derived from the hostname. The spec requires
 # multiple servers so a single lying or broken source can be outvoted, and that only holds if
@@ -35,9 +35,9 @@
 rec {
   # Verified 2026-08-02 from a development machine, NOT yet from the rpi5: all four completed
   # NTS-KE on tcp/4460 (TLS 1.3, ALPN ntske/1, AEAD 15, 8 cookies each), and all four returned
-  # an authenticated timestamp over NTPv4 through the full rough-time path. Re-run
-  # `rough-time --force --dry-run` on the Pi and record that here before relying on it there;
-  # its egress is not this machine's.
+  # an authenticated timestamp over NTPv4 through the full time-correction path. Re-run
+  # `time-correction --force --dry-run` on the Pi and record that here before relying on it
+  # there; its egress is not this machine's.
   #
   # A server that is merely unreachable degrades quietly: chronyd drops to the remaining
   # sources and `minsources 2` keeps working until it cannot, and nothing reports it yet.

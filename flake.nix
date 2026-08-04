@@ -63,9 +63,9 @@
       # The counterpart to qemu-vm.nix's `services.timesyncd.enable = false` ("Don't run ntpd
       # in the guest. It should get the correct time from KVM."). That line neutralises the
       # stock time daemon on every test node; chrony is now the time daemon, so without the
-      # same treatment every VM test acquires a daemon -- and a rough-time unit retrying
-      # forever against a network with no providers -- that argues with the ~10 tests which
-      # drive the clock with `date -s`.
+      # same treatment every VM test acquires a daemon -- one that steps the clock forward to
+      # its drift file on start (`chronyd -s`) and has an hourly correction service beside it --
+      # that argues with the ~10 tests which drive the clock with `date -s`.
       #
       # Priority 90 rather than mkForce: it has to beat the host config's normal-priority
       # `enable = true`, while leaving mkForce free for the two tests that are ABOUT time and
@@ -454,25 +454,25 @@
         };
         inherit dohStamps;
       };
-      # The boot-time rough clock on the REAL rpi config -- the valuable variant, since the
+      # The time-correction service on the REAL rpi config -- the valuable variant, since the
       # RTC-less Pi is the host that actually needs it: the deployed dnscrypt, the DoH egress
       # rules and the default-deny firewall are all live around it.
-      roughTimeTestRpi = import ./tests/rough-time.nix {
+      timeCorrectionTestRpi = import ./tests/time-correction.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
         inherit dohStamps;
         # Same reasoning as connectivityWatchdogTestRpi: hosts/rpi5 enables
         # connectivity-fallback, whose check would fire at the production 5min bootGrace
-        # inside a test whose retry subtests span far longer than that. Push the deadline
-        # past the end of the run rather than removing the units.
+        # inside a test whose subtests span far longer than that. Push the deadline past the
+        # end of the run rather than removing the units.
         machineModule = { ... }: {
           imports = [ rpiConnectivitySystemModule ./modules/time-sync.nix ];
           common.connectivityFallback.bootGrace = "3h";
         };
         globalTimeout = 1800;
       };
-      # The full time chain on the REAL rpi config: rough clock -> DNS -> chrony over NTS.
+      # The full time chain on the REAL rpi config: correction service -> DNS -> chrony over NTS.
       # The RTC-less Pi is the host the bootstrap deadlock actually happens to, so this is the
       # variant that matters.
       ntsSyncTestRpi = import ./tests/nts-sync.nix {
@@ -484,8 +484,10 @@
           imports = [ rpiConnectivitySystemModule ./modules/time-sync.nix ];
           common.connectivityFallback.bootGrace = "3h";
         };
-        # Five VMs under TCG, and the unwedge node adds two 120s countdowns and a real reboot.
-        globalTimeout = 3000;
+        # Four VMs under TCG, with a real reboot and several chrony synchronisations. Down from
+        # 3000 with the reboot-failsafe node, which added two 120s countdowns and a reboot of
+        # its own.
+        globalTimeout = 2400;
       };
       # Production timer constants under icount time-warp, on the real rpi config. Composes
       # rpiNodeBase rather than rpiSystemModule so this node owns the sole -rtc flag (it
@@ -554,7 +556,7 @@
         connectivity-fallback = connectivityFallbackTestRpi;
         connectivity-fallback-trigger = connectivityFallbackTriggerTestRpi;
         connectivity-watchdog = connectivityWatchdogTestRpi;
-        rough-time = roughTimeTestRpi;
+        time-correction = timeCorrectionTestRpi;
         nts-sync = ntsSyncTestRpi;
         connectivity-fallback-timing = connectivityFallbackTimingTestRpi;
         monitoring-nix-gc = monitoringNixGcTestRpi;
@@ -688,11 +690,12 @@
       # The two halves of the time chain on the generic desktop config, for fast local
       # feedback; the aarch64 variants against hosts/rpi5 are the ones that cover the deployed
       # target, since the RTC-less Pi is the host the bootstrap actually matters on.
-      # rough-time.nix covers the rough clock itself -- quorum, floor, deferred certificate
-      # checks -- and nts-sync.nix covers the chain it exists to unblock. time-sync.nix arrives
+      # time-correction.nix covers the correction service itself -- its timer, quorum, floor and
+      # deferred certificate checks -- and nts-sync.nix covers the chain it exists to unblock,
+      # including chrony's own persisted last-known-good clock. time-sync.nix arrives
       # through commonDesktopModule and is named again here so the composition each test runs
       # is readable at its call site.
-      roughTimeTest = import ./tests/rough-time.nix {
+      timeCorrectionTest = import ./tests/time-correction.nix {
         inherit nixpkgs pkgs stateVersion dohStamps;
         machineModule = { ... }: {
           imports = [ commonDesktopModule ./modules/time-sync.nix ];
@@ -952,7 +955,7 @@
         connectivity-fallback = connectivityFallbackTest;
         connectivity-fallback-trigger = connectivityFallbackTriggerTest;
         connectivity-watchdog = connectivityWatchdogTest;
-        rough-time = roughTimeTest;
+        time-correction = timeCorrectionTest;
         nts-sync = ntsSyncTest;
         connectivity-fallback-timing = connectivityFallbackTimingTest;
         system = systemTest;

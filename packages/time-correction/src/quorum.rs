@@ -95,12 +95,17 @@ fn vote(answers: &[&Answer], tolerance: i64) -> Result<i64, String> {
 /// establishment being refused and an NTP packet failing authentication are three different
 /// operational faults, and each is reported by the caller at the point it happened; folding
 /// them into one sentence would lose the only part worth acting on.
-pub fn decide(
-    sampled: &[String],
-    answers: &[Answer],
-    tolerance: i64,
-    floor: i64,
-) -> Result<i64, String> {
+///
+/// The caller now refuses the run outright when any pair failed, so the silent-operator branch
+/// below is unreachable from `main::run`. It stays because this function's contract is "every
+/// sampled operator must have answered", and a function that quietly returned a time from half a
+/// sample would be the wrong thing for any future caller to be handed.
+///
+/// The build-time floor is NOT checked here. It applies to each set's own reported timestamp,
+/// before that timestamp is used to re-verify any certificate chain, so it lives in
+/// `main::ask_pair`; applying it to the agreed time as well would only re-check a bound already
+/// enforced on every input to the agreement.
+pub fn decide(sampled: &[String], answers: &[Answer], tolerance: i64) -> Result<i64, String> {
     if sampled.is_empty() {
         return Err("no providers were sampled".to_string());
     }
@@ -139,21 +144,13 @@ pub fn decide(
         ));
     }
 
-    let believed = middle(votes.iter().map(|(_, s)| *s).collect());
-    if believed < floor {
-        return Err(format!(
-            "refusing {believed}: earlier than the build-time floor {floor}. Retroactive certificate validation proves a chain was valid at the claimed time, not that the claimed time is now, so a once-valid certificate could otherwise roll this clock backwards"
-        ));
-    }
-
-    Ok(believed)
+    Ok(middle(votes.iter().map(|(_, s)| *s).collect()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const FLOOR: i64 = 1_700_000_000;
     const NOW: i64 = 1_800_000_000;
 
     fn answer(operator: &str, endpoint: &str, seconds: i64) -> Answer {
@@ -174,7 +171,6 @@ mod tests {
             &names(&["a", "b"]),
             &[answer("a", "1.1.1.1", NOW), answer("b", "9.9.9.10", NOW + 3)],
             60,
-            FLOOR,
         );
         // The middle of two is the upper of the pair after sorting; what matters is that it is
         // one of the readings and inside the tolerance, not which extreme it is.
@@ -187,14 +183,13 @@ mod tests {
             &names(&["a", "b"]),
             &[answer("a", "1.1.1.1", NOW), answer("b", "9.9.9.10", NOW + 3_600)],
             60,
-            FLOOR,
         );
         assert!(got.unwrap_err().contains("operators disagree"));
     }
 
     #[test]
     fn a_silent_provider_blocks_the_decision() {
-        let got = decide(&names(&["a", "b"]), &[answer("a", "1.1.1.1", NOW)], 60, FLOOR);
+        let got = decide(&names(&["a", "b"]), &[answer("a", "1.1.1.1", NOW)], 60);
         let message = got.unwrap_err();
         assert!(message.contains("1 of 2 operators"), "{message}");
         assert!(message.contains("(b)"), "{message}");
@@ -211,7 +206,6 @@ mod tests {
                 answer("a", "2606:4700:4700::1111", NOW + 1),
             ],
             60,
-            FLOOR,
         );
         assert!(got.unwrap_err().contains("(b)"));
     }
@@ -224,7 +218,6 @@ mod tests {
             &names(&["a", "b", "c", "d"]),
             &[answer("a", "x", NOW), answer("c", "y", NOW)],
             60,
-            FLOOR,
         );
         let message = got.unwrap_err();
         assert!(message.contains("2 of 4 operators"), "{message}");
@@ -241,7 +234,6 @@ mod tests {
                 answer("b", "9.9.9.10", NOW),
             ],
             60,
-            FLOOR,
         );
         assert!(got.unwrap_err().contains("a disagrees with itself"));
     }
@@ -256,7 +248,6 @@ mod tests {
                 answer("b", "9.9.9.10", NOW + 1),
             ],
             60,
-            FLOOR,
         );
         assert_eq!(got, Ok(NOW + 2));
     }
@@ -267,7 +258,6 @@ mod tests {
             &names(&["a", "b"]),
             &[answer("a", "x", NOW), answer("b", "y", NOW + 60)],
             60,
-            FLOOR,
         );
         assert_eq!(at, Ok(NOW + 60), "exactly the tolerance still agrees");
 
@@ -275,32 +265,14 @@ mod tests {
             &names(&["a", "b"]),
             &[answer("a", "x", NOW), answer("b", "y", NOW + 61)],
             60,
-            FLOOR,
         );
         assert!(over.is_err(), "one second past the tolerance does not");
     }
 
-    #[test]
-    fn a_time_below_the_floor_is_rejected() {
-        let got = decide(
-            &names(&["a", "b"]),
-            &[answer("a", "x", FLOOR - 1), answer("b", "y", FLOOR - 1)],
-            60,
-            FLOOR,
-        );
-        assert!(got.unwrap_err().contains("floor"));
-    }
-
-    #[test]
-    fn a_time_exactly_at_the_floor_is_accepted() {
-        let got = decide(
-            &names(&["a", "b"]),
-            &[answer("a", "x", FLOOR), answer("b", "y", FLOOR)],
-            60,
-            FLOOR,
-        );
-        assert_eq!(got, Ok(FLOOR));
-    }
+    // The floor's own fixtures are not here any more: it is applied per set in
+    // `main::ask_pair`, against each provider's own reported timestamp, so `decide` never sees
+    // a time the floor would refuse. `main::floor_rejects_a_time_before_it` covers the rule and
+    // tests/time-correction.nix covers the message a real provider produces.
 
     #[test]
     fn unreachable_endpoints_contribute_nothing_rather_than_disagreeing() {
@@ -311,7 +283,6 @@ mod tests {
             &names(&["a", "b"]),
             &[answer("a", "1.1.1.1", NOW), answer("b", "9.9.9.10", NOW)],
             60,
-            FLOOR,
         );
         assert_eq!(got, Ok(NOW));
     }
@@ -328,20 +299,19 @@ mod tests {
                 answer("c", "z", NOW + 20),
             ],
             60,
-            FLOOR,
         );
         assert_eq!(got, Ok(NOW));
     }
 
     #[test]
     fn no_answers_at_all_is_rejected() {
-        let got = decide(&names(&["a", "b"]), &[], 60, FLOOR);
+        let got = decide(&names(&["a", "b"]), &[], 60);
         assert!(got.is_err());
     }
 
     #[test]
     fn an_empty_sample_is_rejected() {
-        assert!(decide(&[], &[answer("a", "x", NOW)], 60, FLOOR).is_err());
+        assert!(decide(&[], &[answer("a", "x", NOW)], 60).is_err());
     }
 
     #[test]

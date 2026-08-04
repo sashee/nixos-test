@@ -1,9 +1,9 @@
 [package]
-name = "rough-time"
+name = "time-correction"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Establish a rough system clock at boot from an authenticated NTS timestamp, resolving the server over DoH"
+description = "Correct the system clock from an authenticated NTS timestamp, resolving the server over DoH"
 
 [dependencies]
 # HTTP for the DoH leg, at whatever version the resolver negotiates over ALPN. Hand-rolling
@@ -33,11 +33,7 @@ rustix = { version = "1", features = ["time"] }
 # operation has not been thoroughly assessed -- worth knowing for a boot-critical path, and
 # there is no alternative implementation of this construction in the ecosystem.
 aes-siv = "0.7"
-# adjtimex, to ask the kernel whether the clock is already disciplined. rustix 1.x does not
-# bind it and the crates that do are unvetted single-purpose packages, so this is the one
-# place the crate makes a raw call; see the SAFETY note in main.rs.
-libc = "0.2"
 
 [[bin]]
-name = "rough-time"
+name = "time-correction"
 path = "src/main.rs"

@@ -252,87 +252,100 @@ synchronises over NTS — authenticated NTP — against the four servers in
 `minsources 2` so no single reachable server can set the time unchallenged.
 `enableNTS` brings `ntsdumpdir` with it, so cookies survive a reboot and a cold
 boot does not have to redo key establishment before it can ask the time. The
-module also sets `rtcsync`, which is the only thing that makes chronyd tell the
-*kernel* the clock is synchronised; nixpkgs' default `enableRTCTrimming` is
-mutually exclusive with it and is therefore off, which costs nothing here — the
-Pi has no RTC battery at all, and what the laptop needs is only that the next
-boot starts close to correct. The module writes `/run/chrony-wait/synchronized`
-from a small `chrony-wait` unit and repoints
-`common.systemMetrics.syncedMarker` at it, since chrony has no equivalent of
-timesyncd's marker and `time-sync.target` is reached when chronyd *starts*, not
-when it has synchronised.
+module also sets `rtcsync`, which keeps the RTC current (so a host that has one
+starts its next boot close to correct) and is what makes chronyd tell the *kernel*
+the clock is synchronised; nixpkgs' default `enableRTCTrimming` is mutually
+exclusive with it and is therefore off, which costs nothing here — the Pi has no
+RTC battery at all. The module writes `/run/chrony-wait/synchronized` from a small
+`chrony-wait` unit and repoints `common.systemMetrics.syncedMarker` at it, since
+chrony has no equivalent of timesyncd's marker and `time-sync.target` is reached
+when chronyd *starts*, not when it has synchronised.
 
-The other half of the module is the way out of a deadlock. DoH and NTS are both
-TLS, so a clock outside certificate validity blocks name resolution and time
+The rest of the module is the way out of a deadlock. DoH and NTS are both TLS, so
+a clock outside certificate validity blocks name resolution and time
 synchronisation at once and neither can recover the other — and an RTC-less
 Raspberry Pi is in exactly that state on every cold boot. chrony cannot break it
-alone, because whatever its certificate policy it still has to *resolve* the NTS
-hostnames, and that is DoH. So `packages/rough-time`, a small Rust binary, runs
-as a oneshot that retries every 30s until it succeeds: it dials a DoH
-resolver at a pinned address (the same addresses `modules/doh.nix` pins, read
-from `lib/doh-stamps.nix`) to resolve an NTS server's name, does NTS key
-establishment with that server, takes an authenticated NTPv4 timestamp — and
-only then verifies both certificate chains, at the instant that was reported.
-That last step is the whole security argument, and a `Deferred` type makes it
-structural rather than a step someone can forget: there is no way to obtain a
-believable time except by consuming the recorded chains. Two independent
-operators must agree within a minute, so moving this clock means compromising
-two at once, and only ever within a certificate's validity window — with
-`nixpkgs.lastModified` passed in from `flake.nix` as a floor bounding how far
-back a once-valid certificate could roll things. `rough-time --force --dry-run`
-on a live host asks exactly what the boot service asks and prints the answer
-without setting anything.
+by synchronising, because whatever its certificate policy it still has to *resolve*
+the NTS hostnames, and that is DoH. There are two independent ways out, and the
+cheap one is chrony's own.
 
-It steps the clock only when it has to, which is narrower than it sounds. It asks
-the kernel via `adjtimex` whether `STA_UNSYNC` is clear — before the exchange and
-again before writing, since the exchange takes seconds during which chrony may
-get there first — so on a laptop with a working RTC or any warm reboot it is a
-no-op. It also stands down when the current clock, however wrong, already falls
-inside the validity of every certificate it just checked: TLS works at that
-point, which is the only thing this program exists to arrange, and chrony will
-make the accurate correction itself rather than have a whole-second approximation
-imposed on it first. That leans on chrony being able to step a large error, which
-it can, because nixpkgs defaults `services.chrony.makestep` to `0.1 3` — the
-first three updates step, with no size limit.
+**The persisted last-known-good clock.** chronyd runs with `-s`. It rewrites its
+`driftfile` whenever it computes a new drift value — at most hourly, and
+unconditionally on exit — and only ever while it is actually disciplining the
+clock, so that file's mtime is a timestamp at which this host was demonstrably
+right. At startup `-s` sets the clock from the RTC, or, when there is no usable RTC
+or the RTC reads *earlier* than that mtime (which is what a dead battery looks
+like), steps the clock **forward** to the mtime instead. No network, no DNS, one
+`stat`. It recovers a host that was merely off for a while; it cannot help one that
+was off for longer than a certificate's validity, and being forward-only it can
+never drag a good clock backwards.
+
+**The time-correction service.** `packages/time-correction`, a small Rust binary, dials
+a DoH resolver at a pinned address (the same addresses `modules/doh.nix` pins, read
+from `lib/doh-stamps.nix`) to resolve an NTS server's name, does NTS key
+establishment with that server, takes an authenticated NTPv4 timestamp — and only
+then verifies both certificate chains, at the instant that was reported. That last
+step is the whole security argument, and a `Deferred` type makes it structural
+rather than a step someone can forget: there is no way to obtain a believable time
+except by consuming the recorded chains. Two independent operators must agree
+within a minute, so moving this clock means compromising two at once, and only ever
+within a certificate's validity window — with `nixpkgs.lastModified` passed in from
+`flake.nix` as a floor, applied to each provider's own answer *before* that answer
+is used to re-verify anything, bounding how far back a once-valid certificate could
+roll things. Any provider failing fails the run. `time-correction --force --dry-run` on
+a live host asks exactly what the service asks and prints the answer without
+setting anything.
+
+It runs on a timer: once a minute after boot, then every
+`common.timeSync.interval` (default one hour). Monotonic rather than
+`OnCalendar` + `Persistent`, deliberately — `Persistent` works out what was missed
+by comparing a stored wall-clock stamp against the current clock, and a wrong clock
+is precisely the state this exists for. The hourly run is also a *check*, not only
+a repair: it does the whole DoH + NTS exchange even where the clock is
+demonstrably fine, so a provider that stopped answering or a pinned address that
+moved shows up as a failing unit while the host is still healthy enough to say so,
+rather than at the next cold boot when nothing works and nobody can reach the box.
+That is why it no longer asks the kernel via `adjtimex` whether the clock is
+already synchronised and skips the exchange — the skip was the failure mode.
+
+It still steps the clock only when it has to. It stands down when the current
+clock, however wrong, already falls inside the validity of every certificate it
+just checked: TLS works at that point, which is the only thing this program exists
+to arrange, and chrony will make the accurate correction itself rather than have a
+whole-second approximation imposed on it first. On a host chrony has disciplined
+that rule always fires, which is why dropping the kernel check costs nothing. It
+leans on chrony being able to step a large error, which it can, because nixpkgs
+defaults `services.chrony.makestep` to `0.1 3` — the first three updates step, with
+no size limit.
 
 It is deliberately not ordered against chronyd, though `Before=chronyd.service`
 reads like the obvious thing to write. What that would buy is chronyd's *first*
 name resolution happening with a usable clock, so it never enters its own retry
 backoff — `7 × 2^n` seconds with `n` clamped to `[2,9]`, i.e. 28s to ~60min, and
-`n` resets only on a successful resolve. What it costs is a full DoH+NTS exchange
-before chronyd may start, on every boot of every host — including the laptop,
-where `STA_UNSYNC` is set at boot like everywhere else, so the exchange runs in
-full before the program concludes it had nothing to do. And it only holds for the
-first attempt: `Restart=` does not keep the start job open, so from the second
-attempt on chronyd is already up and already backing off — which on a cold boot
-is the usual case, since `After=network.target` does not mean an address exists.
-The case the ordering fixes is the one that needed no fixing. The accepted
-consequence is that on an RTC-less cold boot chrony's first synchronisation is
-gated by its own 28s retry floor. `tests/rough-time.nix` pins that chronyd runs
-while the rough clock is still failing, on the node that never reaches a
-resolver.
+`n` resets only on a successful resolve. What it costs is more: a full DoH + NTS
+exchange before chronyd may start, on every boot of every host, now that the
+exchange happens unconditionally; a postponed `chronyd -s`, which is the half of
+the recovery needing no network and so the half most likely to work; and, since the
+boot run waits for `network-online.target`, chronyd waiting for the network too.
+The accepted consequence is that on an RTC-less cold boot whose persisted time is
+too stale to help, chrony's first synchronisation is gated by its own 28s retry
+floor. `tests/time-correction.nix` pins that chronyd runs regardless of whether the
+correction service succeeded.
 
-One failure remains after all that: the rough clock succeeded, so the network and
-the NTS servers demonstrably work, and chrony still has not synchronised. That is
-what `common.timeSync.unwedgeSeconds` (default one hour) catches, by rebooting.
-Note where it sits — it only starts counting once rough-time has succeeded, so a
-host that is simply offline is retried every 30s and never reaches it, which is
-the right response to an outage. What it does catch is the asymmetry between the
-two: rough-time resolves the NTS hostnames itself at a pinned address, while
-chrony goes through dnscrypt-proxy, so a wedged resolver stops one and not the
-other. It reboots at most once per episode, recording the boot ID before it goes
-so a second stuck boot stands down instead — because rebooting fixes a wedged
-daemon and does nothing for, say, a chrony persistently refusing sources whose
-intervals do not overlap, and an unbounded rule would then reboot hourly forever.
+There is deliberately no reboot failsafe for "the correction service succeeded and
+chrony still has not synchronised". `common.timeSync.unwedgeSeconds` used to be
+exactly that and the spec dropped it: a reboot is a remedy for a wedged resolver
+and nothing else, the hourly run now surfaces the same class of fault as a plain
+failing unit, and an unbounded reboot rule is the shape of the 2026-07-27 bootloop
+`modules/connectivity-watchdog.nix` exists to avoid repeating.
 
 It is opt-in (`common.timeSync.enable`) and enabled on both hosts. Two VM checks
-cover it on x86 and aarch64: `rough-time` exercises the binary's quorum, floor,
-deferred certificate checks and stand-down rules against controlled DoH resolvers
-and NTS servers, and `nts-sync` reproduces the deadlock end to end on the real
-host config — the machine boots years out, cannot resolve anything, and has to
-climb out through rough-time to chrony on its own. `nts-sync` also carries a
-second machine for the reboot failsafe alone, which needs a host that can sit
-unsynchronised on purpose and survive two reboots.
+cover it on x86 and aarch64: `time-correction` exercises the binary's quorum, floor,
+deferred certificate checks and stand-down rule, and the unit's timer, against
+controlled DoH resolvers and NTS servers; `nts-sync` reproduces the deadlock end to
+end on the real host config — the machine boots years out, cannot resolve anything,
+and has to climb out to chrony on its own — and covers the persisted clock by
+putting the RTC behind the drift file, which is what a dead battery looks like.
 
 `modules/restic.nix` configures named restic backups using systemd credentials.
 Each backup must specify the user that runs the service. Backup paths are bound
@@ -779,21 +792,23 @@ make run-tests MAX_JOBS=1
 `dns-peer`, redirects outbound HTTPS there, and verifies that a local DNS query
 becomes an HTTPS `/dns-query` request to one of the configured DoH hostnames.
 
-`rough-time` and `nts-sync` are hermetic in the same way and are among the
-slowest checks in the suite — five VMs each, both existing on x86 and aarch64.
-`rough-time` covers the boot clock in isolation against
+`time-correction` and `nts-sync` are hermetic in the same way and are among the
+slowest checks in the suite — five and four VMs, both existing on x86 and aarch64.
+`time-correction` covers the time-correction service in isolation against
 impersonated DoH resolvers and NTS servers, including the cases that only ever
 matter once: an expired certificate on either leg while that server's clock stays
 correct (so the answer it gives is right and must still be refused), a time below
-the build-time floor, a clock already inside the certificates' validity (left
-alone) and one outside it (set), no reachable resolver at all, and v4-only,
+the build-time floor (refused before any chain is re-verified against it), one
+provider of two failing (which fails the whole run), a clock already inside the
+certificates' validity (left alone) and one outside it (set), no reachable
+resolver at all (a visibly failed unit with the timer still armed), and v4-only,
 v6-only and NTS-reachable-only-over-v6 hosts. `nts-sync` boots a machine years out
 of date on the deployed configuration and asserts it climbs out on its own, then
-that chrony refuses a falseticker, keeps cookies across a reboot, and will not
-fall back to unauthenticated NTP when NTS-KE is blocked — and on a second machine,
-that the reboot failsafe fires once and only once. Their aarch64 variants get a
-raised `globalTimeout` (1800s and 3000s), since under TCG a run of either is
-measured in tens of minutes.
+that chrony records and restores its last known good time (forward only), refuses
+a falseticker, keeps cookies across a reboot, and will not fall back to
+unauthenticated NTP when NTS-KE is blocked. Their aarch64 variants get a raised
+`globalTimeout` (1800s and 2400s), since under TCG a run of either is measured in
+tens of minutes.
 
 `nix flake check` also works, but it evaluates every check in one nix process
 (~15 GiB peak) and leaves no output symlinks — prefer the `make run-*` targets,

@@ -920,19 +920,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rough-time"
-version = "0.1.0"
-dependencies = [
- "aes-siv",
- "libc",
- "reqwest",
- "rustix",
- "rustls",
- "rustls-native-certs",
- "x509-parser",
-]
-
-[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1276,6 +1263,18 @@ name = "time-core"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
+
+[[package]]
+name = "time-correction"
+version = "0.1.0"
+dependencies = [
+ "aes-siv",
+ "reqwest",
+ "rustix",
+ "rustls",
+ "rustls-native-certs",
+ "x509-parser",
+]
 
 [[package]]
 name = "time-macros"
