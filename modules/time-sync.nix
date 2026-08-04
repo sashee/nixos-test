@@ -45,10 +45,13 @@
 #     works and nobody can reach the box. Skipping the exchange on a healthy clock would trade
 #     that away for nothing: the run is cheap and the discovery is the point.
 #   * It still steps the clock only when it has to. It stands down when the clock, however
-#     wrong, already sits inside the validity of every certificate it just checked: TLS works
-#     at that point, which is the only thing this program exists to arrange, and stepping would
-#     replace an error chrony is about to correct precisely with a whole-second approximation
-#     of the same instant. On a host chrony has disciplined, that rule always fires.
+#     wrong, already sits inside the validity of every certificate it just checked -- checked,
+#     not merely sent, since a peer's chain file may carry a superseded cross-sign that TLS
+#     never uses and that would otherwise narrow the window past the present and step a correct
+#     clock hourly (spec/features/system/time-correction-details.md). TLS works at that point,
+#     which is the only thing this program exists to arrange, and stepping would replace an
+#     error chrony is about to correct precisely with a whole-second approximation of the same
+#     instant. On a host chrony has disciplined, that rule always fires.
 #
 # That leans on chrony being able to step a large error, which it can because nixpkgs defaults
 # `services.chrony.makestep` to `0.1 3` -- the first three updates step, with no size limit. A

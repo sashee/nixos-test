@@ -312,8 +312,15 @@ It still steps the clock only when it has to. It stands down when the current
 clock, however wrong, already falls inside the validity of every certificate it
 just checked: TLS works at that point, which is the only thing this program exists
 to arrange, and chrony will make the accurate correction itself rather than have a
-whole-second approximation imposed on it first. On a host chrony has disciplined
-that rule always fires, which is what makes the unconditional exchange free. It
+whole-second approximation imposed on it first. *Checked*, not merely received —
+a peer sends whatever is in its chain file and TLS uses only the certificates on
+the path it builds, so a superseded cross-sign left behind must get no vote on
+whether this clock is good enough. Letting it vote would narrow the window past
+the present and step a *correct* clock on every run, on every host at once, with
+nothing local to blame; `spec/features/system/time-correction-details.md` states
+the rule and `verify::verified_window` is what enforces it. On a host chrony has
+disciplined the stand-down rule always fires, which is what makes the
+unconditional exchange free. It
 leans on chrony being able to step a large error, which it can, because nixpkgs
 defaults `services.chrony.makestep` to `0.1 3` — the first three updates step, with
 no size limit.

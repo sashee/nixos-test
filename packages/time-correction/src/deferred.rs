@@ -33,7 +33,7 @@ pub struct Deferred {
 }
 
 /// A timestamp that has been checked against every chain gathered on the way to it, plus the
-/// span over which those chains are simultaneously valid.
+/// span over which the certificates that check USED are simultaneously valid.
 ///
 /// The fields are private and the only constructor is `Deferred::accept`, so this type existing
 /// is itself the evidence that pass 2 ran. The window rides along for the same reason the
@@ -50,11 +50,16 @@ impl Verified {
         self.seconds
     }
 
-    /// When every chain behind this timestamp is valid at once.
+    /// When the certificates behind this timestamp are all valid at once.
     ///
-    /// `None` if the chains have no common instant. `verify_at` would already have rejected such
-    /// a set at the timestamp itself, so this should be unreachable; callers must nonetheless
-    /// treat it as "no window is known" rather than "any time is fine".
+    /// Restricted to the ones pass 2 checked; a certificate a peer sent and the path did not use
+    /// is not one of them. See `verify::verified_window` for why, and why erring narrow is safe
+    /// while erring wide is not.
+    ///
+    /// `None` means no window could be established -- in practice, a certificate whose validity
+    /// could not be parsed at all. Reachable, not merely defensive, and callers must treat it as
+    /// "no window is known" rather than "any time is fine": not knowing whether the clock is good
+    /// enough is not the same as knowing that it is, so the caller steps.
     pub fn window(&self) -> Option<(i64, i64)> {
         self.window
     }
@@ -88,7 +93,14 @@ impl Deferred {
         }
 
         // The window is collected in the same pass, from the same chains, so the two cannot
-        // describe different sets of certificates.
+        // describe different sets of certificates -- and, per
+        // spec/features/system/time-correction-details.md, from the same certificates: only those
+        // pass 2 actually checked may decide whether this clock is good enough. `verified_window`
+        // is handed the instant this leg just verified at and drops the certificates that instant
+        // proves were not on the path. Skipping that filter is the footgun the spec names: a
+        // provider that leaves a superseded cross-sign in its chain file would otherwise narrow
+        // the window past the present and this service would step a correct clock, hourly, on
+        // every host at once.
         //
         // A single chain of unknown window makes the whole window unknown, rather than merely
         // dropping out of the intersection. That distinction is load-bearing: `intersect` over an
@@ -107,9 +119,10 @@ impl Deferred {
                 .chain
                 .split_first()
                 .ok_or_else(|| format!("{}: an empty chain was recorded", pending.leg))?;
-            match crate::verify::chain_window(leaf, intermediates)
-                .map_err(|e| format!("{}: {e}", pending.leg))?
-            {
+            match crate::verify::verified_window(
+                &crate::verify::chain_windows(leaf, intermediates),
+                seconds,
+            ) {
                 Some(window) => windows.push(window),
                 None => window_known = false,
             }

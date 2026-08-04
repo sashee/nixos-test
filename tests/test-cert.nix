@@ -18,6 +18,18 @@
 # instead would put it outside its own certificate and it would fail for the wrong reason.
 # Only the leaf is parameterised -- webpki does not check a trust anchor's dates, and the CA
 # being long-lived is what keeps the failure attributable to the leaf.
+#
+# `chainWith` appends further certificates to `certFile`, after the leaf: certificates the server
+# SENDS and that no path through it uses. Real servers do this -- a superseded cross-sign left in
+# the chain file is the usual way -- and a client that judged dates by what was sent rather than by
+# what it verified would be misled by one. See spec/features/system/time-correction-details.md;
+# tests/time-correction.nix is the caller. Order matters and the leaf stays first, because both
+# consumers of `certFile` take the leaf from the front and the rest as candidate issuers
+# (OpenSSL's SSL_CTX_use_certificate_chain_file, which is what Python's ssl.load_cert_chain calls,
+# and chrony's ntsservercert).
+#
+#   pad = mkCert { name = "pad"; sans = [ "unused.invalid" ]; notBefore = ...; notAfter = ...; };
+#   mkCert { name = "good"; sans = [ "x" ]; chainWith = [ pad.certFile ]; }
 { pkgs }:
 
 {
@@ -25,6 +37,7 @@
   sans,
   notBefore ? null,
   notAfter ? null,
+  chainWith ? [ ],
 }:
 
 let
@@ -79,10 +92,15 @@ let
     openssl req -newkey rsa:2048 -nodes -keyout $out/leaf-key.pem -out leaf.csr -config leaf.cnf -sha256
     openssl x509 -req -in leaf.csr -CA $out/ca.pem -CAkey $out/ca-key.pem -CAcreateserial \
       -out $out/leaf.pem ${validityArgs} -extensions v3_req -extfile leaf.cnf -sha256
+    ${lib.optionalString (chainWith != [ ]) ''
+      cat $out/leaf.pem ${lib.escapeShellArgs chainWith} > $out/chain.pem
+    ''}
   '';
 in
 {
   caFile = "${certs}/ca.pem";
-  certFile = "${certs}/leaf.pem";
+  # The leaf alone when nothing was appended, so an unparameterised call keeps serving exactly the
+  # bytes it always did rather than a one-certificate "chain" file that merely happens to be equal.
+  certFile = if chainWith == [ ] then "${certs}/leaf.pem" else "${certs}/chain.pem";
   keyFile = "${certs}/leaf-key.pem";
 }

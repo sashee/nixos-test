@@ -20,6 +20,13 @@
 # inside -- so any subtest that means to watch the clock being SET has to put it outside first,
 # or it passes while time-correction does nothing.
 #
+# Both interceptors also SEND a certificate that no path through them uses (padSuperseded and
+# padExpired below), because "the certificates the answer was verified with" and "the certificates
+# the peer sent" are different sets and only the first may decide anything -- the rule
+# spec/features/system/time-correction-details.md states. That is not one subtest: every DoH
+# handshake in this run carries one, so a client that went back to judging dates by what arrived
+# would fail here broadly rather than in one place.
+#
 # Why so much of this drives the CLI wrapper rather than the unit: the unit samples operators at
 # random, and a test that must hold a specific pair cannot be built on a random draw. `--only`
 # pins the choice while every other flag stays exactly what the unit uses. The unit itself is
@@ -166,12 +173,64 @@ let
         return nodata(query)
   '';
 
+  # Certificates the interceptors SEND and that no path through them uses -- the shape a provider
+  # leaves behind when a superseded cross-sign stays in its chain file, and which
+  # spec/features/system/time-correction-details.md names as the footgun. Each has its own CA,
+  # trusted by nobody, so neither can ever be part of a path: they exist purely to be sent.
+  #
+  # Both windows exclude the present, which is what makes them discriminating, and the two shapes
+  # are deliberately different because they break a client in two different ways:
+  #
+  #   padSuperseded, which OVERLAPS the leaf it rides with (2020-2060 & 2020-2022). A client that
+  #     intersected what was sent would report a window ending in 2022, find the present outside it,
+  #     and step a clock that is already correct -- hourly, on every host, with nothing local to
+  #     blame. It goes on dohgood, so every DoH handshake in this run carries one.
+  #   padExpired, which is DISJOINT from its leaf (2020-2021 & 2010-2011). The intersection of what
+  #     was sent is then empty, and a client that needed a non-empty one to pick a pass-1 instant
+  #     refuses the handshake outright -- failing the run, and with it any chance of recovering a
+  #     host whose clock is wrong. It goes on dohstale, whose subtest asserts the failure it is
+  #     supposed to have (an expired LEAF, caught by pass 2) and would report the wrong one.
+  padSuperseded = import ./test-cert.nix { inherit pkgs; } {
+    name = "pad-superseded";
+    sans = [ "superseded.invalid" ];
+    notBefore = "20200101000000Z";
+    notAfter = "20220101000000Z";
+  };
+
+  padExpired = import ./test-cert.nix { inherit pkgs; } {
+    name = "pad-expired";
+    sans = [ "expired.invalid" ];
+    notBefore = "20100101000000Z";
+    notAfter = "20110101000000Z";
+  };
+
+  # How many certificates a TLS peer actually SENDS, which is the only thing that makes the
+  # off-path fixtures above more than decoration: if a server quietly dropped the extra
+  # certificate, the subtest that depends on it would pass while testing nothing at all.
+  #
+  # `get_unverified_chain` rather than parsing `openssl s_client -showcerts`, whose output prints
+  # the leaf twice -- once in the chain listing and once under "Server certificate" -- so counting
+  # PEM blocks there answers 3 for a chain of 2. This asks the TLS stack what arrived. Unverified
+  # deliberately: the question is what was sent, so the answer must not depend on the trust store.
+  peerChainCount = pkgs.writeShellScript "peer-chain-count" ''
+    exec ${pkgs.python3}/bin/python3 -c '
+    import socket, ssl, sys
+    context = ssl._create_unverified_context()
+    with context.wrap_socket(
+        socket.create_connection((sys.argv[1], 443), timeout=10),
+        server_hostname=sys.argv[2],
+    ) as tls:
+        print(len(tls.get_unverified_chain()))
+    ' "$@"
+  '';
+
   dohGood = import ./doh-interceptor.nix {
     inherit pkgs dohStamps respond;
     name = "time-correction-doh";
     readyFile = "/tmp/fake-doh-ready";
     certNotBefore = dohNotBefore;
     certNotAfter = dohNotAfter;
+    certChainWith = [ padSuperseded.certFile ];
   };
 
   dohStale = import ./doh-interceptor.nix {
@@ -180,6 +239,7 @@ let
     readyFile = "/tmp/fake-doh-ready";
     certNotBefore = "20200101000000Z";
     certNotAfter = "20210101000000Z";
+    certChainWith = [ padExpired.certFile ];
   };
 in
 
@@ -317,6 +377,7 @@ nixpkgs.lib.nixos.runTest {
   testScript = ''
     doh_ipv4 = ${builtins.toJSON dohGood.dohIpv4}
     doh_ipv6 = ${builtins.toJSON dohGood.dohIpv6}
+    doh_domains = ${builtins.toJSON dohGood.dohDomains}
     FLOOR = ${toString floor}
     # The instants at which BOTH good certificates are valid; see the fixtures above.
     BOTH_FROM = ${toString bothFrom}
@@ -520,10 +581,22 @@ nixpkgs.lib.nixos.runTest {
         # The other leg, and it must fail even though the NTS server is beyond reproach: the
         # resolver that produced the address is part of what vouches for the answer, so its
         # certificate has to hold at the same instant.
+        #
+        # dohstale also sends padExpired, whose window is DISJOINT from its leaf's -- so the
+        # certificates it sends have no common instant at all. That must not change which failure
+        # this is: pass 1 has to get far enough to accept the chain, on an instant it takes from the
+        # LEAF rather than from an intersection there is none of, and pass 2 has to reject it for the
+        # leaf's own expiry. Asserting the message rather than merely `fail` is what distinguishes
+        # the two: a client that refused the handshake over the off-path certificate would fail this
+        # subtest's command just as reliably, and for a reason that would leave a wrong clock
+        # unrecoverable.
         use_resolver(dohstale)
         output = dry_run("--only cloudflare", expect_success=False)
         assert "not valid at the time the server reported" in output, output
         assert "DoH" in output, f"the failing leg should be named: {output}"
+        assert "no instant" not in output, (
+            f"pass 1 judged the certificates the peer sent rather than the path: {output}"
+        )
         use_resolver(dohgood)
 
     with subtest("a time below the floor is refused, before any chain is re-verified"):
@@ -612,6 +685,35 @@ nixpkgs.lib.nixos.runTest {
         # Still in 2030, i.e. not stepped back to what the NTS server serves. The lower bound is
         # IN_2030 itself, which is why stand_down_or_set places it as UTC -- see there.
         assert IN_2030_EPOCH <= clock() < 1900000000, f"the clock moved to {clock()}"
+
+    with subtest("a certificate the peer sends but the path does not use gets no vote"):
+        # The footgun in spec/features/system/time-correction-details.md, on the clock where it does
+        # damage: a CORRECT one. dohgood sends padSuperseded beside its leaf -- expired in 2022,
+        # chaining to a CA nobody trusts, so no path can include it -- and the window this run
+        # reports has to be the two LEAVES' intersection, with the present comfortably inside.
+        #
+        # Judge by what arrived instead and the window ends in 2022, `now` is past it, and the run
+        # steps a clock that was already right. Hourly, on every host at once, triggered by a
+        # provider's chain file rather than by anything on the box. That is the whole reason the
+        # window comes from `verified_window` rather than from the chain as sent.
+        #
+        # Non-vacuous in both directions, which matters more here than usual because the fixture is
+        # only a fixture if the extra certificate really goes out on the wire: the peer is asked
+        # what it sends, and the reported window is pinned exactly rather than merely "inside".
+        sent = int(machine.succeed(
+            f"${peerChainCount} {doh_ipv4[0]} {doh_domains[0]}"
+        ).strip())
+        assert sent == 2, f"dohgood sent {sent} certificates, not its leaf plus the off-path one"
+
+        # The clock the NTS server itself keeps, i.e. right. Not IN_2030: the subtest above already
+        # covers standing down on a clock that is merely inside the windows, and what is under test
+        # here is that a healthy clock is left alone despite what the peer sent.
+        machine.succeed(f"date -s @{int(ntsgood.succeed('date +%s').strip())}")
+        healthy = clock()
+        output = machine.succeed("time-correction --only cloudflare 2>&1")
+        assert "already inside the certificates' validity" in output, output
+        assert f"({BOTH_FROM}..{BOTH_UNTIL})" in output, output
+        assert abs(clock() - healthy) < 120, f"a correct clock was stepped to {clock()}"
 
     with subtest("a clock outside the certificates' validity is set"):
         # The converse, so the subtest above cannot pass by time-correction having simply stopped
