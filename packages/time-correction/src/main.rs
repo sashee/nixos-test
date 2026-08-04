@@ -322,19 +322,28 @@ fn needs_setting(now: i64, window: Option<(i64, i64)>) -> bool {
     }
 }
 
-/// The current wall clock, which is the thing under judgement rather than a source of truth.
-fn wall_clock() -> Result<i64, String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
+/// An instant as signed Unix seconds.
+///
+/// Split from `wall_clock` so the branch below the epoch can be reached by a fixture. That is not
+/// a formality: `duration_since` returns an ERROR for an instant before `UNIX_EPOCH`, so the
+/// obvious spelling of this function rejects exactly the clock this program exists to fix, and
+/// the recovery has a sign flip in it. Nothing else here inverts a number, and no integration
+/// test can reach it -- a VM cannot be booted before 1970.
+fn epoch_seconds(instant: std::time::SystemTime) -> Result<i64, String> {
+    use std::time::UNIX_EPOCH;
 
-    // Signed, and `duration_since` is not enough on its own: a clock before 1970 is exactly the
-    // state this program exists for, and it must produce a negative number rather than an error.
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
+    match instant.duration_since(UNIX_EPOCH) {
         Ok(since) => i64::try_from(since.as_secs())
             .map_err(|_| "the clock is further ahead than a signed epoch can hold".to_string()),
         Err(before) => i64::try_from(before.duration().as_secs())
             .map(|seconds| -seconds)
             .map_err(|_| "the clock is further behind than a signed epoch can hold".to_string()),
     }
+}
+
+/// The current wall clock, which is the thing under judgement rather than a source of truth.
+fn wall_clock() -> Result<i64, String> {
+    epoch_seconds(std::time::SystemTime::now())
 }
 
 fn set_clock(seconds: i64) -> Result<(), String> {
@@ -987,6 +996,35 @@ mod tests {
         // The state this program is written for: an RTC-less host whose provider is being
         // impersonated with a certificate that expired before the build.
         assert!(refuse_below_floor(0, FLOOR).is_err());
+    }
+
+    #[test]
+    fn a_clock_before_the_epoch_reads_as_a_negative_number() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // `duration_since` fails rather than going negative, so this is the one place in the
+        // program where a value is recovered from an error and its sign flipped by hand. Get
+        // that wrong and a host sitting before 1970 reports a large POSITIVE time -- which
+        // `needs_setting` would then find comfortably inside a certificate window, and the run
+        // would stand down on precisely the clock it exists to repair.
+        assert_eq!(epoch_seconds(UNIX_EPOCH), Ok(0));
+        assert_eq!(
+            epoch_seconds(UNIX_EPOCH + Duration::from_secs(1_785_000_000)),
+            Ok(1_785_000_000)
+        );
+        assert_eq!(
+            epoch_seconds(UNIX_EPOCH - Duration::from_secs(1_000_000_000)),
+            Ok(-1_000_000_000)
+        );
+
+        // And the consequence, spelled out rather than left to the reader: a pre-epoch clock is
+        // below any real certificate's notBefore, so it must be stepped.
+        let before_epoch = epoch_seconds(UNIX_EPOCH - Duration::from_secs(86_400)).unwrap();
+        assert!(before_epoch < 0);
+        assert!(needs_setting(
+            before_epoch,
+            Some((1_785_000_000, 1_800_000_000))
+        ));
     }
 
     #[test]

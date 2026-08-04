@@ -28,14 +28,31 @@
 #
 # Not covered here: operators disagreeing, one operator failing to outvote itself, and the
 # tolerance boundary. Those are decisions taken by `quorum::decide`, which is pure and has
-# fixtures for each; reproducing them with real servers would need a third and fourth NTS node
-# for no additional confidence.
+# fixtures for each, and reproducing them here would need this node to draw two operators at
+# once -- which `sample = 1` rules out, since one of its NTS fixtures is deliberately expired.
+# tests/nts-sync.nix runs at the deployed `sample = 2` against two valid servers and skews one
+# of them, so the disagreement path is covered end to end there instead.
 
 let
   floor = 1000000000;
 
   goodHost = "time.cloudflare.com";
   staleHost = "nts.netnod.se";
+
+  # The redirect pair. An NTS server may answer key establishment itself and hand timestamping
+  # to a DIFFERENT host, using records marked CRITICAL -- lib/nts-servers.nix records that
+  # nts.netnod.se does exactly this in production, pointing at 194.58.207.80:4123. Nothing in
+  # this suite reproduced it, so `main::ask_pair`'s redirect branch -- a SECOND DoH lookup, the
+  # address-family match against the address key establishment worked over, and a THIRD
+  # certificate chain recorded into `Deferred` -- never ran anywhere.
+  #
+  # Two names for one node: key establishment happens on `redirectKeHost` (which is what its
+  # certificate is issued for) and the redirect names `redirectNtpHost`, which resolves back to
+  # the same chronyd. One daemon, so the cookies it issued are the cookies it accepts and no
+  # NTS key sharing is needed; two names, so following the redirect is observable rather than
+  # indistinguishable from ignoring it.
+  redirectKeHost = "ptbtime1.ptb.de";
+  redirectNtpHost = "ptbtime2.ptb.de";
 
   # Valid now, so the NTS leg's pass 2 succeeds -- and DELIBERATELY not the same window as the
   # good DoH certificate below. The stand-down rule is defined over the validity of *every*
@@ -74,7 +91,20 @@ let
     notAfter = "20210101000000Z";
   };
 
-  mkNtsServer = cert: { ... }: {
+  # Issued for the KEY ESTABLISHMENT name only. The redirect target is reached over plain NTPv4
+  # with no TLS at all -- the AEAD keys exported from this handshake are what authenticate it --
+  # so a certificate naming it would be describing a handshake that never happens. Same window
+  # as ntsCert, since this fixture is about the redirect and not about validity.
+  redirectCert = import ./test-cert.nix { inherit pkgs; } {
+    name = "nts-redirect";
+    sans = [ redirectKeHost ];
+    notBefore = ntsNotBefore;
+    notAfter = ntsNotAfter;
+  };
+
+  # `extra` is appended to chrony.conf, which is how the redirect node advertises a different
+  # timestamping host (`ntsntpserver`). Every other node passes nothing and is unchanged.
+  mkNtsServer = { cert, extra ? "" }: { ... }: {
     virtualisation.memorySize = 512;
     networking.firewall.enable = false;
     services.chrony = {
@@ -86,6 +116,7 @@ let
         ntsserverkey ${cert.keyFile}
         ntsservercert ${cert.certFile}
         ntsprocesses 0
+        ${extra}
       '';
     };
     system.stateVersion = stateVersion;
@@ -96,11 +127,31 @@ let
   # addresses to whichever one a subtest needs.
   # Both families, because time-correction asks for both: querying A alone would resolve an
   # IPv6-only host to an address it has no way to reach.
+  # The redirect's key-establishment name and its timestamping name both resolve to the same
+  # node, which is what lets one chronyd play both halves.
   respond = ''
     def respond(query, meta):
         name, qtype, _, _ = read_question(query)
-        v4 = {"${goodHost}": ARGS[0], "${staleHost}": ARGS[1]}
-        v6 = {"${goodHost}": ARGS[2], "${staleHost}": ARGS[3]}
+        # Every question, appended before it is answered. This is the evidence that the
+        # redirect was FOLLOWED: ${redirectNtpHost} is named by nothing this host is
+        # configured with, so the only way it can be asked for is a client that read the
+        # redirect out of the NTS-KE response and went to resolve it. Without this the
+        # redirect subtest would pass just as well on a client that ignored the record and
+        # kept talking to the key-establishment host, which answers correctly either way.
+        with open("/tmp/queried-names", "a") as log:
+            log.write(name + "\n")
+        v4 = {
+            "${goodHost}": ARGS[0],
+            "${staleHost}": ARGS[1],
+            "${redirectKeHost}": ARGS[4],
+            "${redirectNtpHost}": ARGS[4],
+        }
+        v6 = {
+            "${goodHost}": ARGS[2],
+            "${staleHost}": ARGS[3],
+            "${redirectKeHost}": ARGS[5],
+            "${redirectNtpHost}": ARGS[5],
+        }
         if name not in v4:
             return nxdomain(query)
         if qtype == 1:
@@ -145,6 +196,8 @@ nixpkgs.lib.nixos.runTest {
         nodes.ntsstale.networking.primaryIPAddress
         nodes.ntsgood.networking.primaryIPv6Address
         nodes.ntsstale.networking.primaryIPv6Address
+        nodes.ntsredirect.networking.primaryIPAddress
+        nodes.ntsredirect.networking.primaryIPv6Address
       ];
     };
     system.stateVersion = stateVersion;
@@ -162,19 +215,38 @@ nixpkgs.lib.nixos.runTest {
         nodes.ntsstale.networking.primaryIPAddress
         nodes.ntsgood.networking.primaryIPv6Address
         nodes.ntsstale.networking.primaryIPv6Address
+        nodes.ntsredirect.networking.primaryIPAddress
+        nodes.ntsredirect.networking.primaryIPv6Address
       ];
     };
     system.stateVersion = stateVersion;
   };
 
   nodes.ntsgood = { ... }: {
-    imports = [ (mkNtsServer ntsCert) ];
+    imports = [ (mkNtsServer { cert = ntsCert; }) ];
     networking.hostName = "ntsgood";
   };
 
   nodes.ntsstale = { ... }: {
-    imports = [ (mkNtsServer staleCert) ];
+    imports = [ (mkNtsServer { cert = staleCert; }) ];
     networking.hostName = "ntsstale";
+  };
+
+  # A separate node rather than a redirect bolted onto ntsgood, deliberately: ntsgood is the
+  # server every other subtest here talks to, and putting a redirect in its path would mean a
+  # break in the redirect code failed a dozen unrelated assertions at once instead of the one
+  # that is about it.
+  nodes.ntsredirect = { ... }: {
+    imports = [
+      (mkNtsServer {
+        cert = redirectCert;
+        # Points at its own other name. chronyd puts this in the NTS-KE response as an
+        # NTPv4 Server Negotiation record marked CRITICAL, which is the record a client that
+        # does not understand it is required to abort on.
+        extra = "ntsntpserver ${redirectNtpHost}";
+      })
+    ];
+    networking.hostName = "ntsredirect";
   };
 
   nodes.machine = { lib, ... }: {
@@ -196,8 +268,9 @@ nixpkgs.lib.nixos.runTest {
     # testNodeTimeSyncOff in flake.nix), which here is the thing under test.
     common.timeSync = {
       enable = lib.mkForce true;
-      # Only the two hosts this test impersonates, so no unreachable name adds delay.
-      servers = lib.mkForce [ goodHost staleHost ];
+      # Only the hosts this test impersonates, so no unreachable name adds delay. Three
+      # operators (cloudflare, netnod, ptb), which the `sample = 1` below is well inside.
+      servers = lib.mkForce [ goodHost staleHost redirectKeHost ];
       # mkForce because the host layer supplies the real floor (nixpkgs.lastModified). A 2026
       # floor would reject the deliberately-stale fixtures for the wrong reason.
       floor = lib.mkForce floor;
@@ -221,6 +294,7 @@ nixpkgs.lib.nixos.runTest {
       dohStale.caFile
       ntsCert.caFile
       staleCert.caFile
+      redirectCert.caFile
     ];
 
     system.stateVersion = stateVersion;
@@ -244,6 +318,7 @@ nixpkgs.lib.nixos.runTest {
         )
     ntsgood.wait_for_unit("chronyd.service")
     ntsstale.wait_for_unit("chronyd.service")
+    ntsredirect.wait_for_unit("chronyd.service")
     machine.wait_for_unit("multi-user.target")
 
     def peer_ip(node):
@@ -448,6 +523,43 @@ nixpkgs.lib.nixos.runTest {
         # chains were checked against a timestamp already refused.
         assert "not valid at the time the server reported" not in output, output
 
+    with subtest("an NTS server that redirects timestamping to another host is followed"):
+        # `nts.netnod.se` answers key establishment itself and hands timestamping to a different
+        # host, marking the records CRITICAL -- lib/nts-servers.nix records the measurement. So
+        # this branch runs against a real deployed provider on every draw that picks netnod, and
+        # until now nothing exercised it: `nts::parse_response` and `timeserver::ntp_target` have
+        # fixtures for the records and the target arithmetic, but the part in `main::ask_pair`
+        # that acts on them -- a SECOND DoH lookup for the redirect's name, the address-family
+        # match against the address key establishment worked over, and a THIRD chain recorded
+        # into `Deferred` so pass 2 covers it too -- had no test at all.
+        #
+        # ntsredirect establishes keys as ${redirectKeHost} and redirects to ${redirectNtpHost},
+        # which resolves back to itself. One daemon, so its own cookies authenticate the reply.
+        dohgood.succeed("truncate -s 0 /tmp/queried-names")
+        output = dry_run("--only ptb1", expect_success=True)
+        assert "would set the clock to" in output, output
+
+        # The evidence, and the reason the redirect target has a different name from the key
+        # establishment host: nothing on this machine is configured with ${redirectNtpHost}, so
+        # the only thing that can have asked for it is a client that read the redirect record
+        # and went to resolve it. A client that ignored the record would have kept talking to
+        # ${redirectKeHost}, which answers correctly, and every other assertion here would still
+        # hold.
+        queried = dohgood.succeed("cat /tmp/queried-names").split()
+        assert "${redirectKeHost}" in queried, queried
+        assert "${redirectNtpHost}" in queried, (
+            f"the redirect was not followed; names resolved this run: {queried}"
+        )
+
+        # What this does NOT isolate, said plainly so nobody adds an assertion believing it
+        # does: the redirect lookup records a THIRD chain into `Deferred`, and pointing this run
+        # at the stale resolver would indeed fail it -- but on the first lookup, before the
+        # redirect is even read, so it would prove nothing the DoH subtest above has not already
+        # proved. Isolating the third chain needs a resolver that is good for one query and
+        # stale for the next, which is a fixture this test has no other use for. The recording
+        # itself is not conditional (`doh::resolve` records on every success), so what is left
+        # untested is a line that cannot be skipped for the redirect alone.
+
     with subtest("one failing provider fails the whole run"):
         # Spec: "any error fails the service run". With --sample forced to 1 this node normally
         # asks one pair, so ask for two and let the deliberately-stale one be the second: the run
@@ -554,6 +666,30 @@ nixpkgs.lib.nixos.runTest {
             "time-correction --force --dry-run --only cloudflare", timeout=120
         )
         machine.succeed(f"${pkgs.iproute2}/bin/ip route del unreachable {ntsgood_v4}/32")
+
+    with subtest("the wrapper on PATH asks exactly what the timed unit asks"):
+        # Everything above this line drives `time-correction ...` -- the wrapper
+        # modules/time-sync.nix installs, preloaded with the unit's own flags -- rather than the
+        # unit. So does `time-correction --force --dry-run` in the README and in
+        # lib/nts-servers.nix, which is the documented way to check a live Pi's providers still
+        # answer. All of that rests on the two carrying identical arguments, and nothing checked
+        # it: the wrapper and the unit interpolate `correctionArgs` at two separate call sites,
+        # so a flag added to one and not the other would leave every test here passing while the
+        # command an operator actually runs asked something else.
+        #
+        # tests/time-sync-deployed.nix pins what those arguments ARE on the deployed hosts. This
+        # pins that there is only one set of them, which is a claim about the module rather than
+        # about any host -- so this node's forced `servers`/`sample`/`floor` do not weaken it.
+        unit_exec = machine.succeed(
+            "systemctl cat time-correction.service | grep -m1 '^ExecStart='"
+        ).strip()[len("ExecStart="):]
+        wrapper = machine.succeed("cat $(command -v time-correction)")
+        execs = [l.strip() for l in wrapper.splitlines() if l.strip().startswith("exec ")]
+        assert len(execs) == 1, f"the wrapper does not exec exactly once:\n{wrapper}"
+        # `"$@"` is the wrapper's whole reason to exist -- it is what lets --only and --dry-run
+        # be appended by hand -- so it is part of the expected string rather than stripped out.
+        expected = f'exec {unit_exec} "$@"'
+        assert execs[0] == expected, f"wrapper:\n  {execs[0]}\nunit:\n  {expected}"
 
     with subtest("the unit keeps exactly the privilege it needs"):
         def unit_property(name):
