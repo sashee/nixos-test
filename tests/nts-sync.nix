@@ -1,6 +1,5 @@
-# Back to 1200 now that the unwedge node is gone (it added two 120s countdowns plus a real
-# reboot). The ceiling should stay above the sum of the waits inside the test so a slow run fails
-# on the subtest that was slow rather than on the global deadline.
+# The ceiling should stay above the sum of the waits inside the test, so a slow run fails on the
+# subtest that was slow rather than on the global deadline.
 { nixpkgs, pkgs, stateVersion, machineModule, dohStamps, globalTimeout ? 1200 }:
 
 # The whole time chain, on the real host config: correction service -> DNS -> chrony over NTS.
@@ -40,9 +39,10 @@
 # chronyd reaches its sources by hostname through the system resolver, and nothing in
 # modules/time-sync.nix says anything about address families, so the remaining gap is upstream
 # chrony's socket handling rather than this repo's configuration of it. Closing it would cost a
-# fifth VM in what is already the slowest check in the suite (four VMs, a real reboot and several
-# chrony synchronisations, 2400s of headroom on the TCG aarch64 runner). If the v6 path ever does
-# break, it breaks in chrony and this is the note that says where to start.
+# fifth VM in one of the slowest checks in the suite (four VMs, a real reboot and several chrony
+# synchronisations, 2400s of headroom on the TCG aarch64 runner -- tests/time-correction.nix runs
+# six). If the v6 path ever does break, it breaks in chrony and this is the note that says where
+# to start.
 
 let
   lib = nixpkgs.lib;
@@ -170,6 +170,13 @@ nixpkgs.lib.nixos.runTest {
     # middle of a subtest. Same reasoning and remedy as tests/restic.nix.
     nix.gc.automatic = lib.mkForce false;
 
+    # And fstrim.timer for the same reason: `OnCalendar=weekly` and on by default, so every
+    # forward jump crosses a weekly boundary and fires it again until back-to-back starts trip
+    # systemd's start limit and leave the unit failed. Not observed failing here -- it was
+    # tests/time-correction.nix that caught it -- but this test jumps the clock the same way, so
+    # it is latent rather than absent.
+    services.fstrim.enable = lib.mkForce false;
+
     # mkForce: the shared test-node layer switches time sync off on every node (see
     # testNodeTimeSyncOff in flake.nix), and here it is the thing under test.
     common.timeSync = {
@@ -237,20 +244,20 @@ nixpkgs.lib.nixos.runTest {
     machine.wait_for_unit("multi-user.target")
 
     with subtest("no reboot failsafe is installed"):
-        # The spec dropped it, so this is the guard against it coming back: several subtests
-        # below leave this host deliberately unsynchronised for a minute or more at a stretch,
-        # and a unit whose job was to reboot an unsynchronised host would fire in the middle of
-        # them -- taking the machine down for a reason the failing subtest would not name.
-        machine.fail("systemctl cat time-sync-unwedge.service")
-
-        # The check above is a cheap canary and nothing more: it only catches the failsafe coming
-        # back under the name it had. What follows is the name-agnostic half. A unit that reboots
-        # an unsynchronised host has to find out that the host is unsynchronised, and the only two
-        # things here that know are the correction service and the marker chrony-wait writes -- so
-        # anything ordered off either of them is the shape being guarded against, whatever it is
-        # called. Not asserted by enumerating units that invoke `reboot`: connectivity-watchdog
-        # and connectivity-fallback legitimately do, and an allowlist of those would make this
-        # subtest fail whenever an unrelated module gained a reboot.
+        # The spec asks for no reboot failsafe, and this is the guard against one appearing:
+        # several subtests below leave this host deliberately unsynchronised for a minute or more
+        # at a stretch, and a unit whose job was to reboot an unsynchronised host would fire in
+        # the middle of them -- taking the machine down for a reason the failing subtest would not
+        # name.
+        #
+        # Asserted name-agnostically, since a guard against one particular unit name is a guard
+        # against nothing. A unit that reboots an unsynchronised host has to find out that the
+        # host is unsynchronised, and the only two things here that know are the correction
+        # service and the marker chrony-wait writes -- so anything ordered off either of them is
+        # the shape being guarded against, whatever it is called. Not asserted by enumerating
+        # units that invoke `reboot`: connectivity-watchdog and connectivity-fallback legitimately
+        # do, and an allowlist of those would make this subtest fail whenever an unrelated module
+        # gained a reboot.
         def pullers(unit, prop):
             # One property per call with --value: `systemctl show -p NAME` omits properties whose
             # value is empty unless --all is passed, so asking for several at once and matching on
@@ -339,24 +346,11 @@ nixpkgs.lib.nixos.runTest {
         # host to sit at a chosen time cannot leave it running.
         #
         # NOT because the step would kill it: chronyd logs "Backward time jump detected!" and
-        # carries on (same MainPID either side, asserted in the subtest below). The comment here
-        # used to claim it exits, which would have made the whole retry loop unsafe.
+        # carries on, same MainPID either side, which the "a clock step under a running chronyd"
+        # subtest asserts. Believing otherwise would make the retry loops below unsafe.
         machine.succeed("systemctl stop chronyd.service || true")
         machine.succeed(f"date -s '{when}'")
         align_rtc()
-
-    def start_collector():
-        # Returns systemd's own verdict on the unit's conditions. A condition that is not met
-        # makes `systemctl start` a satisfied no-op rather than an error, so the exit status
-        # says nothing -- ConditionResult is the observable.
-        #
-        # reset-failed first because a oneshot started back to back trips the start rate limit
-        # and would fail with "start-limit-hit" instead of running (tests/system-metrics.nix:86).
-        machine.succeed("systemctl reset-failed system-metrics.service || true")
-        machine.succeed("systemctl start system-metrics.service")
-        return machine.succeed(
-            "systemctl show -p ConditionResult --value system-metrics.service"
-        ).strip()
 
     def resync():
         # Drop everything chrony knows and make it start over, so a subtest cannot pass on a
@@ -374,21 +368,19 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed("systemctl restart chronyd.service")
         machine.succeed("systemctl start --no-block chrony-wait.service")
 
-    with subtest("the collector is gated on chrony's marker, not timesyncd's"):
-        # This wiring is why the RTC-less Pi does not write 1970-dated rows into a store that
-        # has no retention, and until now nothing asserted it. tests/system-metrics.nix covers
-        # the timesyncd marker, which no host uses any more -- enabling chrony forces timesyncd
-        # off -- so the deployed gate was evaluated by these tests and checked by none of them.
-        machine.succeed(
-            f"systemctl cat system-metrics.service | grep -Fx 'ConditionPathExists={MARKER}'"
-        )
-
-        # Nothing has synchronised yet, so the collector must hold back even though the clock
-        # is perfectly capable of producing a timestamp -- that is exactly the trap, since the
-        # timestamp it would produce is wrong and permanent.
+    with subtest("nothing has synchronised yet"):
+        # The precondition the whole run rests on: this host comes up with no reachable time
+        # source, so the marker chrony-wait writes must be absent until something fixes the clock.
+        #
+        # What the marker is FOR is deliberately not asserted here, and the split is what keeps
+        # this test host-agnostic. That the metrics collector's ConditionPathExists is this marker
+        # is a claim about rendered units, made for every deployed host by
+        # tests/time-sync-deployed.nix; that systemd actually holds a unit back on such a
+        # condition and releases it is covered against a real time source by
+        # tests/system-metrics.nix. Neither needs this host -- which matters because
+        # anya-feher-laptop deploys time sync and no collector at all, so a collector assertion
+        # here would be an assertion about a feature that host does not have.
         machine.fail(f"test -e {MARKER}")
-        condition = start_collector()
-        assert condition == "no", f"the collector ran before the clock was synchronised ({condition})"
 
     with subtest("with the clock years out, nothing resolves"):
         # The deadlock the correction service exists to break, demonstrated rather than assumed.
@@ -479,28 +471,15 @@ nixpkgs.lib.nixos.runTest {
             assert own[0].startswith("server "), f"{host} became a pool: {own[0]}"
             assert own[0].split()[-1] == "nts", f"{host} is not authenticated: {own[0]}"
 
-    with subtest("the collector is released once chrony has synchronised"):
-        # The other half of the gate. Asserting only the closed side would pass just as well
-        # with a marker path that can never appear, which would silently stop collection
-        # forever -- the failure modules/system-metrics.nix warns about in both directions.
-        condition = start_collector()
-        assert condition == "yes", f"the collector is still gated after synchronisation ({condition})"
-        machine.log(
-            "collector run result: "
-            + machine.succeed("systemctl show -p Result --value system-metrics.service")
-        )
-
     with subtest("a clock already inside certificate validity is left alone"):
-        # The one stand-down rule the spec leaves, on the node where the clock is genuinely
-        # right. There used to be a second one -- ask the kernel via adjtimex whether anything
-        # had already synchronised the clock -- and it is gone, along with the subtest that
-        # covered it and the one that staged the mid-exchange race it guarded. What replaces
-        # both is this: a synchronised clock is inside the validity of every certificate on the
-        # path by construction, so the window rule alone still refuses to step it.
+        # The program's only stand-down rule, on the node where the clock is genuinely right. It
+        # needs no help from the kernel's STA_UNSYNC: a synchronised clock is inside the validity
+        # of every certificate on the path by construction, so the certificate window alone
+        # refuses to step it.
         #
-        # The difference is that the exchange now actually happens, which is the point of the
-        # change: the run is evidence that DoH and NTS still work, not merely a repair that
-        # skips itself when the clock looks fine.
+        # And the exchange happens anyway, which is the half worth asserting -- the run is
+        # evidence that DoH and NTS still work, not merely a repair that skips itself when the
+        # clock looks fine.
         machine.succeed(f"test -e {MARKER}")
         output = machine.succeed("time-correction --dry-run 2>&1")
         assert "already inside the certificates' validity" in output, output
@@ -613,10 +592,10 @@ nixpkgs.lib.nixos.runTest {
         #
         # What has to be beaten is the RTC, not the system clock: chronyd only falls through to the
         # driftfile path when the RTC reads EARLIER than the mtime, logging "RTC time before last
-        # driftfile modification (ignored)" on the way. Two earlier versions of this subtest got
-        # that staging wrong and silently tested nothing -- chronyd found nothing to do, logged
-        # nothing, and the clock the kernel had already read from the RTC in the initrd looked
-        # plausible -- so the margin below is deliberate and so is the assertion under it.
+        # driftfile modification (ignored)" on the way. Mis-stage that and this subtest tests
+        # nothing while looking like it passed -- chronyd finds nothing to do, logs nothing, and
+        # the clock the kernel already read from the RTC in the initrd looks plausible. Hence both
+        # the deliberate margin below and the assertion under it.
         #
         # Three days, and it cannot be read off the RTC instead. `machine.start()` is a FRESH qemu
         # process with `-rtc base=$(date -u -d tomorrow +...T10:00:00)` (lib/test-rtc-base.nix), so

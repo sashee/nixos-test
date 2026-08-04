@@ -1,8 +1,8 @@
 # Eval-only guard on what the DEPLOYED hosts actually tell systemd to do about time.
 #
-# Two claims, both read off the rendered units of the real host configs, and both invisible to
-# every VM test -- because both VM tests have to override exactly these values to be testable
-# at all:
+# Three claims, all read off the rendered units of the real host configs. The first two are
+# invisible to every VM test, because both VM tests have to override exactly these values to be
+# testable at all:
 #
 #   * the cadence, "a separate service runs every hour and after boot". tests/time-correction.nix
 #     overrides `interval` to 3h and asserts 3h, because a second timed run landing mid-test
@@ -12,11 +12,16 @@
 #     to two hosts, `sample` to 1 and `floor` to a fixture; tests/nts-sync.nix forces `servers`
 #     and `floor`. So no test has ever seen a host ask the four real NTS servers through the
 #     four real DoH resolvers with the build-time floor.
+#   * the METRICS CLOCK GATE -- that system-metrics.service is conditioned on chrony's marker
+#     rather than on the one systemd-timesyncd writes and chrony never will. Invisible to the VM
+#     tests for a different reason: it is per-host. Only rpi5 deploys the collector, and until this
+#     check the only place the wiring was exercised was the generic x86 desktop test node, which is
+#     not a host anyone deploys. See gateDrift below.
 #
-# A drift in either is silent in the worst way: the unit stays green, the timer stays armed, and
-# the only symptom is that the hourly run which is supposed to catch a dead provider *while the
-# host is still reachable* now happens daily -- or that the quorum is drawn from a smaller pool
-# than the configuration appears to describe.
+# A drift in either of the first two is silent in the worst way: the unit stays green, the timer
+# stays armed, and the only symptom is that the hourly run which is supposed to catch a dead
+# provider *while the host is still reachable* now happens daily -- or that the quorum is drawn
+# from a smaller pool than the configuration appears to describe.
 #
 # The argument check is what catches the join in modules/time-sync.nix going wrong. `selected`
 # there is `filterAttrs (_: p: elem p.hostname cfg.servers)` over lib/nts-servers.nix, while
@@ -177,7 +182,55 @@ let
             "${host}: --floor ${toString floor} is below ${toString floorLowerBound}, which is not a plausible build-time constant"
       );
 
-  errors = lib.concatMap (host: timerDrift host ++ serviceDrift host) (builtins.attrNames hosts);
+  # --- the metrics clock gate -----------------------------------------------------------
+
+  # That the collector is gated on CHRONY's marker rather than timesyncd's.
+  #
+  # modules/system-metrics.nix defaults `requireClockSync` to `services.timesyncd.enable` and
+  # `syncedMarker` to the path timesyncd writes, and enabling chrony forces timesyncd off -- so
+  # without the `common.systemMetrics` block at the end of modules/time-sync.nix the gate would
+  # switch itself off on precisely the host that needs it, and the RTC-less Pi would go back to
+  # writing 1970-dated rows into a store with no retention. That is a two-line mkDefault whose
+  # failure is silent in both directions: a marker that never appears stops collection forever,
+  # and one that appears too early admits pre-sync timestamps.
+  #
+  # Read off the rendered unit for the same reason as everything above -- the claim is that
+  # systemd was told the path, not that the option holds it. It is a rendered-unit claim and
+  # therefore belongs here rather than in a VM: that systemd actually holds a unit back on an
+  # unmet ConditionPathExists and releases it when the file appears is covered against a real
+  # time source by tests/system-metrics.nix, and does not need repeating per host.
+  gateDrift =
+    host:
+    let
+      cfg = hosts.${host}.config.common;
+      want = "ConditionPathExists=${toString cfg.timeSync.syncedMarker}";
+      text = unitOf host "system-metrics.service";
+      lines = trimmedLines text;
+      conditions = lib.filter (l: lib.hasPrefix "ConditionPathExists=" l) lines;
+    in
+    lib.optionals cfg.systemMetrics.enable (
+      if text == null then
+        [
+          "${host}: common.systemMetrics is enabled but there is no system-metrics.service to gate"
+        ]
+      else if conditions == [ ] then
+        [
+          "${host}: system-metrics.service has no ConditionPathExists at all, so it runs before the clock is known and writes timestamps that cannot be deleted"
+        ]
+      else
+        lib.optional (conditions != [ want ])
+          "${host}: system-metrics.service has ${toString conditions}, expected exactly ${want} -- the gate must follow chrony's marker, since enabling chrony forces timesyncd off and its marker never appears"
+    );
+
+  # Named in the success output rather than passed over in silence: a host that stops deploying
+  # the collector makes `gateDrift` vacuous, and a check that quietly asserts nothing about a
+  # host reads exactly like one that asserted something.
+  gated = lib.filter (h: hosts.${h}.config.common.systemMetrics.enable) (builtins.attrNames hosts);
+  ungated = lib.subtractLists gated (builtins.attrNames hosts);
+
+  errors = lib.concatMap (host: timerDrift host ++ serviceDrift host ++ gateDrift host) (
+    builtins.attrNames hosts
+  );
 in
 if errors != [ ] then
   throw ''
@@ -193,8 +246,18 @@ if errors != [ ] then
     that discovery to the next cold boot, when nothing works and nobody can reach the box; losing
     a provider from the arguments shrinks the pool those two sets are drawn from without changing
     anything a running host would report.
+
+    And the metrics clock gate: modules/system-metrics.nix defaults its marker to the one
+    systemd-timesyncd writes, which enabling chrony forces off, so modules/time-sync.nix has to
+    repoint it or the gate silently disables itself on the host that needs it most.
   ''
 else
   pkgs.runCommand "time-sync-deployed-check" { } ''
     echo "cadence and provider arguments verified on: ${toString (builtins.attrNames hosts)}" > $out
+    echo "metrics clock gate verified on: ${
+      if gated == [ ] then "no host (none deploys the collector)" else toString gated
+    }" >> $out
+    ${lib.optionalString (ungated != [ ]) ''
+      echo "no collector deployed, so no gate to check: ${toString ungated}" >> $out
+    ''}
   ''

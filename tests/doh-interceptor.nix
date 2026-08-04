@@ -167,11 +167,10 @@ let
   #
   #   dohgood # IPv6: eth1: IPv6 duplicate address 2620:fe::10 used by 52:54:00:12:01:02 detected!
   #
-  # The race is per address, so each run left a different random subset of each node's addresses
-  # dead. It hid for a while because time-correction draws its resolver at random and, at the
-  # time, a retry loop rerolled the draw -- so a partial loss looked like slowness; the aarch64
-  # run where dohgood lost all four failed outright. IPv4 has no DAD, which is why only the v6
-  # path ever showed it.
+  # The race is per address, so without `nodad` each run leaves a different random subset of each
+  # node's addresses dead -- which reads as intermittent slowness rather than as a failure, since a
+  # caller retrying can still land on one of the survivors. IPv4 has no DAD, which is why only the
+  # v6 path ever shows it.
   #
   # Duplicates on one segment are fine here because nothing resolves these addresses on-link:
   # callers route to them `via` each node's own unique address. Same idiom as

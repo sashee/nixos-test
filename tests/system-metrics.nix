@@ -26,11 +26,12 @@ nixpkgs.lib.nixos.runTest {
     # drop the clock gate. mkForce because that definition is at normal priority, so a plain
     # `true` fails to merge.
     #
-    # Note this is no longer the configuration the hosts deploy: they run chrony, which forces
-    # timesyncd off, and gate on /run/chrony-wait/synchronized instead (modules/time-sync.nix).
-    # This test keeps the timesyncd marker because it is the option's default and the cheaper
-    # way to exercise the gate MECHANISM -- one node, no NTS server. The deployed marker is
-    # asserted end to end by tests/nts-sync.nix, which has real chrony to synchronise.
+    # Note this is not the configuration the hosts deploy: they run chrony, which forces timesyncd
+    # off, and gate on /run/chrony-wait/synchronized instead (modules/time-sync.nix). This test
+    # keeps the timesyncd marker because it is the option's default and the cheaper way to exercise
+    # the gate MECHANISM -- one node, no NTS server, and the mechanism is the same whatever writes
+    # the file. Which marker each deployed host is actually pointed at is a rendered-unit claim,
+    # asserted per host by tests/time-sync-deployed.nix.
     services.timesyncd = {
       enable = lib.mkForce true;
       servers = [ "ntp-server" ];

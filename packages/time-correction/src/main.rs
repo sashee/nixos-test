@@ -20,9 +20,10 @@
 //!
 //! Two independent pairs must agree, so moving this clock means compromising two operators at
 //! once -- and even then only within a certificate's validity window, with the build-time floor
-//! bounding how far back it can go. That is the same bound the previous Date-header design had:
-//! the deferred check is what is being traded on, and NTS does not change it. What NTS buys is
-//! that every configured server can answer, rather than the two of four that emitted a `Date`.
+//! bounding how far back it can go. The deferred check is what is being traded on; what NTS adds
+//! is that the timestamp is authenticated by a key only the server holding that chain's private
+//! key could have derived, so every configured server can vouch for a time rather than only the
+//! ones that happen to emit a usable HTTP `Date`.
 //!
 //! Runs as a systemd oneshot on a timer -- once after boot, then every hour (see
 //! `modules/time-sync.nix`). A failed run exits non-zero and the next attempt is the timer's,
@@ -281,6 +282,18 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Action, String> {
                 only.len(),
                 operators.len(),
                 operators.join(", ")
+            ));
+        }
+        // The same arity rule `--sample` gets, for the path that bypasses sampling. Every pair
+        // needs a resolver of its own -- one compromised resolver must not sit in front of every
+        // answer -- so a list longer than the resolver pool cannot be served. `choose` refuses
+        // this too, but only once the run is under way; refusing it here keeps all three arity
+        // rules in one place and reports them the same way.
+        if only.len() > options.resolvers.len() {
+            return Err(format!(
+                "--only names {} servers but only {} DoH resolvers are configured; each pair uses a different one",
+                only.len(),
+                options.resolvers.len()
             ));
         }
     }
@@ -653,12 +666,12 @@ fn choose(options: &Options, seed: u64) -> Result<Vec<(Resolver, TimeServer)>, S
                 .into_iter()
                 .enumerate()
                 .filter_map(|(index, operator)| {
-                    // Draw among that operator's servers rather than taking the first. Taking
-                    // the first made a second server for an operator dead weight: ptbtime2 was
-                    // configured, passed to the binary and never asked, so the redundancy it
-                    // exists for -- ptbtime1 being down -- did not work. The seed is varied per
-                    // position so two operators drawn in one run do not both take the same
-                    // index into their own lists.
+                    // Draw among that operator's servers rather than taking the first, so a
+                    // second server for one operator is reachable rather than dead weight --
+                    // taking the first would mean ptbtime2 is configured, passed to the binary
+                    // and never asked, and the redundancy it exists for (ptbtime1 being down)
+                    // would not work. The seed is varied per position so two operators drawn in
+                    // one run do not both take the same index into their own lists.
                     let theirs: Vec<&TimeServer> = options
                         .servers
                         .iter()
@@ -749,12 +762,13 @@ fn run(options: Options) -> Result<(), String> {
 /// state the clock is in *now*: the exchange takes seconds, during which chrony may have stepped
 /// the clock itself.
 ///
-/// There used to be a second rule -- ask the kernel via `adjtimex` whether `STA_UNSYNC` is clear,
-/// and stand down if something had already disciplined the clock. It is gone, and nothing is lost
-/// by that, because the window rule subsumes it: a clock chrony has disciplined sits inside the
-/// validity of every certificate on the path by construction, so this returns a reason anyway.
-/// What its removal buys is that the exchange is no longer skipped on a healthy host, which is
-/// what makes each run evidence that DoH and NTS still work rather than only a repair.
+/// Asking the kernel instead -- `adjtimex`, and stand down when `STA_UNSYNC` is clear -- would be
+/// both weaker and more expensive. Weaker because it says nothing about whether TLS works, which
+/// is the only question this program cares about; more expensive because it can be answered
+/// without doing the exchange, and then the exchange gets skipped on every healthy host and stops
+/// being evidence that DoH and NTS still work. The window rule subsumes it anyway: a clock chrony
+/// has disciplined sits inside the validity of every certificate on the path by construction, so
+/// this returns a reason there regardless.
 fn reason_to_stand_down(
     options: &Options,
     window: Option<(i64, i64)>,
@@ -897,6 +911,29 @@ mod tests {
     }
 
     #[test]
+    fn only_cannot_exceed_the_resolvers_either() {
+        // --only bypasses sampling, so it also bypasses the --sample check above -- but every pair
+        // still needs a resolver of its own, or one compromised resolver sits in front of more
+        // than one answer. Refused at parse time rather than left to `choose`, so all three arity
+        // rules report the same way.
+        let one_resolver = |extra: &[&str]| {
+            let mut v = vec![
+                "--doh", CF, "--nts", NTS_CF, "--nts", NTS_PTB1, "--sample", "1",
+            ];
+            v.extend_from_slice(extra);
+            parse(&v)
+        };
+
+        let error = one_resolver(&["--only", "cloudflare,ptb1"]).unwrap_err();
+        assert!(error.contains("DoH resolvers"), "{error}");
+
+        // One name against one resolver is fine, and so is the two-resolver configuration the
+        // rest of these tests use.
+        assert!(one_resolver(&["--only", "cloudflare"]).is_ok());
+        assert!(parse_args(full(&["--only", "cloudflare,ptb1"]).into_iter()).is_ok());
+    }
+
+    #[test]
     fn rejects_only_naming_an_unconfigured_server() {
         assert!(parse_args(full(&["--only", "netnod"]).into_iter()).is_err());
         assert!(parse_args(full(&["--only", ""]).into_iter()).is_err());
@@ -924,13 +961,6 @@ mod tests {
         // Reachable with no --doh or --nts at all: asking for the usage text must not depend on
         // being configured well enough to run.
         assert!(matches!(parse(&["--help"]), Ok(Action::Help)));
-    }
-
-    #[test]
-    fn check_synced_is_gone() {
-        // The kernel's STA_UNSYNC is no longer consulted anywhere, so the flag that exposed it
-        // must not linger as an argument that silently parses into a run with no servers.
-        assert!(parse(&["--check-synced"]).is_err());
     }
 
     #[test]
@@ -1074,8 +1104,8 @@ mod tests {
     fn both_servers_of_an_operator_get_used() {
         // ptb1 and ptb2 are one operator, so they never appear together -- but each must be
         // reachable, or the second is dead weight and the redundancy it exists for (the first
-        // being down) does not work. Regression: `.find()` used to return the first match
-        // always, so ptb2 was configured, passed to the binary and never asked.
+        // being down) does not work. The failure this guards is a draw that resolves an operator
+        // to a fixed one of its servers, which no other test here would notice.
         let options = run_options(&[
             "--doh", CF, "--doh", Q9, "--nts", NTS_CF, "--nts", NTS_PTB1, "--nts", NTS_PTB2,
         ]);

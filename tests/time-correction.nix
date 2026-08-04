@@ -63,10 +63,10 @@ let
   #   NTS         2024-01-01 ................................... 2100-01-01
   #   both        2024-01-01 ............................. 2060-01-01
   #
-  # With one shared 100-year window (which is what these fixtures used to have) a client that
-  # consulted only one leg, or that answered "every instant" when it could not tell, would pass
-  # every subtest here. The dates are absolute rather than relative to the build so the fixture
-  # is reproducible, and far enough out that the window still contains the present for decades.
+  # One shared 100-year window would not do: a client that consulted only one leg, or that
+  # answered "every instant" when it could not tell, would pass every subtest here. The dates are
+  # absolute rather than relative to the build so the fixture is reproducible, and far enough out
+  # that the window still contains the present for decades.
   ntsNotBefore = "20240101000000Z";
   ntsNotAfter = "21000101000000Z";
   dohNotBefore = "20200101000000Z";
@@ -74,6 +74,11 @@ let
   # The intersection, as epoch seconds, for the driver to assert against.
   bothFrom = 1704067200; # 2024-01-01
   bothUntil = 2840140800; # 2060-01-01
+
+  # The stand-down subtest's clock: comfortably inside the intersection above and wrong by years,
+  # given both ways because that subtest sets the first and asserts the second.
+  in2030 = "2030-01-01 00:00:00";
+  in2030Epoch = 1893456000;
 
   ntsCert = import ./test-cert.nix { inherit pkgs; } {
     name = "nts-good";
@@ -264,6 +269,15 @@ nixpkgs.lib.nixos.runTest {
     # and same remedy as tests/restic.nix, which advances the clock for its own purposes.
     nix.gc.automatic = lib.mkForce false;
 
+    # fstrim.timer is the same hazard by a different route, and it bites the LAST subtest rather
+    # than a timing-sensitive one. It is `OnCalendar=weekly` and enabled by default, so every
+    # forward jump this test makes crosses a weekly boundary and fires it again -- and back-to-back
+    # starts trip systemd's start limit, leaving `fstrim.service` permanently failed. "nothing was
+    # left broken" then reports a failure that has nothing to do with the clock code. Disabled
+    # rather than added to that subtest's exclusion list, because a repeatedly-fired timer is
+    # something this test causes and can therefore prevent, not a fact about the host.
+    services.fstrim.enable = lib.mkForce false;
+
     # mkForce: the shared test-node layer switches time sync off on every node (see
     # testNodeTimeSyncOff in flake.nix), which here is the thing under test.
     common.timeSync = {
@@ -307,6 +321,11 @@ nixpkgs.lib.nixos.runTest {
     # The instants at which BOTH good certificates are valid; see the fixtures above.
     BOTH_FROM = ${toString bothFrom}
     BOTH_UNTIL = ${toString bothUntil}
+    # A clock that is wrong by years but inside both windows, as a wall-clock string and as the
+    # epoch second it must land on. The two have to agree, which is why every `date -s` in this
+    # file passes `-u`: the string is otherwise read in the node's own timezone.
+    IN_2030 = "${in2030}"
+    IN_2030_EPOCH = ${toString in2030Epoch}
 
     start_all()
 
@@ -381,10 +400,9 @@ nixpkgs.lib.nixos.runTest {
         # about half of them MUST fail -- that is "any error fails the service run" doing its job,
         # and the same draw is what lets the subtests below pin each leg with --only.
         #
-        # This used to be `wait_for_unit`, which worked only because the unit restarted itself
-        # every 30s until a draw landed on the good server. The spec dropped that retry, so the
-        # retrying moved here -- which is honest about where it now lives: on the deployed hosts
-        # every configured operator is real, and the timer is what tries again.
+        # The retrying therefore lives in the driver, which is honest about whose job it is: the
+        # unit has no Restart= at all, and on the deployed hosts every configured operator is real
+        # and the timer is what tries again.
         machine.wait_until_succeeds(
             "systemctl reset-failed time-correction.service || true; "
             "systemctl start time-correction.service",
@@ -392,9 +410,8 @@ nixpkgs.lib.nixos.runTest {
         )
 
     with subtest("the boot run is timed, and a host with no resolver fails it and changes nothing"):
-        # The spec dropped "gets restarted until it succeeds" in favour of "runs every hour and
-        # after boot", so what is asserted here is a plain terminal failure plus an armed timer --
-        # not the retry counter this subtest used to watch.
+        # The spec asks for "runs every hour and after boot", not "gets restarted until it
+        # succeeds", so what is asserted here is a plain terminal failure plus an armed timer.
         before = clock()
         machine.wait_until_succeeds(
             "systemctl show -p Result --value time-correction.service | grep -qx exit-code",
@@ -448,9 +465,8 @@ nixpkgs.lib.nixos.runTest {
         # Asked one scalar at a time with --value, which is the only reliable form here: plain
         # `systemctl show -p NAME` omits properties whose value is empty unless --all is passed,
         # so a false boolean or an unset timestamp simply does not appear in the output and an
-        # `in`-style assertion on it silently tests nothing. (Learned the hard way: an earlier
-        # version of this subtest asserted against `-p TimersMonotonic -p Persistent` and got back
-        # nothing but the `Unit=` line.)
+        # `in`-style assertion on it silently tests nothing. `-p TimersMonotonic -p Persistent`
+        # on this unit comes back as nothing but the `Unit=` line, which is exactly the trap.
         def timer_property(name):
             return machine.succeed(
                 f"systemctl show -p {name} --value time-correction.timer"
@@ -473,7 +489,7 @@ nixpkgs.lib.nixos.runTest {
     # time-correction now stands down when the clock is already inside, because TLS works there and
     # there is nothing left for it to fix. 2001 is before every fixture's notBefore, so the unit
     # has to do the whole job.
-    machine.succeed("date -s '2001-01-01 00:00:00'")
+    machine.succeed("date -u -s '2001-01-01 00:00:00'")
 
     use_resolver(dohgood)
 
@@ -483,7 +499,7 @@ nixpkgs.lib.nixos.runTest {
         # --force. This is also the only place the exporter-derived AEAD keys are exercised
         # against a real server rather than a fixture.
         #
-        # Started explicitly rather than waited for: the unit is no longer RemainAfterExit, so
+        # Started explicitly rather than waited for: the unit is not RemainAfterExit, so
         # `wait_for_unit` would wait forever on a oneshot that goes inactive the moment it
         # succeeds. See run_unit for why a successful run has to be waited for rather than
         # demanded of the first attempt.
@@ -571,9 +587,14 @@ nixpkgs.lib.nixos.runTest {
 
     def stand_down_or_set(when):
         # Not --force and not --dry-run: the decision AND its effect are the subject. The
-        # certificate window is the only thing that can decide these -- it is now the program's
-        # sole stand-down rule, the kernel's STA_UNSYNC no longer being consulted at all.
-        machine.succeed(f"date -s '{when}'")
+        # certificate window is the only thing that can decide these -- it is the program's sole
+        # stand-down rule, and nothing consults the kernel's STA_UNSYNC.
+        #
+        # `-u`, so `when` names the same instant whatever the host's timezone is. Without it
+        # `date -s` parses as LOCAL time, and the epoch bound below -- which is a UTC instant
+        # worked out by hand -- is off by the offset: anya-feher-laptop is Europe/Budapest, so
+        # 2030-01-01 00:00:00 landed an hour early and the subtest read it as a clock that moved.
+        machine.succeed(f"date -u -s '{when}'")
         return machine.succeed("time-correction --only cloudflare 2>&1")
 
     with subtest("a clock already inside the certificates' validity is left alone"):
@@ -581,15 +602,16 @@ nixpkgs.lib.nixos.runTest {
         # the rule is about: TLS works, so chrony can reach its sources and make the accurate
         # correction itself, and stepping here would only replace one wrong time with a
         # whole-second approximation of a different one.
-        output = stand_down_or_set("2030-01-01 00:00:00")
+        output = stand_down_or_set(IN_2030)
         assert "already inside the certificates' validity" in output, output
         # The reported window is the INTERSECTION of the two legs, asserted exactly. Without this
         # the subtest would pass just as well on a client that answered "every instant is inside"
         # whenever it could not work a window out -- which is the one wrong answer here, and the
         # reason `common_window` treats a single unknown as poisoning the whole result.
         assert f"({BOTH_FROM}..{BOTH_UNTIL})" in output, output
-        # Still in 2030, i.e. not stepped back to what the NTS server serves.
-        assert 1893456000 <= clock() < 1900000000, f"the clock moved to {clock()}"
+        # Still in 2030, i.e. not stepped back to what the NTS server serves. The lower bound is
+        # IN_2030 itself, which is why stand_down_or_set places it as UTC -- see there.
+        assert IN_2030_EPOCH <= clock() < 1900000000, f"the clock moved to {clock()}"
 
     with subtest("a clock outside the certificates' validity is set"):
         # The converse, so the subtest above cannot pass by time-correction having simply stopped
@@ -616,7 +638,7 @@ nixpkgs.lib.nixos.runTest {
         # is fine (`time-correction --force --dry-run`). The window rule is the only stand-down rule
         # left, so if --force did not override it this would report a stand-down on every healthy
         # host -- i.e. the escape hatch would be useless precisely where it is used.
-        machine.succeed("date -s '2030-01-01 00:00:00'")
+        machine.succeed(f"date -u -s '{IN_2030}'")
         output = machine.succeed("time-correction --force --dry-run --only cloudflare 2>&1")
         assert "would set the clock to" in output, output
         machine.succeed(f"date -s @{int(ntsgood.succeed('date +%s').strip())}")
@@ -637,13 +659,9 @@ nixpkgs.lib.nixos.runTest {
         # probe to wait on -- the interceptor answers TLS on 443 and nothing else, not even
         # ICMPv6 -- so retry the operation itself.
         #
-        # This retry used to be here for the wrong reason, and the reason is worth recording
-        # because it made the failure unreadable for a while. Both interceptors add the same
-        # provider /128s, so before tests/doh-interceptor.nix passed `nodad` each run left a
-        # random subset of each node's addresses `dadfailed`. Rerolling the draw -- time-correction
-        # picks its resolver at random per run -- eventually found a surviving address, so a
-        # partial loss looked exactly like slow neighbour discovery. The aarch64 run where
-        # dohgood lost all four failed outright and no timeout would have helped.
+        # The retry cannot rescue a v6 address that is `dadfailed`, which both interceptor nodes
+        # holding the same provider /128s would otherwise produce; see the `nodad` note in
+        # tests/doh-interceptor.nix for why that is not what is being waited on here.
         disconnect(v4=True, v6=False)
         machine.wait_until_succeeds(
             "time-correction --force --dry-run --only cloudflare", timeout=120
@@ -653,8 +671,8 @@ nixpkgs.lib.nixos.runTest {
     with subtest("an NTS server reachable only over IPv6 still gives the time"):
         # The v4-only/v6-only pair above covers the DoH leg -- reaching the resolver. This
         # covers the other one: the resolver is reachable, but the NTS server it names is not
-        # reachable over IPv4. Querying A alone (as this program once did) resolves to an
-        # address the host cannot use and the whole chain fails.
+        # reachable over IPv4. A client that queried A alone would resolve to an address the host
+        # cannot use and the whole chain would fail, which is why `ask_pair` asks for both.
         ntsgood_v4 = ntsgood.succeed(
             "${pkgs.iproute2}/bin/ip -j -4 addr show dev eth1 "
             "| ${pkgs.jq}/bin/jq -r '.[0].addr_info[] | select(.prefixlen==24) | .local'"
@@ -672,10 +690,10 @@ nixpkgs.lib.nixos.runTest {
         # modules/time-sync.nix installs, preloaded with the unit's own flags -- rather than the
         # unit. So does `time-correction --force --dry-run` in the README and in
         # lib/nts-servers.nix, which is the documented way to check a live Pi's providers still
-        # answer. All of that rests on the two carrying identical arguments, and nothing checked
-        # it: the wrapper and the unit interpolate `correctionArgs` at two separate call sites,
-        # so a flag added to one and not the other would leave every test here passing while the
-        # command an operator actually runs asked something else.
+        # answer. All of that rests on the two carrying identical arguments: the wrapper and the
+        # unit interpolate `correctionArgs` at two separate call sites, so a flag added to one and
+        # not the other would leave every test here passing while the command an operator actually
+        # runs asked something else.
         #
         # tests/time-sync-deployed.nix pins what those arguments ARE on the deployed hosts. This
         # pins that there is only one set of them, which is a claim about the module rather than
@@ -722,7 +740,7 @@ nixpkgs.lib.nixos.runTest {
         # repeating here rather than resting on the earlier subtest, because by now the clock has
         # been moved in and out of certificate windows a dozen times and the unit has failed and
         # been reset repeatedly -- so this is also the check that none of that left it wedged.
-        machine.succeed("date -s '2001-01-01 00:00:00'")
+        machine.succeed("date -u -s '2001-01-01 00:00:00'")
         run_unit()
         assert clock() > FLOOR, f"the run left the clock at {clock()}"
 

@@ -38,19 +38,17 @@
 # not only at boot. Two consequences worth stating, because both are the point rather than a
 # side-effect:
 #
-#   * The hourly run is a check, not just a repair. It does the whole DoH + NTS exchange even
-#     when the clock is demonstrably fine, so a provider that stopped answering, a pinned
-#     address that moved or an expired trust store is discovered while the host is still
-#     healthy enough to say so -- instead of at the next cold boot, when nothing works and
-#     nobody can reach the box. That is why the program no longer asks the kernel whether the
-#     clock is already synchronised and skips the exchange when it is: the skip was the whole
-#     failure mode.
+#   * The hourly run is a check, not just a repair. It does the whole DoH + NTS exchange
+#     unconditionally, even when the clock is demonstrably fine, so a provider that stopped
+#     answering, a pinned address that moved or an expired trust store is discovered while the
+#     host is still healthy enough to say so -- instead of at the next cold boot, when nothing
+#     works and nobody can reach the box. Skipping the exchange on a healthy clock would trade
+#     that away for nothing: the run is cheap and the discovery is the point.
 #   * It still steps the clock only when it has to. It stands down when the clock, however
 #     wrong, already sits inside the validity of every certificate it just checked: TLS works
 #     at that point, which is the only thing this program exists to arrange, and stepping would
 #     replace an error chrony is about to correct precisely with a whole-second approximation
-#     of the same instant. On a host chrony has disciplined that rule always fires, which is
-#     why dropping the kernel check costs nothing.
+#     of the same instant. On a host chrony has disciplined, that rule always fires.
 #
 # That leans on chrony being able to step a large error, which it can because nixpkgs defaults
 # `services.chrony.makestep` to `0.1 3` -- the first three updates step, with no size limit. A
@@ -69,12 +67,11 @@
 # what its consumers actually want -- a gate that reopened mid-run would make measurements
 # vanish rather than make them more correct.
 #
-# Also gone deliberately: there is no reboot failsafe for "the correction service succeeded
-# and chrony still has not synchronised". It used to live here as `unwedgeSeconds`, and the
-# spec dropped it. A reboot is a remedy for a wedged resolver and nothing else, the hourly run
-# now surfaces the same class of fault as a plain failing unit instead, and an unbounded reboot
-# rule is the shape of the 2026-07-27 bootloop that modules/connectivity-watchdog.nix exists to
-# avoid repeating.
+# Also deliberate: there is no reboot failsafe for "the correction service succeeded and chrony
+# still has not synchronised". A reboot is a remedy for a wedged resolver and nothing else, the
+# hourly run surfaces that class of fault as a plain failing unit instead, and an unbounded
+# reboot rule is the shape of the 2026-07-27 bootloop that modules/connectivity-watchdog.nix
+# exists to avoid repeating.
 
 let
   cfg = config.common.timeSync;
@@ -456,14 +453,14 @@ in
         # RemainAfterExit would additionally make the timer's next trigger a no-op on a unit
         # still "active" from its last success.
 
-        # Well above any exchange that could still succeed, and that matters more than it used to.
-        # systemd's default is 90s, and the program's own worst case can exceed it: every address
-        # of every chosen provider is tried in turn, so a network that BLACKHOLES one family --
-        # dropping silently rather than answering ENETUNREACH -- pays the full
-        # [](#opt-common.timeSync.timeoutSeconds) per address on both the DoH and the NTS leg.
-        # While the unit retried every 30s, being killed at 90s cost one attempt; now it costs an
-        # hour, and reads in the journal as a failure of the providers rather than of the ceiling.
-        # Still far below the interval, so a run can never overlap its successor.
+        # Well above any exchange that could still succeed. systemd's default is 90s, and the
+        # program's own worst case can exceed it: every address of every chosen provider is tried
+        # in turn, so a network that BLACKHOLES one family -- dropping silently rather than
+        # answering ENETUNREACH -- pays the full [](#opt-common.timeSync.timeoutSeconds) per
+        # address on both the DoH and the NTS leg. Being killed at the default would cost a whole
+        # interval, since the next attempt is the timer's, and would read in the journal as a
+        # failure of the providers rather than of the ceiling. Still far below the interval, so a
+        # run can never overlap its successor.
         TimeoutStartSec = "5min";
 
         # Setting the clock is the entire point, so unlike every other hardened unit in this
