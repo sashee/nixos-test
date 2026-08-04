@@ -93,6 +93,18 @@ in
     memoryPercent = 100;
   };
 
+  # Dirty-page writeback thresholds, a quarter of the laptop values (see
+  # modules/laptop-base.nix, which this host does not import). Both scales are
+  # wrong for this box by default: the kernel's ratio defaults (20%/10%) allow
+  # ~800/400 MiB of dirty pages on 4 GiB of RAM, and the backing store is an SD
+  # card, so a pool that large is many seconds of writes queued behind any fsync.
+  # Starting writeback at 16 MiB keeps it trickling instead of bursting, and the
+  # 64 MiB hard limit bounds how long a writer can be blocked.
+  boot.kernel.sysctl = {
+    "vm.dirty_bytes" = 67108864;              # 64 MiB
+    "vm.dirty_background_bytes" = 16777216;   # 16 MiB
+  };
+
   # No interactive boot menu on the Pi + limited SD space: keep only the current
   # generation on GC (laptops keep 14 days to roll back from the boot menu).
   common.nixSettings.gcOptions = "--delete-old";

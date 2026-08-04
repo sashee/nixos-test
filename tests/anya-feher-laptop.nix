@@ -2,7 +2,7 @@
 
 # Host-spec test for anya-feher-laptop (spec/anya-feher-laptop.md): asserts the
 # host-specific bullets on the real host config. The shared feature behaviors
-# (doh, firewall, iroh tunnel, monitoring, zram) have their own *-anya variants.
+# (doh, firewall, iroh tunnel, monitoring, system) have their own *-anya variants.
 nixpkgs.lib.nixos.runTest {
   name = "anya-feher-laptop";
   hostPkgs = pkgs;

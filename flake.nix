@@ -274,11 +274,15 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiSystemModule;
       };
-      zramTestRpi = import ./tests/zram.nix {
+      # spec/rpi-features.md overrides the shared writeback thresholds with a
+      # quarter of the laptop values (SD-card backing store).
+      systemTestRpi = import ./tests/system.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiSystemModule;
+        dirtyBytes = 67108864;             # 64 MiB
+        dirtyBackgroundBytes = 16777216;   # 16 MiB
       };
       # The measurement producer against the receiver the Pi actually deploys. Slow here (TCG),
       # which is why the same file also runs as a generic x86 check.
@@ -484,7 +488,7 @@
         auto-upgrade = autoUpgradeTestRpi;
         nix-settings = nixSettingsTestRpi;
         auto-upgrade-reboot = autoUpgradeRebootTestRpi;
-        zram = zramTestRpi;
+        system = systemTestRpi;
         nix-gc-retention = nixGcRetentionTestRpi;
         monitoring = monitoringTestRpi;
         connectivity-fallback = connectivityFallbackTestRpi;
@@ -572,9 +576,13 @@
         };
         inherit nixpkgs pkgs stateVersion;
       };
-      zramTest = import ./tests/zram.nix {
+      # spec/features/system.md: the shared values, asserted on the base module
+      # that declares them (the -anya variant covers the real host config).
+      systemTest = import ./tests/system.nix {
         inherit nixpkgs pkgs stateVersion;
         machineModule = ./modules/laptop-base.nix;
+        dirtyBytes = 268435456;            # 256 MiB
+        dirtyBackgroundBytes = 67108864;   #  64 MiB
       };
       systemMetricsTest = import ./tests/system-metrics.nix {
         inherit nixpkgs pkgs stateVersion;
@@ -691,9 +699,11 @@
         inherit nixpkgs pkgs stateVersion dohStamps;
         machineModule = anyaFeherLaptopSystemModule;
       };
-      anyaFeherLaptopZramTest = import ./tests/zram.nix {
+      anyaFeherLaptopSystemTest = import ./tests/system.nix {
         inherit nixpkgs pkgs stateVersion;
         machineModule = anyaFeherLaptopSystemModule;
+        dirtyBytes = 268435456;            # 256 MiB
+        dirtyBackgroundBytes = 67108864;   #  64 MiB
       };
       anyaFeherLaptopMonitoringAutoUpgradeTest = import ./tests/monitoring/auto-upgrade.nix {
         inherit nixpkgs pkgs stateVersion;
@@ -808,7 +818,7 @@
         anya-feher-laptop-doh-captive = anyaFeherLaptopDohCaptiveTest;
         anya-feher-laptop-firewall = anyaFeherLaptopFirewallTest;
         anya-feher-laptop-iroh-ssh = anyaFeherLaptopIrohSshTest;
-        anya-feher-laptop-zram = anyaFeherLaptopZramTest;
+        anya-feher-laptop-system = anyaFeherLaptopSystemTest;
         anya-feher-laptop-monitoring-auto-upgrade = anyaFeherLaptopMonitoringAutoUpgradeTest;
         anya-feher-laptop-monitoring-disk-space = anyaFeherLaptopMonitoringDiskSpaceTest;
         anya-feher-laptop-monitoring-generations = anyaFeherLaptopMonitoringGenerationsTest;
@@ -856,7 +866,7 @@
         connectivity-fallback-trigger = connectivityFallbackTriggerTest;
         connectivity-watchdog = connectivityWatchdogTest;
         connectivity-fallback-timing = connectivityFallbackTimingTest;
-        zram = zramTest;
+        system = systemTest;
         system-metrics = systemMetricsTest;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
@@ -948,8 +958,8 @@
         plasma-firefox-driver-interactive = plasmaFirefoxTest.driverInteractive;
         restic-driver = resticTest.driver;
         restic-driver-interactive = resticTest.driverInteractive;
-        zram-driver = zramTest.driver;
-        zram-driver-interactive = zramTest.driverInteractive;
+        system-driver = systemTest.driver;
+        system-driver-interactive = systemTest.driverInteractive;
       } // nixUtilsTestDrivers;
     };
 }

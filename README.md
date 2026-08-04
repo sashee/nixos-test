@@ -106,6 +106,7 @@ Plasma 6 + Firefox, SDDM, hardware graphics
 NetworkManager, Bluetooth, DNS over HTTPS, nftables firewall
 PipeWire audio, fonts, CLI/dev tools, direnv
 redistributable firmware, CPU microcode (Intel + AMD), zram swap
+byte-based dirty-page writeback thresholds (256 MiB hard / 64 MiB background)
 flakes/nix settings + GC, auto-upgrade, monitoring, restic scaffolding
 SSH over iroh tunnel for IP-less remote access
 ```
@@ -208,6 +209,16 @@ firmware, CPU microcode updates (Intel and AMD), firmware updates (fwupd), power
 profiles, printing, UPower, and zram swap. The microcode and firmware settings
 are CPU- and vendor-agnostic, so the base works unchanged on any Intel or AMD
 laptop.
+
+It also sets the dirty-page writeback thresholds in **bytes** —
+`vm.dirty_background_bytes` 64 MiB, `vm.dirty_bytes` 256 MiB — instead of the
+kernel's RAM-proportional `dirty_background_ratio`/`dirty_ratio` defaults
+(10%/20%), which on a 16-32 GB laptop let GBs of dirty pages pile up before any
+writeback starts and then stall in one burst. Writing either byte knob zeroes its
+ratio counterpart, so the byte values are the ones in force. `hosts/rpi5` sets a
+quarter of each (16 MiB / 64 MiB): 4 GiB of RAM behind an SD card, where a large
+dirty pool is many seconds of queued writes. Both are covered by the `system`
+check.
 
 `modules/audio.nix` contains PipeWire and realtime audio support.
 
