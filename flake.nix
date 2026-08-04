@@ -731,19 +731,23 @@
         imports = [ anyaFeherLaptopHostModule testNodeTimeSyncOff ];
         virtualisation.qemu.options = [ (testRtcBase pkgs.coreutils) ];
       };
+      # Stand-in for the machine-unique parts that live on the device, so the deployable laptop
+      # system can be evaluated here at all. Shared by anyaFeherLaptopEval and
+      # timeSyncCadenceTest, which both need the host config forced but neither of which may
+      # depend on the device's real hardware-configuration.nix.
+      laptopStubHw = {
+        fileSystems."/" = {
+          device = "/dev/disk/by-label/nixos";
+          fsType = "ext4";
+        };
+      };
       # Eval-only smoke check: force full evaluation (assertions included) of
       # the deployable system with a stand-in hardware config, so a broken host
       # config fails CI instead of the laptop's next auto-upgrade. The context
       # discard keeps the check from depending on (= building) the system.
       anyaFeherLaptopEval =
         let
-          stubHw = {
-            fileSystems."/" = {
-              device = "/dev/disk/by-label/nixos";
-              fsType = "ext4";
-            };
-          };
-          toplevel = (mkAnyaFeherLaptop { modules = [ stubHw ]; }).config.system.build.toplevel;
+          toplevel = (mkAnyaFeherLaptop { modules = [ laptopStubHw ]; }).config.system.build.toplevel;
         in
         pkgs.runCommand "anya-feher-laptop-eval" { } ''
           echo ${nixpkgs.lib.escapeShellArg (builtins.unsafeDiscardStringContext toplevel.drvPath)} > $out
@@ -759,6 +763,17 @@
       };
       dohProvidersTest = import ./tests/doh-providers.nix {
         inherit pkgs dohStamps;
+      };
+      # Unlike the eval checks above this one is not pure data -- it forces both deployed host
+      # configs to render their time-correction.timer, which costs an eval of each. Worth it
+      # because the values it asserts are the ones no VM test can see: both time tests override
+      # the cadence so their own subtests are not interrupted by a timed run.
+      timeSyncCadenceTest = import ./tests/time-sync-cadence.nix {
+        inherit pkgs;
+        hosts = {
+          rpi5 = rpi5Base;
+          anya-feher-laptop = mkAnyaFeherLaptop { modules = [ laptopStubHw ]; };
+        };
       };
       anyaFeherLaptopTest = import ./tests/anya-feher-laptop.nix {
         inherit nixpkgs pkgs stateVersion;
@@ -973,6 +988,7 @@
         doh-endpoints = dohEndpointsTest;
         nts-servers = ntsServersTest;
         doh-providers = dohProvidersTest;
+        time-sync-cadence = timeSyncCadenceTest;
       };
     in
     {

@@ -100,7 +100,9 @@ usage: time-correction [options]
   --tolerance SECONDS              how far apart two answers may be (default: 60)
   --floor EPOCH                    refuse any time earlier than this (default: 0)
   --only NAME[,NAME]               ask exactly these NTS servers instead of sampling; for
-                                   tests, which need the choice to be deterministic
+                                   tests, which need the choice to be deterministic. At most one
+                                   server per operator, since sampling's guarantee that each
+                                   vote comes from a different organisation still has to hold
   --timeout SECONDS                per-connection connect and read timeout (default: 10)
   --force                          step the clock even when it is already inside the validity
                                    of every certificate seen, which is otherwise the one reason
@@ -258,6 +260,28 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Action, String> {
             if !options.servers.iter().any(|s| &s.name == name) {
                 return Err(format!("--only names {name:?}, which is not configured"));
             }
+        }
+        // --only bypasses sampling, and with it the guarantee sampling exists to provide: that
+        // each pair's vote comes from a different organisation. Without this check
+        // `--only ptbtime1,ptbtime2` would ask one operator twice, and `quorum::decide` -- which
+        // votes per entry of the sampled list, not per distinct operator -- would count that as
+        // two agreeing sources and set the clock. Naming one server per operator is fine, and
+        // naming a single server is fine (one vote, and it is asked for explicitly); what is
+        // refused is a list that would silently turn N names into fewer than N sources.
+        let named: Vec<TimeServer> = options
+            .servers
+            .iter()
+            .filter(|s| only.contains(&s.name))
+            .cloned()
+            .collect();
+        let operators = distinct_operators(&named);
+        if operators.len() < only.len() {
+            return Err(format!(
+                "--only names {} servers but only {} distinct operators ({}); servers run by the same organisation cannot cross-check each other, so name at most one per operator",
+                only.len(),
+                operators.len(),
+                operators.join(", ")
+            ));
         }
     }
 
@@ -601,6 +625,11 @@ fn common_window(windows: &[Option<(i64, i64)>]) -> Option<(i64, i64)> {
 /// Distinct operators, so two hostnames from one organisation cannot form a quorum with each
 /// other, and a distinct resolver per pair, so one compromised resolver cannot sit in the path
 /// of every answer.
+///
+/// `--only` skips the sampling but not the first property: `parse_args` refuses a list naming
+/// two servers of one operator, so the pairs returned here are one-per-operator either way.
+/// Enforced there rather than here because a caller who typed two names should be told, not
+/// silently handed one pair.
 fn choose(options: &Options, seed: u64) -> Result<Vec<(Resolver, TimeServer)>, String> {
     let chosen: Vec<TimeServer> = match &options.only {
         Some(only) => options
@@ -893,6 +922,36 @@ mod tests {
         // The kernel's STA_UNSYNC is no longer consulted anywhere, so the flag that exposed it
         // must not linger as an argument that silently parses into a run with no servers.
         assert!(parse(&["--check-synced"]).is_err());
+    }
+
+    #[test]
+    fn only_refuses_two_servers_of_one_operator() {
+        // --only skips sampling, so it also skips the guarantee sampling provides. ptb1 and ptb2
+        // are one organisation, and `quorum::decide` votes per entry of the sampled list rather
+        // than per distinct operator -- so without this check they would count as two agreeing
+        // sources and one compromised operator could set the clock unchallenged. The wrapper
+        // installed by modules/time-sync.nix comes preloaded with every --nts, which is what
+        // makes this reachable by hand.
+        let with_ptb2 = |extra: &[&str]| {
+            let mut v = vec![
+                "--doh", CF, "--doh", Q9, "--nts", NTS_CF, "--nts", NTS_PTB1, "--nts", NTS_PTB2,
+            ];
+            v.extend_from_slice(extra);
+            parse(&v)
+        };
+
+        let err = with_ptb2(&["--only", "ptb1,ptb2"]).unwrap_err();
+        assert!(err.contains("distinct operators"), "{err}");
+        assert!(err.contains("ptb"), "{err}");
+        // The same name twice is the same fault by a shorter route.
+        assert!(with_ptb2(&["--only", "ptb1,ptb1"]).is_err());
+
+        // One server per operator is the point of the flag and must still work, as must a single
+        // name -- one vote, asked for explicitly. Both shapes are used throughout
+        // tests/time-correction.nix.
+        assert!(with_ptb2(&["--only", "cloudflare,ptb1"]).is_ok());
+        assert!(with_ptb2(&["--only", "ptb2"]).is_ok());
+        assert!(with_ptb2(&["--only", "cloudflare"]).is_ok());
     }
 
     #[test]

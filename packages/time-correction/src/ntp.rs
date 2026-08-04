@@ -51,7 +51,7 @@ fn extension_fields(packet: &[u8]) -> Result<Vec<(u16, usize, usize)>, String> {
         let kind = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
         let length = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]) as usize;
         // A field that does not advance is a loop; a field longer than the packet is a lie.
-        if length < 4 || length % 4 != 0 {
+        if length < 4 || !length.is_multiple_of(4) {
             return Err(format!("extension field at {offset} has invalid length {length}"));
         }
         if offset + length > packet.len() {
@@ -181,7 +181,7 @@ pub fn parse_response(
 /// NTP counts 32-bit seconds from 1900, which wraps in 2036. The wrap is resolved by treating
 /// values below the 1968 pivot as belonging to the next era — the standard reading, and the one
 /// that keeps this correct for the whole of era 1 rather than failing a decade from now.
-pub fn transmit_timestamp(packet: &[u8]) -> Result<i64, String> {
+fn transmit_timestamp(packet: &[u8]) -> Result<i64, String> {
     let bytes = packet
         .get(40..44)
         .ok_or_else(|| "packet has no transmit timestamp".to_string())?;

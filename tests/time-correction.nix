@@ -32,8 +32,6 @@
 # for no additional confidence.
 
 let
-  lib = nixpkgs.lib;
-
   floor = 1000000000;
 
   goodHost = "time.cloudflare.com";
