@@ -13,6 +13,7 @@
 
 * time correction service
     * [motivation](./time-correction-motivation.md)
+    * [implementation details](./time-correction-details.md)
     * a separate service runs every hour and after boot
     * it chooses 2 distinct sets of providers, where each set contains a provider for DoH and a provider for NTS
     * for each set
@@ -25,5 +26,5 @@
             * retroactively verify all the seen TLS certificates
         * any error fails the service run
     * if the times received do not agree within tolerance => error
-    * if the current system time is within the validity times of all seen TLS certificates => finish with success
+    * if the current system time is within the validity times of all TLS certificates used for the verification => finish with success
     * otherwise => sets the system time to the received timestamp
