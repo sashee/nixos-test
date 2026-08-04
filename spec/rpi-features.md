@@ -2,14 +2,14 @@
 
 ## System
 
-* [./features/system.md]
+* [](./features/system/system.md)
 * DWARF/BTF disabled in the kernel due to disk space running out when compiling otherwise
 * vm.dirty_bytes = 67108864
 * vm.dirty_background_bytes = 16777216
 
 ## Wifi
 
-* [./features/wifi.md]
+* [](./features/wifi.md)
 * uses IWD
 
 ### Setup helper
@@ -26,23 +26,23 @@
 
 ## DNS-over-HTTPS
 
-* [./features/doh.md]
+* [](./features/doh.md)
 * captive portal handling is not needed
 
 ## Auto upgrade
 
-* [./features/auto-upgrade.md]
+* [](./features/auto-upgrade.md)
 * reboot if a new generation was created
 
 ## Auto GC
 
-* [./features/gc.md]
+* [](./features/gc.md)
 * runs twice daily
 * only the last generation is kept
 
 ## Monitoring
 
-* [./features/monitoring.md]
+* [](./features/monitoring.md)
 * runs every 30 minutes
 
 ## Auto-reboot
@@ -52,16 +52,16 @@
 
 ## Backups
 
-* [./features/backups.md]
+* [](./features/backups.md)
 
 ## Dotfiles
 
-* [./features/dotfiles.md]
+* [](./features/dotfiles.md)
 
 ## Iroh SSH
 
-* [./features/iroh-ssh.md]
+* [](./features/iroh-ssh.md)
 
 ## Firewall
 
-* [./features/firewall.md]
+* [](./features/firewall.md)
