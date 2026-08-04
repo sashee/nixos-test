@@ -18,8 +18,14 @@
 # excludes the present is how a test impersonates a resolver whose certificate is genuinely
 # expired while its clock stays correct -- the only way to exercise a client that defers the
 # date check and re-applies it later.
+#
+# `certChainWith` makes the server SEND certificates beyond its leaf that no path through it uses
+# (see tests/test-cert.nix). Python's `ssl.load_cert_chain` below is OpenSSL's
+# SSL_CTX_use_certificate_chain_file, which takes the first certificate as the leaf and offers the
+# rest as candidate issuers without validating or reordering them -- so whatever is listed here
+# really does go out on the wire, which is the point.
 { pkgs, dohStamps, readyFile ? "/tmp/doh-interceptor-ready", respond
-, certNotBefore ? null, certNotAfter ? null, name ? "doh-interceptor" }:
+, certNotBefore ? null, certNotAfter ? null, certChainWith ? [ ], name ? "doh-interceptor" }:
 
 let
   lib = pkgs.lib;
@@ -59,6 +65,7 @@ let
     sans = dohDomains;
     notBefore = certNotBefore;
     notAfter = certNotAfter;
+    chainWith = certChainWith;
   };
   inherit (certs) caFile certFile keyFile;
 

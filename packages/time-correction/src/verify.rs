@@ -7,16 +7,25 @@
 //!
 //! So the check is deferred rather than dropped:
 //!
-//!   pass 1, during the handshake -- verify at an instant taken from the chain's own
-//!     intersected validity window. Time is neutralised by construction (an instant inside
-//!     every certificate's window cannot fail a date check), so the handshake can only fail
-//!     on signatures, chain-to-a-trusted-root, or hostname. There is no fixed instant that
-//!     would do: the build floor precedes a freshly issued certificate's notBefore, the epoch
-//!     precedes every notBefore, and a far-future value follows every notAfter.
+//!   pass 1, during the handshake -- verify at the LEAF's own notBefore, falling back to the sent
+//!     chain's intersected window. Time is neutralised by construction (the leaf is on every path
+//!     webpki could build and a CA issues inside its own validity, so that instant satisfies the
+//!     path that gets used), so the handshake can only fail on signatures,
+//!     chain-to-a-trusted-root, or hostname. There is no fixed instant that would do: the build
+//!     floor precedes a freshly issued certificate's notBefore, the epoch precedes every
+//!     notBefore, and a far-future value follows every notAfter.
 //!
 //!   pass 2, after the response is read -- verify the same chain again, through the same
 //!     verifier, at the time the exchange reported. This is the real check, and it is what
 //!     makes an authenticated timestamp outside the chain's validity a hard failure.
+//!
+//! A peer sends whatever is in its chain file, and webpki date-checks only the certificates on
+//! the path it ends up building -- so "the chain" and "what was verified" are not the same set,
+//! and the difference is load-bearing in both passes. `spec/features/system/time-correction-details.md`
+//! states the rule: only certificates that were checked in pass 2 may decide whether this host's
+//! clock is already good enough. `verified_window` is where that is enforced, and pass 1's choice
+//! of instant is what keeps a certificate nothing uses from aborting the handshake on its way
+//! there.
 //!
 //! Both passes run the identical `WebPkiServerVerifier`, so pass 2 cannot accidentally be
 //! weaker than pass 1 -- and hostname and chain validation stay inside the library rather than
@@ -59,9 +68,12 @@ fn window_of(der: &CertificateDer<'_>) -> Result<(i64, i64), String> {
 
 /// The instants at which every window is simultaneously open.
 ///
-/// `None` when the intersection is empty. That is not an edge case to paper over: a chain
-/// whose leaf begins after an intermediate has expired is internally inconsistent, no instant
-/// satisfies it, and verifying it at any time we invent would be verifying a lie.
+/// `None` when the intersection is empty, which callers must treat as "no instant is known"
+/// rather than as "any instant will do". Note what an empty intersection over a SENT chain does
+/// not mean: not that the chain is unusable, only that the certificates in it do not all hold at
+/// once -- which is the normal state of a chain file carrying a superseded cross-sign. Deciding
+/// what to do about that is `verified_window`'s job and pass 1's; this function only does the
+/// arithmetic.
 pub fn intersect(windows: &[(i64, i64)]) -> Option<(i64, i64)> {
     let mut start = i64::MIN;
     let mut end = i64::MAX;
@@ -78,8 +90,13 @@ pub fn intersect(windows: &[(i64, i64)]) -> Option<(i64, i64)> {
     }
 }
 
-/// `intersect` over the validity windows of an actual chain.
-pub fn chain_window(
+/// `intersect` over the validity windows of an actual chain, as sent.
+///
+/// Private, and that is the point: "when is everything the peer sent valid at once" is not a
+/// question anything outside this file should be asking. It survives only as pass 1's fallback
+/// candidate, where no verification has happened yet and there is nothing better to go on.
+/// Callers deciding anything about the clock want `verified_window`.
+fn chain_window(
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
 ) -> Result<Option<(i64, i64)>, String> {
@@ -89,6 +106,64 @@ pub fn chain_window(
         .collect::<Result<_, _>>()?;
 
     Ok(intersect(&windows))
+}
+
+/// The validity window of every certificate a peer sent, in the order it sent them, `None` where
+/// one could not be parsed.
+///
+/// Deliberately not an intersection: which of these certificates matter is not knowable until
+/// something has verified the chain, so they are kept apart until `verified_window` can be handed
+/// an instant at which that has happened.
+pub fn chain_windows(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+) -> Vec<Option<(i64, i64)>> {
+    std::iter::once(end_entity)
+        .chain(intermediates.iter())
+        .map(|der| window_of(der).ok())
+        .collect()
+}
+
+/// The span over which the path that was verified at `seconds` is valid.
+///
+/// `windows` is `chain_windows` for the chain a peer sent, and `seconds` an instant at which
+/// verification has ALREADY succeeded. That precondition is what makes the filter sound: webpki
+/// date-checks every certificate on the path it built against the instant it was given, so a
+/// certificate whose own window excludes `seconds` provably was not on that path. It is something
+/// the peer sent and nothing used -- a superseded cross-sign left in a chain file is exactly that
+/// -- and giving it a vote on whether this clock is good enough would step a CORRECT clock on
+/// every run, since `now` and `seconds` are the same instant on a healthy host.
+///
+/// Certificates that are off the path but happen to be valid at `seconds` cannot be told apart
+/// from on-path ones, so they stay in and narrow the result. That is the safe direction and worth
+/// being explicit about: too narrow steps a clock that did not need it, and the step lands on a
+/// verified, quorum-agreed time; too wide stands down on a clock TLS cannot actually use, and then
+/// nothing recovers the host at all.
+///
+/// `None` -- "no window is known", which makes the caller step -- when any window could not be
+/// read, for that same reason: an unparseable certificate might be on the path, and dropping it
+/// silently would widen the answer.
+pub fn verified_window(windows: &[Option<(i64, i64)>], seconds: i64) -> Option<(i64, i64)> {
+    if windows.is_empty() || windows.iter().any(Option::is_none) {
+        return None;
+    }
+
+    let used: Vec<(i64, i64)> = windows
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|(not_before, not_after)| *not_before <= seconds && seconds <= *not_after)
+        .collect();
+
+    // Cannot happen after a successful verification -- the leaf is on every path, so it is valid
+    // at `seconds` -- but checked rather than assumed, because `intersect` over an empty slice is
+    // `Some((i64::MIN, i64::MAX))`. That is the one wrong answer here: it says "every instant is
+    // inside" at the moment nothing at all is known.
+    if used.is_empty() {
+        return None;
+    }
+
+    intersect(&used)
 }
 
 fn unix_time(seconds: i64) -> Result<UnixTime, String> {
@@ -201,35 +276,71 @@ impl ServerCertVerifier for TimeAgnosticVerifier {
         ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        let window = chain_window(end_entity, intermediates)
-            .map_err(Error::General)?
-            .ok_or_else(|| {
-                Error::General(
-                    "the certificate chain has no instant at which all of it is valid".to_string(),
-                )
-            })?;
+        // The leaf's own notBefore first, and the intersection over the whole sent chain only as
+        // a fallback. webpki's date check is inclusive at both ends, so the earliest valid instant
+        // is itself valid.
+        //
+        // The leaf rather than the intersection, because the leaf is the only certificate that is
+        // on every path webpki could build, and a CA issues inside its own validity -- so the
+        // leaf's notBefore satisfies the path that will actually be used, whatever else the peer
+        // sent. The intersection does not have that property: a superseded cross-sign or any other
+        // certificate the peer sends and nothing uses gets a vote, and one whose window does not
+        // overlap the leaf's makes the intersection EMPTY -- which used to abort the handshake and
+        // fail the whole run over a certificate that plays no part in it. Deferring the date check
+        // is pointless if an irrelevant date can still refuse the connection.
+        //
+        // The intersection is kept as a second candidate for the converse shape: a chain whose
+        // leaf predates an intermediate's notBefore, i.e. mis-issued or cross-signed later, where
+        // the leaf's own notBefore is not an instant the path satisfies. Trying both means this is
+        // never worse than the old rule, only better where the old one gave up.
+        //
+        // Neither instant is any more real than the other -- both are invented, and pass 2 against
+        // the reported time is the check that decides anything.
+        let leaf = window_of(end_entity).ok().map(|(not_before, _)| not_before);
+        let intersected = chain_window(end_entity, intermediates)
+            .ok()
+            .flatten()
+            .map(|(not_before, _)| not_before)
+            // The two coincide on any chain without an off-path certificate, which is most of
+            // them; filtering here rather than verifying twice for the same answer.
+            .filter(|at| Some(*at) != leaf);
+        let candidates: Vec<i64> = [leaf, intersected].into_iter().flatten().collect();
 
-        // The start of the window. webpki's date check is inclusive at both ends, so the
-        // earliest valid instant is itself valid, and using it keeps the choice independent
-        // of how wide the window happens to be.
-        let at = unix_time(window.0).map_err(Error::General)?;
-
-        let verified = self.verifier.inner.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            at,
-        )?;
-
-        // Recorded only on success, so a chain that failed pass 1 can never reach pass 2.
-        let mut chain = vec![end_entity.clone().into_owned()];
-        chain.extend(intermediates.iter().map(|c| c.clone().into_owned()));
-        if let Ok(mut seen) = self.seen.lock() {
-            *seen = Some(chain);
+        let mut last = Error::General(
+            "no certificate in the chain has a readable validity window".to_string(),
+        );
+        for at in candidates {
+            let at = match unix_time(at) {
+                Ok(at) => at,
+                Err(e) => {
+                    last = Error::General(e);
+                    continue;
+                }
+            };
+            match self.verifier.inner.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                at,
+            ) {
+                Ok(verified) => {
+                    // Recorded only on success, so a chain that failed pass 1 can never reach
+                    // pass 2 -- and only once, from the attempt that succeeded.
+                    let mut chain = vec![end_entity.clone().into_owned()];
+                    chain.extend(intermediates.iter().map(|c| c.clone().into_owned()));
+                    if let Ok(mut seen) = self.seen.lock() {
+                        *seen = Some(chain);
+                    }
+                    return Ok(verified);
+                }
+                Err(e) => last = e,
+            }
         }
 
-        Ok(verified)
+        // rustls' own error rather than a synthetic one: it names whether the failure was the
+        // signature, the chain, or the hostname, which is the only part worth acting on.
+        Err(last)
     }
 
     fn verify_tls12_signature(
@@ -261,13 +372,16 @@ impl ServerCertVerifier for TimeAgnosticVerifier {
 
 #[cfg(test)]
 mod tests {
-    //! The window arithmetic is what decides whether pass 1 can run at all, so it is tested
-    //! directly. Building real chains would need a certificate generator; the end-to-end
-    //! behaviour is covered by tests/time-correction.nix, which gives a provider a genuinely
-    //! expired certificate while its clock stays correct -- so the answer it returns is right and
-    //! pass 2 must still reject it -- and asserts the clock is left alone.
+    //! The window arithmetic decides both whether pass 1 can run at all and whether the clock is
+    //! stepped, so it is tested directly. Building real chains would need a certificate generator;
+    //! the end-to-end behaviour is covered by tests/time-correction.nix, which gives a provider a
+    //! genuinely expired certificate while its clock stays correct -- so the answer it returns is
+    //! right and pass 2 must still reject it -- and asserts the clock is left alone. That test also
+    //! has the interceptors SEND a certificate nothing on the path uses, which is the shape
+    //! `verified_window` exists for and the one no arithmetic fixture can prove is really ignored
+    //! by webpki rather than merely by this file.
 
-    use super::intersect;
+    use super::{intersect, verified_window};
 
     #[test]
     fn a_single_certificate_is_its_own_window() {
@@ -304,6 +418,79 @@ mod tests {
     #[test]
     fn an_expired_root_narrows_the_window_rather_than_being_ignored() {
         assert_eq!(intersect(&[(100, 500), (100, 150), (100, 120)]), Some((100, 120)));
+    }
+
+    #[test]
+    fn a_certificate_the_path_cannot_have_used_is_not_part_of_the_window() {
+        // The defect this function exists for. A peer sends its leaf plus a superseded cross-sign
+        // that expired at 200; webpki builds a path that does not include it and verifies fine at
+        // 500. Counting it would answer "TLS works only up to 200", and a host whose clock reads
+        // 500 -- the correct time -- would be stepped on every run.
+        assert_eq!(
+            verified_window(&[Some((100, 900)), Some((50, 200))], 500),
+            Some((100, 900))
+        );
+        // Same shape in the other direction: a certificate that is not valid YET.
+        assert_eq!(
+            verified_window(&[Some((100, 900)), Some((700, 1000))], 500),
+            Some((100, 900))
+        );
+        // And the shape that used to abort the handshake outright: no instant satisfies leaf and
+        // extra together, and the extra is still simply not part of the answer.
+        assert_eq!(
+            verified_window(&[Some((300, 900)), Some((50, 200))], 500),
+            Some((300, 900))
+        );
+    }
+
+    #[test]
+    fn a_certificate_that_could_have_been_used_still_narrows() {
+        // The other half of the rule, and the reason this is a filter rather than "just use the
+        // leaf": a certificate valid at `seconds` is indistinguishable from one on the path, so it
+        // stays in. Narrow is the safe direction -- it steps a clock that did not need it, onto a
+        // verified time, rather than standing down on a clock TLS cannot use.
+        assert_eq!(
+            verified_window(&[Some((100, 900)), Some((200, 600))], 500),
+            Some((200, 600))
+        );
+    }
+
+    #[test]
+    fn the_reported_time_is_always_inside_the_window() {
+        // The invariant the stand-down rule rests on: `seconds` came back from a chain that
+        // verified AT `seconds`, so the window derived from that chain has to contain it. Without
+        // this, `now` can sit outside a window on a host whose clock is right.
+        for windows in [
+            vec![Some((100, 900))],
+            vec![Some((100, 900)), Some((50, 200))],
+            vec![Some((100, 900)), Some((200, 600))],
+            vec![Some((100, 900)), Some((700, 1000)), Some((400, 800))],
+        ] {
+            let (not_before, not_after) =
+                verified_window(&windows, 500).expect("the leaf is valid at 500");
+            assert!(
+                (not_before..=not_after).contains(&500),
+                "500 outside [{not_before}, {not_after}] for {windows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_window_poisons_the_result() {
+        // Fail-closed, and note WHICH way closed is: `None` makes the caller step. An unparseable
+        // certificate might be on the path, so dropping it would widen the window -- the direction
+        // that leaves a host standing down on a clock TLS cannot use.
+        assert_eq!(verified_window(&[Some((100, 900)), None], 500), None);
+        assert_eq!(verified_window(&[], 500), None);
+    }
+
+    #[test]
+    fn a_chain_valid_nowhere_near_the_reported_time_yields_nothing() {
+        // Unreachable after a successful verification, since the leaf is on every path. Pinned
+        // because the alternative is `intersect` over an empty slice, which is
+        // `Some((i64::MIN, i64::MAX))` -- "every instant is inside" at the moment nothing is
+        // known, which would silently disable the step.
+        assert_eq!(verified_window(&[Some((100, 200))], 500), None);
     }
 
     #[test]

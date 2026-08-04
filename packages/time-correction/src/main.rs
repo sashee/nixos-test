@@ -106,9 +106,10 @@ usage: time-correction [options]
                                    vote comes from a different organisation still has to hold
   --timeout SECONDS                per-connection connect and read timeout (default: 10)
   --force                          step the clock even when it is already inside the validity
-                                   of every certificate seen, which is otherwise the one reason
-                                   to stand down. With --dry-run, this is how to check that the
-                                   configured servers still answer on a host whose clock is fine
+                                   of every certificate the verification used, which is
+                                   otherwise the one reason to stand down. With --dry-run, this
+                                   is how to check that the configured servers still answer on a
+                                   host whose clock is fine
   --dry-run                        report the decision without touching the clock
   --help                           this text
 ";
@@ -629,8 +630,11 @@ fn collect_answers(options: &Options, pairs: &[(Resolver, TimeServer)]) -> Colle
 
 /// The span over which every chain gathered this run is valid at once.
 ///
-/// "All the seen TLS certificates", in the spec's words -- every set's, on both of its legs, and
-/// including the redirect lookup when there was one. `run` refuses the whole run if any set
+/// "All TLS certificates used for the verification", in the spec's words -- every set's, on both of
+/// its legs, and including the redirect lookup when there was one. Used for, not merely seen: a
+/// certificate a peer sent that pass 2 did not check has already been dropped by
+/// `verify::verified_window`, which is what stops a superseded cross-sign in a provider's chain
+/// file from stepping a correct clock. `run` refuses the whole run if any set
 /// failed, so in practice every window here belongs to a set that contributed to the agreement;
 /// the intersection is nonetheless taken over whatever was gathered rather than over the quorum,
 /// because including an extra window can only narrow the result, and narrower means stepping more
