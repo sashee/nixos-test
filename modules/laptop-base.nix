@@ -15,6 +15,18 @@
 
   zramSwap.enable = true;
 
+  # Byte-based dirty-page writeback thresholds, replacing the kernel's
+  # RAM-proportional dirty_ratio/dirty_background_ratio defaults (20%/10%).
+  # Setting either byte knob zeroes its ratio counterpart, so these become the
+  # authoritative limits: writeback starts at 64 MiB of dirty pages and writers
+  # block at 256 MiB, instead of letting GBs of dirty pages accumulate on a
+  # 16-32 GB laptop and then stall in one burst. A host overrides with
+  # lib.mkForce (as anya-feher-laptop already does for bluetooth).
+  boot.kernel.sysctl = {
+    "vm.dirty_bytes" = 268435456;             # 256 MiB
+    "vm.dirty_background_bytes" = 67108864;   #  64 MiB
+  };
+
   hardware.bluetooth.enable = true;
 
   services.blueman.enable = true;

@@ -4,6 +4,8 @@
 
 * [./features/system.md]
 * DWARF/BTF disabled in the kernel due to disk space running out when compiling otherwise
+* vm.dirty_bytes = 67108864
+* vm.dirty_background_bytes = 16777216
 
 ## Wifi
 
