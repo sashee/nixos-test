@@ -46,7 +46,7 @@
 
 ## Dotfiles
 
-* ()(./features/dotfiles.md)
+* [](./features/dotfiles.md)
 
 ## Iroh SSH
 

@@ -1,5 +1,5 @@
 # Eval-only guard on lib/doh-stamps.nix `providers` as seen by modules/time-sync.nix -- the
-# `--doh NAME=HOSTNAME@ADDR[,ADDR]` arguments the rough clock is handed.
+# `--doh NAME=HOSTNAME@ADDR[,ADDR]` arguments the correction service is handed.
 #
 # tests/doh-endpoints.nix guards the sibling `endpoints` attrset, and deliberately never parses
 # an address: everything downstream of it is a `sdns://` stamp, where an unparseable address
@@ -10,13 +10,13 @@
 #     bare `attribute 'v4' missing` from inside a nixpkgs internal rather than anything that
 #     names the file at fault;
 #   * a malformed address reaches the binary verbatim and is rejected only at runtime, which
-#     means rough-time.service failing and restarting forever on every host -- and on the
+#     means time-correction.service failing on every host, once an hour, forever -- and on the
 #     RTC-less Pi that is the difference between a clock and no clock;
 #   * BRACKETING is the sharp one. `endpoints` brackets its IPv6 addresses because a stamp is a
 #     dial target; `providers` must not, because Rust's `IpAddr` rejects `[...]`. Someone
 #     "fixing" providers to match the bracketing rule that endpoints genuinely has would break
-#     every IPv6 endpoint for rough-time while dnscrypt-proxy kept working over IPv4 -- exactly
-#     the invisible-on-a-v4-host failure tests/doh-endpoints.nix:7-9 exists to prevent,
+#     every IPv6 endpoint for time-correction while dnscrypt-proxy kept working over IPv4 --
+#     exactly the invisible-on-a-v4-host failure tests/doh-endpoints.nix:7-9 exists to prevent,
 #     reproduced one layer up;
 #   * `=`, `@` and `,` are the spec's own separators, so one appearing in a name, hostname or
 #     address silently reshapes the argument into a different provider than intended.
@@ -119,7 +119,7 @@ let
 
   countDrift = lib.optional (
     builtins.length names < 2
-  ) "only ${toString (builtins.length names)} provider(s) (${toString names}): the rough clock samples two and requires both to agree, so fewer than two can never set a clock";
+  ) "only ${toString (builtins.length names)} provider(s) (${toString names}): the correction service samples two and requires both to agree, so fewer than two can never set a clock";
 
   errors = providerDrift ++ specDrift ++ countDrift;
 in
@@ -129,11 +129,11 @@ if errors != [ ] then
 
     ${lib.concatStringsSep "\n  " errors}
 
-    These become the --doh arguments of rough-time.service on every host. A bad entry
-    does not fail the build: it fails at boot, on the one host that has no other way to learn
-    what time it is, and it fails there forever.
+    These become the --doh arguments of time-correction.service on every host. A bad entry
+    does not fail the build: it fails on every run of the service, on the one host that has no
+    other way to learn what time it is, and it keeps failing until someone fixes the entry.
   ''
 else
   pkgs.runCommand "doh-providers-check" { } ''
-    echo "${toString (builtins.length names)} DoH providers usable as rough-time sources" > $out
+    echo "${toString (builtins.length names)} DoH providers usable as time-correction sources" > $out
   ''

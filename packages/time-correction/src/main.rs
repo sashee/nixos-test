@@ -1,5 +1,5 @@
-//! Establish a rough system clock at boot, so that everything downstream which needs TLS can
-//! work at all.
+//! Correct the system clock without trusting it, so that everything downstream which needs TLS
+//! can work at all.
 //!
 //! The hosts in this repo resolve names over DoH and synchronise time over NTS. Both are TLS,
 //! so a clock outside certificate validity blocks name resolution and time synchronisation at
@@ -24,9 +24,16 @@
 //! the deferred check is what is being traded on, and NTS does not change it. What NTS buys is
 //! that every configured server can answer, rather than the two of four that emitted a `Date`.
 //!
-//! Runs as a systemd oneshot that restarts until it succeeds (see `modules/time-sync.nix`).
-//! A failed run exits non-zero and is retried, which keeps the failure visible in
-//! `systemctl status` rather than hidden in an internal retry loop.
+//! Runs as a systemd oneshot on a timer -- once after boot, then every hour (see
+//! `modules/time-sync.nix`). A failed run exits non-zero and the next attempt is the timer's,
+//! which keeps the failure visible in `systemctl status` rather than hidden in an internal retry
+//! loop.
+//!
+//! The exchange is never skipped, even on a host whose clock is demonstrably fine. That is
+//! deliberate: it makes each run a check that the DoH and NTS paths still work, taken while the
+//! host is still healthy enough to report it, rather than only a repair for a clock that has
+//! already broken. What the run declines to do in that case is *step* the clock -- see
+//! `reason_to_stand_down`.
 
 mod deferred;
 mod dns;
@@ -78,7 +85,7 @@ struct Options {
 }
 
 const USAGE: &str = "\
-usage: rough-time [options]
+usage: time-correction [options]
 
   --doh NAME=HOSTNAME@ADDR[,ADDR]  a DoH resolver, dialled at the given addresses with the
                                    hostname used for SNI and certificate verification.
@@ -95,14 +102,11 @@ usage: rough-time [options]
   --only NAME[,NAME]               ask exactly these NTS servers instead of sampling; for
                                    tests, which need the choice to be deterministic
   --timeout SECONDS                per-connection connect and read timeout (default: 10)
-  --force                          ask even if the clock is already synchronised. With
-                                   --dry-run, this is how to check that the configured servers
-                                   still answer on a host whose clock is fine
+  --force                          step the clock even when it is already inside the validity
+                                   of every certificate seen, which is otherwise the one reason
+                                   to stand down. With --dry-run, this is how to check that the
+                                   configured servers still answer on a host whose clock is fine
   --dry-run                        report the decision without touching the clock
-  --check-synced                   exit 0 if the kernel reports the clock synchronised and 1 if
-                                   not, contacting nothing. Exists so that whatever waits for
-                                   synchronisation uses the same definition of it this program
-                                   does, instead of a second one written in shell
   --help                           this text
 ";
 
@@ -154,13 +158,12 @@ fn parse_server(spec: &str) -> Result<TimeServer, String> {
     })
 }
 
-/// What the command line asked for. Three genuinely different things, rather than one of them
-/// with flags: `--help` and `--check-synced` need none of the resolver and server configuration
-/// that `Run` cannot work without, so the validation below must not apply to them.
+/// What the command line asked for. Two genuinely different things, rather than one with a flag:
+/// `--help` needs none of the resolver and server configuration that `Run` cannot work without,
+/// so the validation below must not apply to it.
 #[derive(Debug)]
 enum Action {
     Help,
-    CheckSynced,
     Run(Options),
 }
 
@@ -184,7 +187,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Action, String> {
         };
         match arg.as_str() {
             "--help" | "-h" => return Ok(Action::Help),
-            "--check-synced" => return Ok(Action::CheckSynced),
             "--doh" => options.resolvers.push(parse_resolver(&value("--doh")?)?),
             "--nts" => options.servers.push(parse_server(&value("--nts")?)?),
             "--sample" => {
@@ -272,32 +274,6 @@ fn distinct_operators(servers: &[TimeServer]) -> Vec<String> {
     operators
 }
 
-/// True when the kernel reports the clock as disciplined, in which case an authenticated
-/// source already owns it and this program must not overwrite it.
-///
-/// `STA_UNSYNC` is the kernel's own answer rather than a proxy for it: it is clear only because
-/// something synchronised the clock and told the kernel so, which chrony does (via `rtcsync`;
-/// see the comment in modules/time-sync.nix) and this program does not.
-///
-/// This can never be true because of a previous run: `ntp_clear()`, which the kernel calls from
-/// `do_settimeofday64()`, re-sets `STA_UNSYNC` on every clock step. "Rough time set" and
-/// "synchronised" therefore stay distinct states, which is what makes the check meaningful.
-fn clock_is_disciplined() -> bool {
-    // SAFETY: the one raw call in this crate. `adjtimex` reads the caller's `timex` and writes
-    // its result back into it; `modes = 0` makes that a pure query, so no other field is
-    // interpreted as a request. `timex` is a plain struct of integers, so an all-zero value is
-    // valid, and `buf` is uniquely owned by this frame for the whole call, so the pointer is
-    // valid and non-aliased. rustix 1.x does not bind adjtimex and the crates that do are
-    // unvetted, so AGENTS.md's no-unsafe preference yields to interoperability here.
-    let mut buf: libc::timex = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::adjtimex(&mut buf) };
-
-    // A negative return is a failed call, not evidence of a good clock. Otherwise read the bit
-    // directly rather than comparing the return against TIME_ERROR: TIME_ERROR also covers
-    // STA_CLOCKERR, and it is specifically "nothing has synchronised this clock" we care about.
-    result >= 0 && (buf.status & libc::STA_UNSYNC) == 0
-}
-
 /// Whether the clock is far enough wrong to be worth stepping, given the span over which the
 /// certificates behind the answer are simultaneously valid.
 ///
@@ -375,12 +351,28 @@ fn seed() -> u64 {
     }
 }
 
+/// The build-time floor, applied to one provider's own reported timestamp.
+///
+/// Split out from `ask_pair` because it is the only decision in that function that is a pure
+/// function of two numbers, and it is the one worth a fixture: it bounds how far backwards a
+/// compromised pair could roll this clock, and getting the comparison's direction or its
+/// boundary wrong would silently remove that bound.
+fn refuse_below_floor(seconds: i64, floor: i64) -> Result<(), String> {
+    if seconds < floor {
+        return Err(format!(
+            "refusing {seconds}: earlier than the build-time floor {floor}. Retroactive certificate validation proves a chain was valid at the claimed time, not that the claimed time is now, so a once-valid certificate could otherwise roll this clock backwards"
+        ));
+    }
+    Ok(())
+}
+
 /// One (resolver, server) pair, taken all the way from a hostname to a verified timestamp and the
 /// window over which the certificates behind it are valid.
 fn ask_pair(
     verifier: Arc<verify::Verifier>,
     resolver: &Resolver,
     server: &TimeServer,
+    floor: i64,
     timeout: Duration,
 ) -> Result<(i64, Option<(i64, i64)>), String> {
     let mut deferred = deferred::Deferred::new();
@@ -494,19 +486,31 @@ fn ask_pair(
 
     let seconds = timeserver::ask_time(&established, address, port, unique_id, nonce, timeout)?;
 
+    // The floor, per set, and BEFORE pass 2 -- which is the order the spec states and not merely
+    // an optimisation. Pass 2 asks "was this chain valid at the claimed instant", so it accepts a
+    // once-valid certificate presented alongside a date inside its old validity window: exactly
+    // the rollback the floor exists to bound. Rejecting the claim first means a chain can never be
+    // re-verified against a time this host has already refused to believe.
+    refuse_below_floor(seconds, floor)?;
+
     // Pass 2, on every chain gathered on the way here. There is no other way to get a number
     // out of this function.
     let verified = deferred.accept(&verifier, seconds)?;
     Ok((verified.seconds(), verified.window()))
 }
 
-/// The answers that came back, and the validity windows of the chains that vouched for them.
+/// The answers that came back, the validity windows of the chains that vouched for them, and
+/// whatever went wrong on the way.
 ///
 /// The windows are kept beside the answers rather than inside `Answer` so that `quorum` stays a
 /// pure function of times and operators, which is the whole reason its rules are testable.
+///
+/// `failures` is carried rather than only logged because the spec makes any error fail the run:
+/// the caller has to be able to say what went wrong, not merely that a vote was short.
 struct Collected {
     answers: Vec<Answer>,
     windows: Vec<Option<(i64, i64)>>,
+    failures: Vec<String>,
 }
 
 fn collect_answers(options: &Options, pairs: &[(Resolver, TimeServer)]) -> Collected {
@@ -514,10 +518,10 @@ fn collect_answers(options: &Options, pairs: &[(Resolver, TimeServer)]) -> Colle
     {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("error: {e}");
             return Collected {
                 answers: Vec::new(),
                 windows: Vec::new(),
+                failures: vec![format!("the trust store could not be loaded: {e}")],
             };
         }
     };
@@ -530,8 +534,9 @@ fn collect_answers(options: &Options, pairs: &[(Resolver, TimeServer)]) -> Colle
             .map(|(resolver, server)| {
                 let verifier = verifier.clone();
                 let timeout = options.timeout;
+                let floor = options.floor;
                 scope.spawn(move || {
-                    let outcome = ask_pair(verifier, resolver, server, timeout);
+                    let outcome = ask_pair(verifier, resolver, server, floor, timeout);
                     (server.clone(), resolver.name.clone(), outcome)
                 })
             })
@@ -540,9 +545,13 @@ fn collect_answers(options: &Options, pairs: &[(Resolver, TimeServer)]) -> Colle
         let mut collected = Collected {
             answers: Vec::new(),
             windows: Vec::new(),
+            failures: Vec::new(),
         };
         for handle in handles {
             let Ok((server, resolver, outcome)) = handle.join() else {
+                collected
+                    .failures
+                    .push("a provider thread panicked".to_string());
                 continue;
             };
             match outcome {
@@ -558,8 +567,13 @@ fn collect_answers(options: &Options, pairs: &[(Resolver, TimeServer)]) -> Colle
                 Err(e) => {
                     // The message already names the leg -- resolution, key establishment and
                     // the NTP exchange are three different faults, and a summary that
-                    // collapsed them would send whoever reads it to the wrong place.
+                    // collapsed them would send whoever reads it to the wrong place. Logged
+                    // here as well as returned, so the ordering in the journal still shows
+                    // which pairs answered and which did not.
                     eprintln!("{} via {resolver}: {e}", server.name);
+                    collected
+                        .failures
+                        .push(format!("{} via {resolver}: {e}", server.name));
                 }
             }
         }
@@ -569,10 +583,12 @@ fn collect_answers(options: &Options, pairs: &[(Resolver, TimeServer)]) -> Colle
 
 /// The span over which every chain gathered this run is valid at once.
 ///
-/// Every answer's window, not only the quorum's: an answer that lost the vote still presented a
-/// chain that passed both passes, and including it can only narrow the result. Narrower means
-/// stepping more often, which is the safe direction for a decision about whether the clock is
-/// already good enough.
+/// "All the seen TLS certificates", in the spec's words -- every set's, on both of its legs, and
+/// including the redirect lookup when there was one. `run` refuses the whole run if any set
+/// failed, so in practice every window here belongs to a set that contributed to the agreement;
+/// the intersection is nonetheless taken over whatever was gathered rather than over the quorum,
+/// because including an extra window can only narrow the result, and narrower means stepping more
+/// often -- the safe direction for a decision about whether the clock is already good enough.
 fn common_window(windows: &[Option<(i64, i64)>]) -> Option<(i64, i64)> {
     if windows.is_empty() || windows.iter().any(Option::is_none) {
         return None;
@@ -641,11 +657,6 @@ fn choose(options: &Options, seed: u64) -> Result<Vec<(Resolver, TimeServer)>, S
 }
 
 fn run(options: Options) -> Result<(), String> {
-    if !options.force && clock_is_disciplined() {
-        println!("the clock is already synchronised; leaving it alone");
-        return Ok(());
-    }
-
     let pairs = choose(&options, seed())?;
     let sampled: Vec<String> = pairs.iter().map(|(_, s)| s.operator.clone()).collect();
     eprintln!(
@@ -658,7 +669,22 @@ fn run(options: Options) -> Result<(), String> {
     );
 
     let collected = collect_answers(&options, &pairs);
-    let seconds = quorum::decide(&sampled, &collected.answers, options.tolerance, options.floor)?;
+
+    // Any error fails the run, before the quorum is consulted at all. `decide` would refuse this
+    // anyway -- every sampled operator must answer -- but it can only report "N of M gave no
+    // usable answer", and the reason each one failed is the only part worth acting on. Every
+    // failure is named rather than the first: several pairs can break in one round, and a message
+    // naming one of them sends whoever reads it looking at the wrong provider.
+    if !collected.failures.is_empty() {
+        return Err(format!(
+            "{} of {} provider pairs failed: {}",
+            collected.failures.len(),
+            pairs.len(),
+            collected.failures.join("; ")
+        ));
+    }
+
+    let seconds = quorum::decide(&sampled, &collected.answers, options.tolerance)?;
     let window = common_window(&collected.windows);
 
     if options.dry_run {
@@ -681,28 +707,22 @@ fn run(options: Options) -> Result<(), String> {
 
 /// Why the clock should be left as it is, or `None` if it should be stepped.
 ///
-/// Both tests belong here rather than at the top of `run`, because both are about the state the
-/// clock is in *now*, after the exchange, and the exchange takes seconds during which that state
-/// can change.
+/// The one rule, and it is asked here rather than before the exchange because it is about the
+/// state the clock is in *now*: the exchange takes seconds, during which chrony may have stepped
+/// the clock itself.
+///
+/// There used to be a second rule -- ask the kernel via `adjtimex` whether `STA_UNSYNC` is clear,
+/// and stand down if something had already disciplined the clock. It is gone, and nothing is lost
+/// by that, because the window rule subsumes it: a clock chrony has disciplined sits inside the
+/// validity of every certificate on the path by construction, so this returns a reason anyway.
+/// What its removal buys is that the exchange is no longer skipped on a healthy host, which is
+/// what makes each run evidence that DoH and NTS still work rather than only a repair.
 fn reason_to_stand_down(
     options: &Options,
     window: Option<(i64, i64)>,
 ) -> Result<Option<String>, String> {
     if options.force {
         return Ok(None);
-    }
-
-    // Asked again, having also been asked before the exchange. That earlier check is only an
-    // optimization -- it saves the exchange on a host whose clock is already fine -- and it
-    // cannot cover the common case on its own: STA_UNSYNC is always set at boot, so on a warm
-    // reboot the early check never fires, while chronyd starts alongside this program -- nothing
-    // orders the two, see modules/time-sync.nix -- and with cached NTS cookies can synchronise in
-    // well under a second. Without this, the exchange finishes moments later and overwrites an
-    // accurate clock with a whole-second approximation of it.
-    if clock_is_disciplined() {
-        return Ok(Some(
-            "something synchronised the clock while we were asking".to_string(),
-        ));
     }
 
     let now = wall_clock()?;
@@ -721,15 +741,6 @@ fn main() -> ExitCode {
         Ok(Action::Help) => {
             print!("{USAGE}");
             ExitCode::SUCCESS
-        }
-        Ok(Action::CheckSynced) => {
-            if clock_is_disciplined() {
-                println!("the clock is synchronised");
-                ExitCode::SUCCESS
-            } else {
-                println!("the clock is not synchronised");
-                ExitCode::FAILURE
-            }
         }
         Ok(Action::Run(options)) => match run(options) {
             Ok(()) => ExitCode::SUCCESS,
@@ -863,21 +874,25 @@ mod tests {
 
     #[test]
     fn force_is_off_by_default() {
-        // A default-on --force would overwrite a chrony-disciplined clock on every boot, which
-        // is the one thing the adjtimex check exists to prevent.
+        // --force is the only thing that can override the certificate-window rule, and that rule
+        // is now the only protection a chrony-disciplined clock has against being stepped by an
+        // hourly run. A default-on --force would step it every hour.
         assert!(!options(&[]).force);
         assert!(options(&["--force"]).force);
     }
 
     #[test]
-    fn help_and_check_synced_short_circuit_before_validation() {
-        // Both are reachable with no --doh or --nts at all, which is the point: the unwedge unit
-        // asks --check-synced about the kernel, not about any server.
+    fn help_short_circuits_before_validation() {
+        // Reachable with no --doh or --nts at all: asking for the usage text must not depend on
+        // being configured well enough to run.
         assert!(matches!(parse(&["--help"]), Ok(Action::Help)));
-        assert!(matches!(
-            parse(&["--check-synced"]),
-            Ok(Action::CheckSynced)
-        ));
+    }
+
+    #[test]
+    fn check_synced_is_gone() {
+        // The kernel's STA_UNSYNC is no longer consulted anywhere, so the flag that exposed it
+        // must not linger as an argument that silently parses into a run with no servers.
+        assert!(parse(&["--check-synced"]).is_err());
     }
 
     #[test]
@@ -898,6 +913,21 @@ mod tests {
         assert!(needs_setting(201, Some((100, 200))));
         // The case this program exists for: an RTC-less host booting at the epoch.
         assert!(needs_setting(0, Some((1_785_000_000, 1_800_000_000))));
+    }
+
+    #[test]
+    fn floor_rejects_a_time_before_it() {
+        const FLOOR: i64 = 1_700_000_000;
+        // Forward-only, and inclusive at the boundary: a build that happened at exactly this
+        // instant must not refuse the instant it happened at.
+        assert!(refuse_below_floor(FLOOR - 1, FLOOR)
+            .unwrap_err()
+            .contains("earlier than the build-time floor"));
+        assert!(refuse_below_floor(FLOOR, FLOOR).is_ok());
+        assert!(refuse_below_floor(FLOOR + 1, FLOOR).is_ok());
+        // The state this program is written for: an RTC-less host whose provider is being
+        // impersonated with a certificate that expired before the build.
+        assert!(refuse_below_floor(0, FLOOR).is_err());
     }
 
     #[test]

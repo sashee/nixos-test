@@ -1,7 +1,7 @@
 { lib, rustPlatform }:
 
 rustPlatform.buildRustPackage {
-  pname = "rough-time";
+  pname = "time-correction";
   version = "0.1.0";
 
   src = lib.sourceByRegex ./. [
@@ -12,8 +12,8 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
 
   meta = {
-    description = "Establish a rough system clock at boot from an authenticated NTS timestamp, resolving the server over DoH";
+    description = "Correct the system clock from an authenticated NTS timestamp, resolving the server over DoH";
     license = with lib.licenses; [ mit asl20 ];
-    mainProgram = "rough-time";
+    mainProgram = "time-correction";
   };
 }

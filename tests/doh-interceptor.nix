@@ -11,7 +11,7 @@
 # -- and only `.providers` is used here.
 #
 # Used by tests/doh-upstream.nix, tests/iroh-ssh.nix, tests/connectivity-watchdog.nix,
-# tests/rough-time.nix and tests/nts-sync.nix.
+# tests/time-correction.nix and tests/nts-sync.nix.
 #
 # `certNotBefore` / `certNotAfter` pin the leaf's validity window (see tests/test-cert.nix).
 # Both default to null, i.e. the 100-year certificate every existing caller gets. A window that
@@ -161,16 +161,17 @@ let
   #
   # `nodad` on the IPv6 adds, and it is load-bearing rather than tidiness. A test may run two
   # interceptor nodes on one segment holding the SAME provider addresses, choosing between them
-  # by routing (tests/rough-time.nix does exactly that) -- and those addresses are then genuine
+  # by routing (tests/time-correction.nix does exactly that) -- and those addresses are then genuine
   # duplicates, so whichever node adds one second loses duplicate address detection and has it
   # marked `dadfailed`, permanently unusable for the rest of the run:
   #
   #   dohgood # IPv6: eth1: IPv6 duplicate address 2620:fe::10 used by 52:54:00:12:01:02 detected!
   #
   # The race is per address, so each run left a different random subset of each node's addresses
-  # dead. It hid for a while because rough-time draws its resolver at random and a retry loop
-  # rerolls the draw, so a partial loss looks like slowness; the aarch64 run where dohgood lost
-  # all four failed outright. IPv4 has no DAD, which is why only the v6 path ever showed it.
+  # dead. It hid for a while because time-correction draws its resolver at random and, at the
+  # time, a retry loop rerolled the draw -- so a partial loss looked like slowness; the aarch64
+  # run where dohgood lost all four failed outright. IPv4 has no DAD, which is why only the v6
+  # path ever showed it.
   #
   # Duplicates on one segment are fine here because nothing resolves these addresses on-link:
   # callers route to them `via` each node's own unique address. Same idiom as

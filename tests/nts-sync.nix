@@ -1,18 +1,18 @@
-# Raised from 1200 when the unwedge node arrived: its three subtests are two 120s countdowns
-# plus a real reboot, and the ceiling should stay above the sum of the waits inside the test so a
-# slow run fails on the subtest that was slow rather than on the global deadline.
-{ nixpkgs, pkgs, stateVersion, machineModule, dohStamps, globalTimeout ? 1800 }:
+# Back to 1200 now that the unwedge node is gone (it added two 120s countdowns plus a real
+# reboot). The ceiling should stay above the sum of the waits inside the test so a slow run fails
+# on the subtest that was slow rather than on the global deadline.
+{ nixpkgs, pkgs, stateVersion, machineModule, dohStamps, globalTimeout ? 1200 }:
 
-# The whole time chain, on the real host config: rough clock -> DNS -> chrony over NTS.
+# The whole time chain, on the real host config: correction service -> DNS -> chrony over NTS.
 #
-# tests/rough-time.nix covers the rough clock itself -- its quorum, floor and deferred
+# tests/time-correction.nix covers the correction service itself -- its quorum, floor and deferred
 # certificate checks -- against controlled DoH resolvers and NTS servers. This covers what
 # happens after it, and it is the only place the bootstrap deadlock is actually reproduced
 # rather than described:
 #
 #   the machine boots with its clock years out, so DoH's TLS cannot validate and no name
-#   resolves; rough-time reaches the DoH providers by pinned address, resolves an NTS server
-#   through them, takes an authenticated timestamp from it and sets a rough clock; DNS starts
+#   resolves; time-correction reaches the DoH providers by pinned address, resolves an NTS server
+#   through them, takes an authenticated timestamp from it and corrects the clock; DNS starts
 #   working; chronyd resolves the NTS hostnames itself and synchronises over NTS-KE.
 #
 # Nothing about the machine is reconfigured to make that work. It runs the deployed chrony
@@ -73,6 +73,11 @@ let
     system.stateVersion = stateVersion;
   };
 
+  # chrony's drift file, and so the persisted last-known-good time `chronyd -s` reads. The path
+  # is the nixpkgs chrony module's (`${services.chrony.directory}/chrony.drift`), restated here
+  # because the driver has to stat and touch it and there is no option exposing it.
+  driftFile = "/var/lib/chrony/chrony.drift";
+
   interceptor = import ./doh-interceptor.nix {
     inherit pkgs dohStamps;
     name = "nts-sync";
@@ -93,44 +98,6 @@ let
           return a(query, mapping[name])
     '';
   };
-  # Clears STA_UNSYNC without moving the clock, so "something synchronised the clock while
-  # rough-time was mid-exchange" can be staged at a chosen instant rather than raced for.
-  # Nothing but this test has any use for it; it exists only on the test node.
-  clearUnsync = pkgs.writers.writePython3Bin "clear-unsync" { } ''
-    import ctypes
-    import ctypes.util
-
-
-    class Timex(ctypes.Structure):
-        _fields_ = [("modes", ctypes.c_uint), ("offset", ctypes.c_long),
-                    ("freq", ctypes.c_long), ("maxerror", ctypes.c_long),
-                    ("esterror", ctypes.c_long), ("status", ctypes.c_int),
-                    ("constant", ctypes.c_long), ("precision", ctypes.c_long),
-                    ("tolerance", ctypes.c_long), ("tv_sec", ctypes.c_long),
-                    ("tv_usec", ctypes.c_long), ("tick", ctypes.c_long),
-                    ("ppsfreq", ctypes.c_long), ("jitter", ctypes.c_long),
-                    ("shift", ctypes.c_int), ("stabil", ctypes.c_long),
-                    ("jitcnt", ctypes.c_long), ("calcnt", ctypes.c_long),
-                    ("errcnt", ctypes.c_long), ("stbcnt", ctypes.c_long),
-                    ("tai", ctypes.c_int), ("pad", ctypes.c_int * 11)]
-
-
-    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-    buf = Timex()
-    assert libc.adjtimex(ctypes.byref(buf)) >= 0, "adjtimex read failed"
-    buf.status &= ~0x0040  # STA_UNSYNC
-    # Clearing the bit alone is not enough. The kernel grows time_maxerror
-    # every second and re-sets STA_UNSYNC once it reaches NTP_PHASE_LIMIT,
-    # and on a clock that has been unsynchronised it is already pinned
-    # there -- so the bit came back within a second, and rough-time saw it
-    # set again eighteen seconds into its exchange. Real daemons reset
-    # these on every update; so must this.
-    buf.maxerror = 0
-    buf.esterror = 0
-    # ADJ_MAXERROR | ADJ_ESTERROR | ADJ_STATUS
-    buf.modes = 0x0004 | 0x0008 | 0x0010
-    assert libc.adjtimex(ctypes.byref(buf)) >= 0, "adjtimex write failed"
-  '';
 in
 
 nixpkgs.lib.nixos.runTest {
@@ -138,7 +105,7 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
   skipTypeCheck = true;
 
-  # Ceiling, not a wait: five VMs, two reboots, and several chrony synchronisations, all under
+  # Ceiling, not a wait: four VMs, a reboot, and several chrony synchronisations, all under
   # TCG emulation on the KVM-less aarch64 runner.
   inherit globalTimeout;
 
@@ -171,7 +138,7 @@ nixpkgs.lib.nixos.runTest {
 
   nodes.machine = { lib, ... }: {
     imports = [ machineModule ];
-    environment.systemPackages = [ clearUnsync pkgs.iproute2 ];
+    environment.systemPackages = [ pkgs.iproute2 ];
 
     networking.hostName = "nts-sync-test";
 
@@ -190,116 +157,40 @@ nixpkgs.lib.nixos.runTest {
       enable = lib.mkForce true;
       servers = lib.mkForce [ goodHost liarHost ];
       # Well below any date this test uses, so the floor never masks a different failure --
-      # tests/rough-time.nix is where the floor itself is exercised.
+      # tests/time-correction.nix is where the floor itself is exercised.
       floor = lib.mkForce 1000000000;
-      # Headroom for the mid-exchange subtest, which slows the network deliberately. Nothing
-      # here exercises an unreachable provider, so the short timeout that keeps
-      # tests/rough-time.nix brisk buys nothing.
+      # Nothing here exercises an unreachable provider, so the short timeout that keeps
+      # tests/time-correction.nix brisk buys nothing.
       timeoutSeconds = 10;
-      # No unwedge unit on THIS node. Several subtests below deliberately leave the machine
-      # unsynchronised for 60-90s at a stretch -- a blocked NTS port, a skewed source -- and a
-      # unit whose whole job is to reboot an unsynchronised host would fire in the middle of
-      # them. The unwedge node below owns that behaviour instead.
-      unwedgeSeconds = null;
+      # The correction service is driven by hand throughout: several subtests park the clock in
+      # 2001 for a minute or more at a stretch, and a timed run landing in the middle of one
+      # would step the clock back out from under it. `bootDelay` past the end of the run leaves
+      # the timer installed and deployed-shaped while giving the driver sole control of when the
+      # unit actually runs.
+      bootDelay = "3h";
     };
 
-    # Both CAs: the DoH interceptor's, so dnscrypt-proxy and rough-time accept it, and the NTS
+    # The ONE thing about chrony this node changes, and it changes a tempo rather than a
+    # mechanism: how often chronyd rewrites its drift file, which is the persisted last-known-good
+    # time the spec's "must write ... regularly" is about.
+    #
+    # chrony's default interval is 3600s and the nixpkgs module emits `driftfile <path>` with no
+    # way to pass one, so observing a periodic write on the deployed cadence would need an hour of
+    # guest time. `interval 1` makes it every clock update instead, so the write becomes visible
+    # in seconds. Everything else about the mechanism -- the path, the trigger, the fact that
+    # chronyd can write there at all under the unit's hardening -- is exactly as deployed.
+    #
+    # A second `driftfile` line is an override rather than a duplicate: chrony's parser does
+    # `Free(drift_file); drift_file = Strdup(path)` and takes `interval` from whichever line came
+    # last (chrony 4.8 conf.c:1771-1789). mkAfter, because the nixpkgs module interpolates
+    # `extraConfig` at the END of chrony.conf and our own module contributes `minsources` and
+    # `rtcsync` to it -- so this has to be the last definition to be the last line.
+    services.chrony.extraConfig = lib.mkAfter ''
+      driftfile ${driftFile} interval 1
+    '';
+
+    # Both CAs: the DoH interceptor's, so dnscrypt-proxy and time-correction accept it, and the NTS
     # servers', so chrony's NTS-KE does. Nothing else about the node changes.
-    security.pki.certificateFiles = [ interceptor.caFile ntsCert.caFile ];
-
-    system.stateVersion = stateVersion;
-  };
-
-  # A second machine, for the reboot failsafe alone. Its own node because the behaviour under
-  # test is a reboot on a timer, which cannot share a machine with subtests that need the host to
-  # sit unsynchronised on purpose -- and because it has to survive two reboots with its network
-  # intact, which runtime routes do not.
-  nodes.unwedge = { lib, nodes, ... }: {
-    imports = [ machineModule ];
-
-    networking.hostName = "unwedge-test";
-
-    common.autoUpgrade.enable = lib.mkForce false;
-    common.monitoring.enable = lib.mkForce false;
-    common.irohSsh.enable = lib.mkForce false;
-    common.systemMetrics.enable = lib.mkForce false;
-
-    # wedge_chrony steps this node's clock too, and it survives two reboots -- so the Persistent
-    # nix-gc.timer has three chances to fire during the countdowns. See the machine node above.
-    nix.gc.automatic = lib.mkForce false;
-
-    common.timeSync = {
-      enable = lib.mkForce true;
-      servers = lib.mkForce [ goodHost liarHost ];
-      floor = lib.mkForce 1000000000;
-      timeoutSeconds = 10;
-      # The module's floor, so the run is as short as the assertion allows.
-      unwedgeSeconds = 120;
-    };
-
-    # Started by the driver, not by the boot. The countdown is 120s from the moment rough-time
-    # succeeds, which on a normal boot is before the driver has finished attaching to this node
-    # at all -- so left to start itself, the reboot lands in the middle of whichever driver call
-    # is in flight and the test dies of a broken pipe rather than of anything it meant to check
-    # (observed). Everything the unit actually decides -- the Requires on rough-time, the wait,
-    # the breadcrumb, the stand-down -- is exercised either way; only the clock starts on cue.
-    systemd.services.time-sync-unwedge.wantedBy = lib.mkForce [ ];
-
-    # In the configuration rather than applied by the driver, because this node reboots twice and
-    # each boot has to come back with the resolver reachable. The v6 provider addresses are made
-    # unreachable for the same reason connect_upstream does it: this network has no v6 route to
-    # them, and failing fast beats paying timeoutSeconds per address.
-    #
-    # Its own unit rather than networking.localCommands: that runs `before network.target` and
-    # therefore before network-addresses-eth1 has assigned anything, so installing a route via a
-    # gateway on eth1's subnet fails with "Nexthop has invalid gateway" (observed). What this
-    # needs is to be after the addresses and before the first rough-time attempt.
-    #
-    # `network.target` is NOT that point, which cost an aarch64 CI run. It is a passive
-    # synchronisation target, so on a slow runner where eth1 appears late it is reached before
-    # the addresses are assigned at all:
-    #
-    #   [188.4] Reached target Network.
-    #   [190.2] doh-routes-start: Error: Nexthop has invalid gateway.
-    #   [190.3] Starting Address configuration of eth1...
-    #   [193.8] network-addresses-eth1-start: adding address 192.168.1.5/24... done
-    #   [204.5] Reached target Network is Online.
-    #
-    # Hence network-online.target, which is the first point after the addresses. And hence the
-    # retry: with no Restart= that single failure was permanent, so the node spent the whole run
-    # with no route to the resolver and rough-time failed every 30s for fourteen minutes. A loop
-    # rather than Restart=on-failure keeps this clear of systemd's start rate limit (see
-    # tests/system-metrics.nix:86). The last attempt is not swallowed, so a gateway that never
-    # becomes valid still fails the unit loudly instead of leaving the cause to be guessed at.
-    systemd.services.doh-routes = {
-      description = "Point the DoH provider addresses at the interceptor";
-      wantedBy = [ "multi-user.target" ];
-      wants = [ "network-online.target" ];
-      after = [ "network.target" "network-online.target" ];
-      before = [ "rough-time.service" ];
-      path = [ pkgs.iproute2 pkgs.coreutils ];
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-      };
-      script = ''
-        # Retry until the gateway is usable, then let the final attempt's status stand -- the
-        # script runs under `set -e`, so a route that never installs still fails the unit.
-        route_with_retry() {
-          tries=0
-          while [ "$tries" -lt 30 ]; do
-            if "$@"; then return 0; fi
-            tries=$((tries + 1))
-            sleep 1
-          done
-          "$@"
-        }
-      '' + lib.concatMapStrings
-        (ip: "route_with_retry ip route replace ${ip}/32 via ${nodes.dohpeer.networking.primaryIPAddress} dev eth1\n")
-        interceptor.dohIpv4
-      + lib.concatMapStrings (ip: "ip -6 route replace unreachable ${ip}/128\n") interceptor.dohIpv6;
-    };
-
     security.pki.certificateFiles = [ interceptor.caFile ntsCert.caFile ];
 
     system.stateVersion = stateVersion;
@@ -326,112 +217,17 @@ nixpkgs.lib.nixos.runTest {
     )
     machine.wait_for_unit("multi-user.target")
 
-    # The reboot failsafe, on its own node. Everything below happens on `unwedge`.
-    STATE = "/var/lib/time-sync-unwedge/rebooted-boot-id"
-    UNWEDGE_JOURNAL = "journalctl -b -u time-sync-unwedge --no-pager -o cat"
-
-    def wedge_chrony():
-        # The state the failsafe is defined by: the rough clock has succeeded, and nothing is
-        # disciplining the clock. In production that is reached by the asymmetry the module
-        # documents -- rough-time resolves the NTS names itself at a pinned address while chronyd
-        # goes through dnscrypt-proxy, so a wedged resolver stops one and not the other. Staging
-        # the cause instead of the state does not work here: a desktop configuration with no
-        # resolver at all never reaches multi-user.target, so the node cannot be driven (observed).
-        unwedge.succeed("systemctl stop chrony-wait.service || true")
-        unwedge.succeed("systemctl reset-failed chrony-wait.service || true")
-        unwedge.succeed("systemctl stop chronyd.service")
-        unwedge.succeed("rm -f /run/chrony-wait/synchronized")
-        # Stopping chronyd does not by itself make the kernel report an unsynchronised clock --
-        # STA_UNSYNC stays clear for hours once something has cleared it, because the kernel only
-        # re-sets it when maxerror crawls up to NTP_PHASE_LIMIT. A step does set it immediately,
-        # via ntp_clear() in do_settimeofday64(), which is also why rough-time's own step leaves
-        # the bit set. Two minutes keeps the clock well inside the fixtures' validity.
-        unwedge.succeed("date -s '+2 minutes'")
-        unwedge.fail("rough-time --check-synced")
-
-    with subtest("the failsafe will not count anything without a successful rough clock"):
-        # The ordering IS the safety property: a host with no network must be retried, not
-        # rebooted, and the only thing between those two outcomes is that this unit requires
-        # rough-time to have succeeded first.
-        unwedge.wait_for_unit("multi-user.target")
-        requires = unwedge.succeed(
-            "systemctl show -p Requires --value time-sync-unwedge.service"
-        )
-        assert "rough-time.service" in requires, requires
-        after = unwedge.succeed("systemctl show -p After --value time-sync-unwedge.service")
-        assert "rough-time.service" in after, after
-        unwedge.wait_for_unit("rough-time.service", timeout=600)
-
-    with subtest("a rough clock that succeeded while nothing synchronises reboots the host"):
-        wedge_chrony()
-        unwedge.succeed("systemctl start --no-block time-sync-unwedge.service")
-        unwedge.wait_for_shutdown()
-
-        unwedge.start()
-        unwedge.wait_for_unit("multi-user.target")
-        previous = unwedge.succeed(
-            "journalctl -b -1 -u time-sync-unwedge --no-pager -o cat || true"
-        )
-        assert "; rebooting" in previous, previous
-        # The breadcrumb is what bounds the next round. Written before the reboot on purpose, so
-        # a /var that cannot be written produces no reboot rather than an endless series of them.
-        unwedge.succeed(f"test -s {STATE}")
-
-    with subtest("a second stuck boot stands down instead of rebooting again"):
-        # The failure this bounds is the one a reboot cannot fix. Rebooting helps a wedged
-        # resolver; it does nothing for a chrony that persistently refuses sources whose
-        # intervals do not overlap, and an unbounded rule would then reboot this host every
-        # unwedgeSeconds forever -- the shape of the 2026-07-27 bootloop that
-        # modules/connectivity-watchdog.nix exists to avoid repeating.
-        unwedge.wait_for_unit("rough-time.service", timeout=600)
-        wedge_chrony()
-        unwedge.succeed("systemctl start time-sync-unwedge.service")
-        journal = unwedge.succeed(f"{UNWEDGE_JOURNAL} || true")
-        assert "standing down" in journal, journal
-        assert "; rebooting" not in journal, journal
-        # And it is still the same boot: a reboot would have emptied this journal.
-        assert "; rebooting" in unwedge.succeed(
-            "journalctl -b -1 -u time-sync-unwedge --no-pager -o cat || true"
-        ), "the previous boot's reboot verdict went missing"
-        unwedge.succeed("systemctl is-active multi-user.target")
-
-    with subtest("synchronising clears the breadcrumb, so the bound is per episode"):
-        # The other half of that bound, and the one whose failure is silent. If the successful
-        # path did not remove the breadcrumb, the host would stand down for the rest of its life
-        # after a single unwedge reboot -- the failsafe would be permanently disabled and nothing
-        # would say so. "One reboot per stuck episode" only means that if an episode can end.
-        unwedge.succeed(f"test -s {STATE}")
-        unwedge.succeed("systemctl start chronyd.service")
-        unwedge.succeed("systemctl reset-failed chrony-wait.service || true")
-        unwedge.succeed("systemctl start --no-block chrony-wait.service")
-        unwedge.wait_for_file("/run/chrony-wait/synchronized", timeout=300)
-
-        unwedge.succeed("systemctl reset-failed time-sync-unwedge.service || true")
-        unwedge.succeed("systemctl restart time-sync-unwedge.service")
-        journal = unwedge.succeed(f"{UNWEDGE_JOURNAL} || true")
-        assert "nothing to do" in journal, journal
-        unwedge.fail(f"test -e {STATE}")
-
-    with subtest("unwedgeSeconds = null installs no failsafe at all"):
-        # The off switch, checked on the node that relies on it: every subtest above this one
-        # leaves `machine` deliberately unsynchronised for a minute or more at a time, so a unit
-        # that had quietly been installed there would have rebooted the host under test.
+    with subtest("no reboot failsafe is installed"):
+        # The spec dropped it, so this is the guard against it coming back: several subtests
+        # below leave this host deliberately unsynchronised for a minute or more at a stretch,
+        # and a unit whose job was to reboot an unsynchronised host would fire in the middle of
+        # them -- taking the machine down for a reason the failing subtest would not name.
         machine.fail("systemctl cat time-sync-unwedge.service")
-
 
     def peer_ip(node):
         return node.wait_until_succeeds(
             "${pkgs.iproute2}/bin/ip -j -4 addr show dev eth1 "
             "| ${pkgs.jq}/bin/jq -r '.[0].addr_info[] | select(.prefixlen==24) | .local' "
-            "| ${pkgs.gnugrep}/bin/grep .",
-            timeout=120,
-        ).strip()
-
-    def peer_ip6(node):
-        return node.wait_until_succeeds(
-            "${pkgs.iproute2}/bin/ip -j -6 addr show dev eth1 "
-            "| ${pkgs.jq}/bin/jq -r '.[0].addr_info[] "
-            "| select(.prefixlen==64 and .scope==\"global\") | .local' "
             "| ${pkgs.gnugrep}/bin/grep .",
             timeout=120,
         ).strip()
@@ -448,6 +244,37 @@ nixpkgs.lib.nixos.runTest {
     def clock(node=None):
         return int((node or machine).succeed("date +%s").strip())
 
+    def rtc():
+        # hwclock prints an ISO-8601 instant and has no epoch output of its own, so `date` does
+        # the conversion. --noadjfile with --utc, so this never depends on /etc/adjtime existing.
+        return int(machine.succeed(
+            'date -d "$(${pkgs.util-linux}/bin/hwclock --show --utc --noadjfile)" +%s'
+        ).strip())
+
+    def align_rtc():
+        # Copy the system clock to the RTC, and settle the drift file's mtime with it.
+        #
+        # Called wherever the driver moves the clock, because `chronyd -s` reads both on every
+        # start (spec: bump forward to the last known good time) and would otherwise undo the move.
+        # RTC_Initialise does one of two things: set the clock FROM THE RTC in either direction --
+        # `hwclock -s` semantics, chrony 4.8 rtc_linux.c:1016 steps on any offset over a second --
+        # or, when the RTC reads earlier than the drift file's mtime, step the clock FORWARD to
+        # that mtime instead (rtc.c:98-108).
+        #
+        # Leaving the RTC alone is not the neutral choice, it is an unrealistic one. `date -s` does
+        # not touch the RTC, so these nodes would sit with a live emulated RTC pinned near the
+        # present (tomorrow 10:00, lib/test-rtc-base.nix) while the system clock is parked in 2001
+        # -- a state no real host is in. The Pi has no RTC at all, and the laptop's is kept current
+        # by `rtcsync`, which has the kernel copy the system time to it every 11 minutes. This is
+        # that copy, done on demand.
+        machine.succeed("${pkgs.util-linux}/bin/hwclock --systohc --utc --noadjfile")
+        machine.succeed("touch ${driftFile}")
+        # The staging has to have worked. A read-only or unimplemented emulated RTC would leave it
+        # at the present, and every subtest that depends on the parked clock would then fail
+        # somewhere further along with no hint that the RTC was the cause.
+        drift = clock() - rtc()
+        assert abs(drift) < 60, f"the RTC did not follow the clock: it is {drift}s off"
+
     def set_clock(when):
         # chronyd is stopped first because a running one would fight the step -- it is tracking
         # real sources and would pull the clock back toward them, so a subtest that needs the
@@ -458,6 +285,7 @@ nixpkgs.lib.nixos.runTest {
         # used to claim it exits, which would have made the whole retry loop unsafe.
         machine.succeed("systemctl stop chronyd.service || true")
         machine.succeed(f"date -s '{when}'")
+        align_rtc()
 
     def start_collector():
         # Returns systemd's own verdict on the unit's conditions. A condition that is not met
@@ -478,6 +306,13 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed("rm -f " + MARKER)
         machine.succeed("systemctl stop chrony-wait.service || true")
         machine.succeed("systemctl reset-failed chrony-wait.service || true")
+        # Before the restart, not after: chronyd runs with `-s`, so the start it is about to do
+        # reads the RTC and the drift file. The correction service moves the SYSTEM clock and
+        # nothing else -- setting the RTC is not its job, and on the Pi there is no RTC to set --
+        # so without this the restart below would find a stale RTC and step the clock straight back
+        # to where the correction service just rescued it from. In production `rtcsync` closes that
+        # gap within 11 minutes; here it has to be closed on demand. See align_rtc.
+        align_rtc()
         machine.succeed("systemctl restart chronyd.service")
         machine.succeed("systemctl start --no-block chrony-wait.service")
 
@@ -498,17 +333,17 @@ nixpkgs.lib.nixos.runTest {
         assert condition == "no", f"the collector ran before the clock was synchronised ({condition})"
 
     with subtest("with the clock years out, nothing resolves"):
-        # The deadlock the rough clock exists to break, demonstrated rather than assumed.
+        # The deadlock the correction service exists to break, demonstrated rather than assumed.
         set_clock("2001-01-01 00:00:00")
         machine.succeed("systemctl restart dnscrypt-proxy.service")
         connect_upstream()
         machine.fail(f"${pkgs.dig}/bin/dig +short +time=3 +tries=1 @127.0.0.1 {'${goodHost}'} | grep -q .")
 
-    with subtest("the rough clock breaks the deadlock and chrony takes over"):
-        machine.succeed("systemctl reset-failed rough-time.service || true")
-        machine.succeed("systemctl restart rough-time.service")
-        rough = clock()
-        assert rough > 1600000000, f"the rough clock was not set: {rough}"
+    with subtest("the correction service breaks the deadlock and chrony takes over"):
+        machine.succeed("systemctl reset-failed time-correction.service || true")
+        machine.succeed("systemctl restart time-correction.service")
+        corrected = clock()
+        assert corrected > 1600000000, f"the clock was not corrected: {corrected}"
 
         # DNS only works because the clock does now.
         machine.wait_until_succeeds(
@@ -546,120 +381,22 @@ nixpkgs.lib.nixos.runTest {
             + machine.succeed("systemctl show -p Result --value system-metrics.service")
         )
 
-    with subtest("the rough clock stands down once something has synchronised"):
-        # The STA_UNSYNC no-op path, which tests/rough-time.nix cannot reach because nothing
-        # there ever genuinely synchronises the clock. Without --force this must do nothing.
-        output = machine.succeed("rough-time --dry-run 2>&1")
-        assert "already synchronised" in output, output
-
-    with subtest("a clock synchronised mid-exchange is not overwritten"):
-        # The race the second adjtimex check exists for, staged rather than hoped for.
+    with subtest("a clock already inside certificate validity is left alone"):
+        # The one stand-down rule the spec leaves, on the node where the clock is genuinely
+        # right. There used to be a second one -- ask the kernel via adjtimex whether anything
+        # had already synchronised the clock -- and it is gone, along with the subtest that
+        # covered it and the one that staged the mid-exchange race it guarded. What replaces
+        # both is this: a synchronised clock is inside the validity of every certificate on the
+        # path by construction, so the window rule alone still refuses to step it.
         #
-        # The check at the top of the program cannot cover this on its own: STA_UNSYNC is
-        # always set at boot, so on a warm reboot rough-time always proceeds to the full
-        # exchange, while chronyd starts alongside it and -- with cached cookies and no key
-        # establishment to do -- can synchronise in well under a second. Without a second
-        # check the exchange then finishes and overwrites an accurate clock with a
-        # whole-second approximation of it.
-        #
-        # clear-unsync plays the part of chrony finishing: it flips the kernel bit without
-        # moving the clock, so the assertion below is about rough-time's decision and nothing
-        # else.
-        machine.succeed("systemctl stop chronyd.service || true")
-        machine.succeed("rm -f " + MARKER)
-        set_clock("2001-01-01 00:00:00")
-        before = clock()
-
-        # Widen the window deterministically rather than by shaping traffic. Every attempt to
-        # slow the link failed for its own reason: at 800ms the run finished in about two
-        # seconds and the flip landed after the check it exercises, at 1500ms chronyd's own
-        # key-establishment timeout closed the session before answering, and a blackhole route
-        # turned out not to delay anything at all -- for locally generated packets the routing
-        # lookup fails immediately rather than the packet being sent and dropped, so the run
-        # still finished in 200ms.
-        #
-        # Dropping the packets on the way out is what actually costs a timeout. Silently
-        # dropping IPv4 to the resolvers while pointing their IPv6 addresses at the interceptor
-        # makes each of the two DoH lookups spend the unit's full 10s connect timeout on IPv4
-        # before succeeding on IPv6, so the run reliably lasts over twenty seconds with every
-        # server behaving exactly as it does in the other subtests.
-        nft = "${pkgs.nftables}/bin/nft"
-        machine.succeed(f"{nft} add table inet slowdoh")
-        machine.succeed(
-            f"{nft} add chain inet slowdoh out "
-            "'{ type filter hook output priority 0; policy accept; }'"
-        )
-        for ip in doh_ipv4:
-            machine.succeed(f"{nft} add rule inet slowdoh out ip daddr {ip} tcp dport 443 drop")
-        via6 = peer_ip6(dohpeer)
-        for ip in doh_ipv6:
-            machine.succeed(
-                f"${pkgs.iproute2}/bin/ip -6 route replace {ip}/128 via {via6} dev eth1"
-            )
-
-        try:
-            machine.succeed("systemctl reset-failed rough-time.service || true")
-
-            # `systemctl start --no-block` returns before the unit has started, so reading
-            # InvocationID straight afterwards yields the PREVIOUS run's -- whose journal
-            # already contains "clock set to" from an earlier subtest, which made this pass its
-            # wait instantly and then fail against the wrong run's output. Poll until the id
-            # actually changes.
-            previous = machine.succeed(
-                "systemctl show -p InvocationID --value rough-time.service"
-            ).strip()
-            # `restart`, not `start`: the unit is RemainAfterExit and still active from an
-            # earlier subtest, and `start` on an active unit is a no-op that produces no new
-            # invocation at all.
-            machine.succeed("systemctl restart --no-block rough-time.service")
-
-            inv = ""
-            for _ in range(120):
-                inv = machine.succeed(
-                    "systemctl show -p InvocationID --value rough-time.service"
-                ).strip()
-                if inv and inv != previous:
-                    break
-                machine.sleep(0.5)
-            assert inv and inv != previous, "rough-time never started a new invocation"
-
-            # Flip as early as possible: the window is however long the exchange takes, and
-            # every moment spent here is a moment it might finish in.
-            machine.succeed("clear-unsync")
-            # The staging has to have worked, or this subtest proves nothing about rough-time.
-            # A second invocation short-circuits on the check at the top of the program without
-            # touching the network, so this is both cheap and a direct read of the bit.
-            staged = machine.succeed("rough-time --dry-run --only cloudflare 2>&1")
-            assert "already synchronised" in staged, f"clear-unsync did not take: {staged}"
-            # And that it holds. The first version of this helper left maxerror at its ceiling,
-            # so the kernel re-set the bit a second later and the assertion above still passed
-            # while the run under test saw it set.
-            machine.sleep(3)
-            still = machine.succeed("rough-time --dry-run --only cloudflare 2>&1")
-            assert "already synchronised" in still, f"the bit did not stay clear: {still}"
-            # Waiting on the unit's ActiveState would never return: RemainAfterExit keeps a
-            # successful oneshot active. Wait on what the run said instead, scoped to this
-            # invocation so an earlier run cannot satisfy it -- and accept any terminal message
-            # so a regression fails on the assertion below with the journal attached, rather
-            # than timing out with nothing to look at.
-            machine.wait_until_succeeds(
-                f"journalctl _SYSTEMD_INVOCATION_ID={inv} -o cat "
-                "| grep -qE 'while we were asking|clock set to|error:'",
-                timeout=300,
-            )
-            journal = machine.succeed(f"journalctl _SYSTEMD_INVOCATION_ID={inv} -o cat")
-        finally:
-            machine.succeed(f"{nft} delete table inet slowdoh || true")
-            connect_upstream()
-
-        assert "while we were asking" in journal, journal
-        drift = abs(clock() - before)
-        assert drift < 60, f"the clock moved {drift}s despite being synchronised mid-exchange"
-
-        # Put the host back the way the following subtests expect it.
-        machine.succeed("systemctl start chronyd.service")
-        resync()
-        machine.wait_for_file(MARKER, timeout=300)
+        # The difference is that the exchange now actually happens, which is the point of the
+        # change: the run is evidence that DoH and NTS still work, not merely a repair that
+        # skips itself when the clock looks fine.
+        machine.succeed(f"test -e {MARKER}")
+        output = machine.succeed("time-correction --dry-run 2>&1")
+        assert "already inside the certificates' validity" in output, output
+        # Non-vacuous: it did reach both providers rather than declining before the exchange.
+        assert "asking" in output, output
 
     with subtest("NTS cookies are dumped when chronyd stops"):
         # chronyd writes the cookie dump on exit, not continuously, so this has to stop it
@@ -685,14 +422,197 @@ nixpkgs.lib.nixos.runTest {
         connect_upstream()
         machine.wait_for_file(MARKER, timeout=600)
 
+    # ------------------------------------------------------------------------------------
+    # The persisted last-known-good clock: `chronyd -s` plus the drift file's mtime.
+    #
+    # Spec: chrony "must write the last known good time regularly and bump the time forward to
+    # this persisted value on boot". Both halves are chronyd's own, so what these subtests pin is
+    # that the deployed configuration actually reaches them -- and, for the last one, that the step
+    # really is forward-only, which is the only thing standing between this feature and a host
+    # whose clock is dragged backwards on every start.
+    #
+    # Worth having spelled out, because the exact rule decides how each subtest has to be staged
+    # (chrony 4.8 rtc.c:112-135 and rtc_linux.c:969-1025). With `-s`, chronyd:
+    #
+    #   * reads the drift file's mtime, or 0 if there is no drift file;
+    #   * tries the RTC first. If /dev/rtc opens and reads, and the RTC is NOT earlier than that
+    #     mtime, the clock is set from the RTC -- in EITHER direction, on any offset over a
+    #     second, exactly as `hwclock -s` would;
+    #   * otherwise -- no RTC, an unreadable one, or an RTC that reads earlier than the mtime,
+    #     which is what a dead battery looks like -- steps the clock FORWARD to the mtime, and
+    #     only forward.
+    #
+    # So "RTC behind the drift file" is the lever these subtests pull to reach the path the Pi
+    # lives on, from a VM node that does have a working RTC.
+    with subtest("chrony writes the last known good time regularly"):
+        # The "regularly" half, on the running daemon -- not on shutdown. chronyd rewrites the
+        # drift file whenever it computes a new clock update and at least `interval` has
+        # accumulated (chrony 4.8 reference.c:1011-1017), and unconditionally on exit via
+        # REF_Finalise. This node sets `interval 1` so the periodic trigger fires in seconds
+        # instead of an hour; see the comment on nodes.machine for why that is a tempo change and
+        # not a mechanism change.
+        #
+        # The directive itself is pinned too, because it is one we do not write: the nixpkgs chrony
+        # module emits `driftfile <stateDir>/chrony.drift`, and if that ever moved or vanished this
+        # whole feature would switch itself off with nothing else in the suite noticing.
+        conf = machine.succeed(
+            "systemctl cat chronyd.service | grep -o '/nix/store/[^ ]*chrony.conf' "
+            "| head -1 | xargs cat"
+        )
+        assert "driftfile ${driftFile}" in conf, conf
+        # `-s` is the other half, and it is ours.
+        assert "-s" in machine.succeed(
+            "systemctl show -p ExecStart --value chronyd.service"
+        ).split(), "chronyd is not started with -s"
+
+        machine.wait_for_file(MARKER, timeout=300)
+        # Backdated to something no clock in this test ever sits at, so the wait below cannot be
+        # satisfied by a write that happened before this subtest started.
+        machine.succeed("touch -d '@1000000000' ${driftFile}")
+        machine.succeed("systemctl is-active chronyd.service")
+        # chronyd is left alone throughout: no stop, no restart, no signal. Whatever refreshes the
+        # mtime here is the periodic write and nothing else. One poll interval is 64s at chrony's
+        # default minpoll, so give it a few.
+        machine.wait_until_succeeds(
+            "test $(stat -c %Y ${driftFile}) -gt 1000000000", timeout=300
+        )
+        machine.succeed("systemctl is-active chronyd.service")
+        recorded = int(machine.succeed("stat -c %Y ${driftFile}").strip())
+        offset = clock() - recorded
+        assert -120 < offset < 300, (
+            f"the drift file's mtime is {offset}s away from the current clock ({recorded} vs "
+            f"{clock()}); a last-known-good time has to be roughly now, not an arbitrary instant"
+        )
+
+    with subtest("and again when it stops, so a clean shutdown records its own stop time"):
+        # The other trigger, and the one the man page's wording for -s is about: "restore the time
+        # when chronyd was previously stopped". Same writer (update_drift_file), reached from
+        # REF_Finalise instead of from the update path, so what this adds over the subtest above is
+        # only that a shutdown does not skip it.
+        stopped_at = clock()
+        machine.succeed("systemctl stop chronyd.service")
+        recorded = int(machine.succeed("stat -c %Y ${driftFile}").strip())
+        age = recorded - stopped_at
+        assert 0 <= age < 120, (
+            f"the drift file was not refreshed on exit: mtime is {recorded}, "
+            f"chronyd stopped at {stopped_at}"
+        )
+
+    with subtest("the persisted time is restored on boot"):
+        # The spec's own wording is "on boot", so this is a real one rather than a `systemctl
+        # start`. It is also the strongest form of the claim available: the runtime routes to the
+        # DoH interceptor do not survive a reboot, so this host comes up with no DNS at all and
+        # chronyd cannot reach a single source -- whatever moves the clock here moved it from a
+        # local file.
+        #
+        # What has to be beaten is the RTC, not the system clock: chronyd only falls through to the
+        # driftfile path when the RTC reads EARLIER than the mtime, logging "RTC time before last
+        # driftfile modification (ignored)" on the way. Two earlier versions of this subtest got
+        # that staging wrong and silently tested nothing -- chronyd found nothing to do, logged
+        # nothing, and the clock the kernel had already read from the RTC in the initrd looked
+        # plausible -- so the margin below is deliberate and so is the assertion under it.
+        #
+        # Three days, and it cannot be read off the RTC instead. `machine.start()` is a FRESH qemu
+        # process with `-rtc base=$(date -u -d tomorrow +...T10:00:00)` (lib/test-rtc-base.nix), so
+        # the emulated RTC is re-derived from that base on every boot: whatever this guest wrote to
+        # it with `hwclock --systohc` earlier in the run is discarded, and it comes back reading up
+        # to ~34h ahead of the host's real clock. A pre-reboot read therefore predicts nothing. What
+        # it does bound is the post-reboot value, since every node's clock in this test descends
+        # from that same base -- so three days past the larger of the current clock and the current
+        # RTC is ahead of any RTC the next boot can produce.
+        #
+        # chronyd is already stopped by the subtest above, which matters: a running one would
+        # rewrite the drift file on shutdown and undo the staging.
+        persisted = max(clock(), rtc()) + 3 * 86400
+        machine.succeed(f"touch -d '@{persisted}' ${driftFile}")
+
+        machine.shutdown()
+        machine.start()
+        machine.wait_for_unit("multi-user.target")
+
+        # The staging, checked against the RTC this boot actually came up with -- the assertion the
+        # two broken versions of this subtest lacked. Without it a mis-staged mtime makes the
+        # journal check below fail with chronyd's ordinary startup output and no hint why.
+        booted_rtc = rtc()
+        assert persisted > booted_rtc, (
+            f"mis-staged: the drift file ({persisted}) is not ahead of this boot's RTC "
+            f"({booted_rtc}), so chronyd took the RTC path and the restore was never exercised"
+        )
+
+        # The journal line is the precise evidence -- it is emitted only by the driftfile path, so
+        # it cannot be satisfied by the RTC read or by chrony reaching a source.
+        journal = machine.succeed("journalctl -b -u chronyd -o cat --no-pager")
+        assert "restored from driftfile" in journal, journal
+        # And the effect. Loose on the upper side on purpose: chronyd steps to the mtime early in
+        # boot and the rest of the boot then runs on the stepped clock, so by the time the driver
+        # can ask, a couple of minutes of ordinary startup have elapsed on top.
+        restored = clock()
+        drift = restored - persisted
+        assert -60 < drift < 600, (
+            f"the clock is {drift}s from the persisted {persisted} (it is {restored}); "
+            f"the boot should have stepped it forward to the drift file's mtime"
+        )
+
+    with subtest("the restore is forward-only"):
+        # The converse, and the one whose failure is silent -- a host whose clock is dragged
+        # backwards on every start would still look synchronised most of the time, because chrony
+        # would keep pulling it forward again.
+        #
+        # Staged so the driftfile path is what decides it, rather than the RTC: the RTC is put a
+        # day behind the mtime (chronyd therefore ignores it, exactly as on a dead battery) while
+        # the system clock is left an hour AHEAD of the mtime. Nothing may move.
+        #
+        # NTS is blocked as well, so a chronyd that reached a real source could not be what
+        # produced the answer.
+        nft = "${pkgs.nftables}/bin/nft"
+        machine.succeed(f"{nft} add table inet blocknts2")
+        machine.succeed(
+            f"{nft} add chain inet blocknts2 out "
+            "'{ type filter hook output priority 0; policy accept; }'"
+        )
+        machine.succeed(f"{nft} add rule inet blocknts2 out tcp dport 4460 drop")
+        machine.succeed(f"{nft} add rule inet blocknts2 out udp dport 123 drop")
+        try:
+            machine.succeed("systemctl stop chronyd.service || true")
+            persisted = clock()
+            # RTC a day behind the mtime-to-be.
+            machine.succeed(f"date -s @{persisted - 86400}")
+            machine.succeed("${pkgs.util-linux}/bin/hwclock --systohc --utc --noadjfile")
+            # Stopping chronyd rewrote the drift file, so set the mtime AFTER that, then put the
+            # system clock an hour beyond it.
+            machine.succeed(f"touch -d '@{persisted}' ${driftFile}")
+            ahead = persisted + 3600
+            machine.succeed(f"date -s @{ahead}")
+
+            machine.succeed("systemctl reset-failed chronyd.service || true")
+            machine.succeed("systemctl start chronyd.service")
+            after = clock()
+            assert after >= ahead - 60, (
+                f"the clock went backwards: {ahead} -> {after}, toward the persisted {persisted}"
+            )
+            # And it really was the driftfile path being exercised, not the RTC read short-cutting
+            # the decision -- otherwise this subtest would pass on a client with no direction rule
+            # at all.
+            journal = machine.succeed("journalctl -b -u chronyd -o cat --no-pager | tail -30")
+            assert "before last driftfile modification" in journal, journal
+        finally:
+            machine.succeed(f"{nft} delete table inet blocknts2 || true")
+
+        # Put the host back where the remaining subtests expect it: a clock and an RTC that agree
+        # with the servers', a drift file that cannot bump anything, and a resolver again.
+        machine.succeed("systemctl stop chronyd.service || true")
+        set_clock(f"@{clock(ntsgood)}")
+        connect_upstream()
+        resync()
+        machine.wait_for_file(MARKER, timeout=600)
+
     with subtest("a clock step under a running chronyd does not break it for good"):
-        # The race the retry loop makes real. rough-time is ordered BEFORE chronyd, but it retries
-        # every restartSeconds until it succeeds, so every attempt after the first runs with
-        # chronyd already up -- and the timestamp it applies is as old as the slowest leg of its
-        # exchange and truncated to a whole second, so the step it makes on an already-plausible
-        # clock is BACKWARD. If that could kill chronyd for the rest of the boot, this host would
-        # end up permanently unsynchronised while DNS kept working, so nothing else would notice
-        # and the metrics gate would stay shut forever.
+        # The step this guards against is the correction service's own. It applies a timestamp as
+        # old as the slowest leg of its exchange, truncated to a whole second, so on an
+        # already-plausible clock the step it makes is BACKWARD -- and nothing orders it against
+        # chronyd, so chronyd is running when it lands. If that could kill chronyd for the rest of
+        # the boot, this host would end up permanently unsynchronised while DNS kept working, so
+        # nothing else would notice and the metrics gate would stay shut forever.
         machine.wait_for_file(MARKER, timeout=300)
 
         def chronyd_pid():
@@ -746,12 +666,12 @@ nixpkgs.lib.nixos.runTest {
         # Both sources were correct until now. Skewing one leaves chrony with two mutually
         # exclusive intervals and no majority, which -- with minsources 2 -- must resolve to
         # "no usable time" rather than to whichever answered first.
-        # Re-establish a sane clock BEFORE skewing anything. rough-time now asks two NTS
+        # Re-establish a sane clock BEFORE skewing anything. time-correction now asks two NTS
         # operators and requires them to agree, so once one of them is lying it will correctly
         # refuse -- which is the behaviour under test here, not a way to set up for it.
-        machine.succeed("systemctl reset-failed rough-time.service || true")
-        machine.succeed("systemctl restart rough-time.service")
-        rough = clock()
+        machine.succeed("systemctl reset-failed time-correction.service || true")
+        machine.succeed("systemctl restart time-correction.service")
+        corrected = clock()
 
         # Cut its upstream first, or chronyd simply steps the clock back to ntsgood's.
         ntsliar.succeed(
@@ -764,7 +684,7 @@ nixpkgs.lib.nixos.runTest {
         assert not machine.succeed(
             f"test -e {MARKER} && echo yes || echo no"
         ).strip().startswith("yes"), "chrony synchronised despite its sources disagreeing"
-        drift = abs(clock() - rough)
+        drift = abs(clock() - corrected)
         assert drift < 600, f"the clock moved {drift}s toward a disagreeing source"
 
         sources = machine.succeed("${pkgs.chrony}/bin/chronyc sources")
