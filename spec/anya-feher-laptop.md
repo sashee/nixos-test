@@ -2,7 +2,7 @@
 
 ## System
 
-* [./features/system.md]
+* [](./features/system/system.md)
 * 2 users
     * anya: no sudo, has password, auto-logged in, can manage wifi
     * sashee: sudo, can only ssh in (key only, public key provisioned in config), no password or console login
@@ -16,42 +16,42 @@
 
 ## Wifi
 
-* [./features/wifi.md]
+* [](./features/wifi.md)
 * uses NetworkManager
 
 ## DNS-over-HTTPS
 
-* [./features/doh.md]
+* [](./features/doh.md)
 
 ## Auto upgrade
 
-* [./features/auto-upgrade.md]
+* [](./features/auto-upgrade.md)
 * do not reboot automatically, takes effect on next manual reboot
 
 ## Auto GC
 
-* [./features/gc.md]
+* [](./features/gc.md)
 * runs daily
 * generations are kept for 14 days
 
 ## Monitoring
 
-* [./features/monitoring.md]
+* [](./features/monitoring.md)
 * runs daily
 * tolerates being off for up to 14 days
 
 ## Backups
 
-* [./features/backups.md]
+* [](./features/backups.md)
 
 ## Dotfiles
 
-* [./features/dotfiles.md]
+* ()(./features/dotfiles.md)
 
 ## Iroh SSH
 
-* [./features/iroh-ssh.md]
+* [](./features/iroh-ssh.md)
 
 ## Firewall
 
-* [./features/firewall.md]
+* [](./features/firewall.md)
