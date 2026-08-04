@@ -47,13 +47,11 @@ pub fn sample(names: &[String], count: usize, seed: u64) -> Vec<String> {
 
 /// The middle of a set of readings that already agree.
 ///
-/// Deliberately not the maximum. Under the previous Date-header design the newest reading was
-/// the least stale, because a `Date` is stamped when the response is generated and read some
-/// milliseconds later, so the truth was always at or after it. An NTP timestamp has no such
-/// bias: it is the server's own transmit time, early or late only by network delay in either
-/// direction. With no reason to prefer an extreme, the middle is the reading least sensitive to
-/// one outlier -- and since everything here has already passed the tolerance check, any choice
-/// is within tolerance of the truth anyway.
+/// Deliberately not an extreme. An NTP transmit timestamp has no staleness bias to correct for --
+/// it is the server's own send time, early or late only by network delay, in either direction --
+/// so there is no reason to prefer the newest or the oldest. The middle is the reading least
+/// sensitive to one outlier, and since everything here has already passed the tolerance check,
+/// any choice is within tolerance of the truth anyway.
 fn middle(mut values: Vec<i64>) -> i64 {
     values.sort_unstable();
     values[values.len() / 2]
@@ -96,10 +94,10 @@ fn vote(answers: &[&Answer], tolerance: i64) -> Result<i64, String> {
 /// operational faults, and each is reported by the caller at the point it happened; folding
 /// them into one sentence would lose the only part worth acting on.
 ///
-/// The caller now refuses the run outright when any pair failed, so the silent-operator branch
-/// below is unreachable from `main::run`. It stays because this function's contract is "every
-/// sampled operator must have answered", and a function that quietly returned a time from half a
-/// sample would be the wrong thing for any future caller to be handed.
+/// The caller refuses the run outright when any pair failed, so the silent-operator branch below
+/// is unreachable from `main::run`. It stays because this function's contract is "every sampled
+/// operator must have answered", and a function that quietly returned a time from half a sample
+/// would be the wrong thing for any future caller to be handed.
 ///
 /// The build-time floor is NOT checked here. It applies to each set's own reported timestamp,
 /// before that timestamp is used to re-verify any certificate chain, so it lives in

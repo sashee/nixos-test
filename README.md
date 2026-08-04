@@ -305,15 +305,15 @@ a repair: it does the whole DoH + NTS exchange even where the clock is
 demonstrably fine, so a provider that stopped answering or a pinned address that
 moved shows up as a failing unit while the host is still healthy enough to say so,
 rather than at the next cold boot when nothing works and nobody can reach the box.
-That is why it no longer asks the kernel via `adjtimex` whether the clock is
-already synchronised and skips the exchange — the skip was the failure mode.
+Asking the kernel via `adjtimex` whether the clock is already synchronised, and
+skipping the exchange when it is, would trade that discovery away for nothing.
 
 It still steps the clock only when it has to. It stands down when the current
 clock, however wrong, already falls inside the validity of every certificate it
 just checked: TLS works at that point, which is the only thing this program exists
 to arrange, and chrony will make the accurate correction itself rather than have a
 whole-second approximation imposed on it first. On a host chrony has disciplined
-that rule always fires, which is why dropping the kernel check costs nothing. It
+that rule always fires, which is what makes the unconditional exchange free. It
 leans on chrony being able to step a large error, which it can, because nixpkgs
 defaults `services.chrony.makestep` to `0.1 3` — the first three updates step, with
 no size limit.
@@ -333,17 +333,18 @@ floor. `tests/time-correction.nix` pins that chronyd runs regardless of whether 
 correction service succeeded.
 
 There is deliberately no reboot failsafe for "the correction service succeeded and
-chrony still has not synchronised". `common.timeSync.unwedgeSeconds` used to be
-exactly that and the spec dropped it: a reboot is a remedy for a wedged resolver
-and nothing else, the hourly run now surfaces the same class of fault as a plain
-failing unit, and an unbounded reboot rule is the shape of the 2026-07-27 bootloop
+chrony still has not synchronised": a reboot is a remedy for a wedged resolver and
+nothing else, the hourly run surfaces that class of fault as a plain failing unit,
+and an unbounded reboot rule is the shape of the 2026-07-27 bootloop
 `modules/connectivity-watchdog.nix` exists to avoid repeating.
 
 It is opt-in (`common.timeSync.enable`) and enabled on every host that gets the
 common desktop layer as well as on the Pi — `timeSyncSettings` in `flake.nix` is
 composed into all three module lists, which is also where `floor` comes from
-(`nixpkgs.lastModified` is only in scope there). Two VM checks
-cover it on x86 and aarch64: `time-correction` exercises the binary's quorum, floor,
+(`nixpkgs.lastModified` is only in scope there). Two VM checks cover it, each on
+three configurations — the generic x86 desktop, the aarch64 Pi, and the laptop as
+`anya-feher-laptop-time-correction` / `anya-feher-laptop-nts-sync`.
+`time-correction` exercises the binary's quorum, floor,
 deferred certificate checks and stand-down rule, and the unit's timer, against
 controlled DoH resolvers and NTS servers; `nts-sync` reproduces the deadlock end to
 end on the real host config — the machine boots years out, cannot resolve anything,
@@ -352,8 +353,9 @@ putting the RTC behind the drift file, which is what a dead battery looks like.
 Both of those necessarily override the cadence, the server list and the floor to be
 testable at all, so three eval checks cover what they cannot see: `nts-servers`
 and `doh-providers` guard the two source lists, `time-sync-deployed` renders both
-deployed hosts' timer and service and asserts the cadence and the whole argument
-vector, and `time-sync-assertions` checks that the module still refuses the
+deployed hosts' timer and service and asserts the cadence, the whole argument
+vector, and that the metrics clock gate points at chrony's marker, and
+`time-sync-assertions` checks that the module still refuses the
 configurations it says it refuses — an unset floor, a sample larger than the
 distinct operators, an empty or unknown server list, and a marker path
 `RuntimeDirectory` cannot create.
@@ -467,16 +469,21 @@ The gate is a `ConditionPathExists` on `common.systemMetrics.syncedMarker`. Its
 default is the marker systemd-timesyncd writes, because that is the stock NixOS
 time source — but the deployed hosts run chrony, which writes nothing of the
 kind, so `modules/time-sync.nix` (above) repoints the option at the marker its
-own `chrony-wait` unit writes. Both paths are tested against a real NTP server
-rather than a hand-placed marker file. The `system-metrics` check covers the
-default: it runs a second node with chrony (`local stratum 10`, so an island with
-no upstream still serves a usable reference) and asserts that the host records
-nothing while that daemon is down, starts recording once `systemd-timesyncd`
-syncs to it, and stops again when it goes away. That helper node takes the same
-`-rtc base=tomorrow 10:00` as the node under test (`lib/test-rtc-base.nix`) —
-otherwise it would serve real wall-clock time and step the machine a day
-backwards mid-test. The chrony marker the hosts actually use is covered by
-`nts-sync` instead, which has real chrony to synchronise.
+own `chrony-wait` unit writes.
+
+The two halves of that are checked separately, because they fail differently. The
+*mechanism* — systemd holding the unit back while the file is absent and releasing
+it once it appears — is covered by the `system-metrics` check against a real NTP
+server rather than a hand-placed marker file: it runs a second node with chrony
+(`local stratum 10`, so an island with no upstream still serves a usable
+reference) and asserts that the host records nothing while that daemon is down,
+starts recording once `systemd-timesyncd` syncs to it, and stops again when it
+goes away. That helper node takes the same `-rtc base=tomorrow 10:00` as the node
+under test (`lib/test-rtc-base.nix`) — otherwise it would serve real wall-clock
+time and step the machine a day backwards mid-test. Which marker each *deployed*
+host is pointed at is a claim about rendered units, so `time-sync-deployed`
+asserts it per host at eval time; that also makes it the only check that covers
+the Pi, which is the host the gate exists for.
 
 It is opt-in (`common.systemMetrics.enable`) and enabled wherever a receiver
 runs. `system-metrics --dry-run` prints the batch a run would send without
@@ -804,7 +811,7 @@ make run-tests MAX_JOBS=1
 becomes an HTTPS `/dns-query` request to one of the configured DoH hostnames.
 
 `time-correction` and `nts-sync` are hermetic in the same way and are among the
-slowest checks in the suite — five and four VMs, both existing on x86 and aarch64.
+slowest checks in the suite — six and four VMs, both existing on x86 and aarch64.
 `time-correction` covers the time-correction service in isolation against
 impersonated DoH resolvers and NTS servers, including the cases that only ever
 matter once: an expired certificate on either leg while that server's clock stays
@@ -827,7 +834,8 @@ unauthenticated NTP when NTS-KE is blocked, and — at the deployed `sample = 2`
 which is the only place that configuration is exercised — that the correction
 service refuses to set a clock from two operators that disagree. Their aarch64
 variants get a raised `globalTimeout` (1800s and 2400s), since under TCG a run of
-either is measured in tens of minutes.
+either is measured in tens of minutes, and their `anya-feher-laptop-` variants get
+1800s for booting the full autologin desktop three times over.
 
 Both of those override the timer's cadence so a timed run cannot land in the
 middle of a subtest that places the clock by hand, and both override the server
@@ -839,7 +847,11 @@ leaves the values the hosts actually ship uncovered by either.
 renders `time-correction.service` and asserts the argument vector — one `--nts`
 per entry of `lib/nts-servers.nix` with its operator, one `--doh` per provider in
 `lib/doh-stamps.nix` with both families, `--sample 2`, `--tolerance 60`,
-`--timeout 10`, and a `--floor` that is present and numeric. Both throw during
+`--timeout 10`, and a `--floor` that is present and numeric. It also asserts, on
+each host that deploys the metrics collector, that `system-metrics.service` carries
+exactly `ConditionPathExists=<the chrony marker>` — the two-line `mkDefault` in
+`modules/time-sync.nix` whose failure is silent in both directions, and which no VM
+test covers on a host anyone deploys. All of these throw during
 evaluation on drift. It reads the rendered units rather than
 `common.timeSync.interval`, since the claim worth making is that systemd was told
 the value, not that the option holds it. The count assertions are the load-bearing

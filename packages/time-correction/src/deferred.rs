@@ -1,14 +1,13 @@
-//! The safety boundary for deferred certificate validation, now that there is more than one
-//! TLS leg and the timestamp no longer arrives on the connection that presented the chain.
+//! The safety boundary for deferred certificate validation.
 //!
-//! The old single-leg design could keep its guarantee locally: the `Date` header came back on
-//! the same TLS session, so pass 2 ran inside the function that read it and no caller could
-//! obtain a time that had not been through it. That is impossible here. The clock comes from a
-//! UDP packet, after the NTS-KE session has closed, and it must be checked against the chains
-//! of *both* legs — the DoH resolver that produced the address and the NTS server that produced
-//! the time.
+//! A single-leg design could keep this guarantee locally: if the time arrived on the same TLS
+//! session that presented the chain, pass 2 would run inside the function that read it and no
+//! caller could obtain a time that had not been through it. That is not the shape here. There are
+//! two TLS legs, the clock arrives in a UDP packet *after* the NTS-KE session has closed, and it
+//! must be checked against the chains of both legs — the DoH resolver that produced the address
+//! and the NTS server that produced the time.
 //!
-//! So the guarantee moves into the type. Chains accumulate in a `Deferred`, which has no way to
+//! So the guarantee lives in the type. Chains accumulate in a `Deferred`, which has no way to
 //! yield a timestamp; the only thing that produces one is `accept`, which consumes the whole
 //! collection and re-verifies every chain at the claimed instant first. A caller cannot get a
 //! believable time without pass 2 having run on everything, because there is no other

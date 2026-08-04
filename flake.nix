@@ -484,9 +484,7 @@
           imports = [ rpiConnectivitySystemModule ./modules/time-sync.nix ];
           common.connectivityFallback.bootGrace = "3h";
         };
-        # Four VMs under TCG, with a real reboot and several chrony synchronisations. Down from
-        # 3000 with the reboot-failsafe node, which added two 120s countdowns and a reboot of
-        # its own.
+        # Four VMs under TCG, with a real reboot and several chrony synchronisations.
         globalTimeout = 2400;
       };
       # Production timer constants under icount time-warp, on the real rpi config. Composes
@@ -883,12 +881,39 @@
       # import). Purely virtualisation.* resources -- no config change, so the
       # system under test is still the real config. Used by every anya node that
       # boots the full autologin desktop under a heavy wait (monitoring, restic,
-      # plasma/locale firefox, nix-utils). Timezone-adaptive tests (fire_timer)
-      # handle anya's Europe/Budapest, so no UTC pin or headless variant.
+      # plasma/locale firefox, nix-utils, the two time checks below). Timezone-adaptive
+      # tests (fire_timer) handle anya's Europe/Budapest, so no UTC pin or headless
+      # variant.
       anyaFeherLaptopDesktopNode = { lib, ... }: {
         imports = [ anyaFeherLaptopSystemModule ];
         virtualisation.cores = lib.mkDefault 2;
         virtualisation.memorySize = lib.mkDefault 4096;
+      };
+      # The two halves of the time chain on the real laptop host config. timeSync is enabled
+      # there (timeSyncSettings is in anyaFeherLaptopHostModule), so without these it was the
+      # only common.* feature the laptop deploys with no -anya variant.
+      #
+      # The desktop node rather than the bare system module: nts-sync does two real reboots and
+      # time-correction runs some fifteen subtests, which is the heavy-wait case above. Its
+      # sizing is mkDefault, so anything a test sets for itself still wins.
+      #
+      # Each test re-enables common.timeSync with mkForce in its own nodes.machine, which is
+      # what beats testNodeTimeSyncOff's priority-90 `false` -- the case that override reserves
+      # mkForce for. globalTimeout above the files' 1200 default because a ceiling is cheap and
+      # three full desktop boots are not.
+      anyaFeherLaptopTimeCorrectionTest = import ./tests/time-correction.nix {
+        inherit nixpkgs pkgs stateVersion dohStamps;
+        machineModule = { ... }: {
+          imports = [ anyaFeherLaptopDesktopNode ./modules/time-sync.nix ];
+        };
+        globalTimeout = 1800;
+      };
+      anyaFeherLaptopNtsSyncTest = import ./tests/nts-sync.nix {
+        inherit nixpkgs pkgs stateVersion dohStamps;
+        machineModule = { ... }: {
+          imports = [ anyaFeherLaptopDesktopNode ./modules/time-sync.nix ];
+        };
+        globalTimeout = 1800;
       };
       anyaFeherLaptopPlasmaFirefoxTest = import ./tests/plasma-firefox.nix {
         inherit nixpkgs pkgs stateVersion;
@@ -944,6 +969,8 @@
         anya-feher-laptop-nm-captive-portal-ipv6 = anyaFeherLaptopNmCaptivePortalIpv6Test;
         anya-feher-laptop-restic = anyaFeherLaptopResticTest;
         anya-feher-laptop-boot-clock = anyaFeherLaptopBootClockTest;
+        anya-feher-laptop-time-correction = anyaFeherLaptopTimeCorrectionTest;
+        anya-feher-laptop-nts-sync = anyaFeherLaptopNtsSyncTest;
         anya-feher-laptop-plasma-firefox = anyaFeherLaptopPlasmaFirefoxTest;
         anya-feher-laptop-locale-firefox = anyaFeherLaptopLocaleFirefoxTest;
       } // (nixpkgs.lib.mapAttrs'
@@ -1034,6 +1061,10 @@
       packages.${system} = {
         default = qemuVm;
         iroh-ssh = pkgs.callPackage ./packages/iroh-ssh/package.nix { };
+        # Exposed so the binary can be built on its own, which on the Pi is the difference
+        # between one small build and evaluating a whole check inside a 4 GB evaluator -- and
+        # the Pi is the host this exists for.
+        time-correction = pkgs.callPackage ./packages/time-correction/package.nix { };
         auto-upgrade-mocked-service-driver = autoUpgradeMockedServiceTest.driver;
         auto-upgrade-mocked-service-driver-interactive = autoUpgradeMockedServiceTest.driverInteractive;
         common-desktop-driver = commonDesktopTest.driver;
