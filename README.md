@@ -349,6 +349,14 @@ controlled DoH resolvers and NTS servers; `nts-sync` reproduces the deadlock end
 end on the real host config — the machine boots years out, cannot resolve anything,
 and has to climb out to chrony on its own — and covers the persisted clock by
 putting the RTC behind the drift file, which is what a dead battery looks like.
+Both of those necessarily override the cadence, the server list and the floor to be
+testable at all, so three eval checks cover what they cannot see: `nts-servers`
+and `doh-providers` guard the two source lists, `time-sync-deployed` renders both
+deployed hosts' timer and service and asserts the cadence and the whole argument
+vector, and `time-sync-assertions` checks that the module still refuses the
+configurations it says it refuses — an unset floor, a sample larger than the
+distinct operators, an empty or unknown server list, and a marker path
+`RuntimeDirectory` cannot create.
 
 `modules/restic.nix` configures named restic backups using systemd credentials.
 Each backup must specify the user that runs the service. Backup paths are bound
@@ -804,23 +812,42 @@ correct (so the answer it gives is right and must still be refused), a time belo
 the build-time floor (refused before any chain is re-verified against it), one
 provider of two failing (which fails the whole run), a clock already inside the
 certificates' validity (left alone) and one outside it (set), no reachable
-resolver at all (a visibly failed unit with the timer still armed), and v4-only,
-v6-only and NTS-reachable-only-over-v6 hosts. `nts-sync` boots a machine years out
-of date on the deployed configuration and asserts it climbs out on its own, then
-that chrony records and restores its last known good time (forward only), refuses
-a falseticker, keeps cookies across a reboot, and will not fall back to
-unauthenticated NTP when NTS-KE is blocked. Their aarch64 variants get a raised
-`globalTimeout` (1800s and 2400s), since under TCG a run of either is measured in
-tens of minutes.
+resolver at all (a visibly failed unit with the timer still armed), v4-only,
+v6-only and NTS-reachable-only-over-v6 hosts, and a server that redirects
+timestamping to a second hostname — the shape `nts.netnod.se` has in production,
+proved followed rather than ignored by logging every name the impersonated
+resolver was asked for. It also pins that the `time-correction` wrapper on `PATH`
+execs exactly the unit's argument vector, since that wrapper is what the Pi is
+driven by hand with. `nts-sync` boots a machine years out of date on the deployed
+configuration and asserts it climbs out on its own, then that chrony records and
+restores its last known good time (forward only), reports itself synchronised to
+the kernel (`rtcsync`, which is what keeps a laptop's RTC current for the next
+boot), refuses a falseticker, keeps cookies across a reboot, will not fall back to
+unauthenticated NTP when NTS-KE is blocked, and — at the deployed `sample = 2`,
+which is the only place that configuration is exercised — that the correction
+service refuses to set a clock from two operators that disagree. Their aarch64
+variants get a raised `globalTimeout` (1800s and 2400s), since under TCG a run of
+either is measured in tens of minutes.
 
 Both of those override the timer's cadence so a timed run cannot land in the
-middle of a subtest that places the clock by hand — which leaves the values the
-hosts actually ship uncovered by either. `time-sync-cadence` is the eval-only
-check that closes that: it renders `time-correction.timer` from both deployed
-host configs and asserts `OnBootSec=1min`, `OnUnitActiveSec=1h`, no `OnCalendar`
-and no `Persistent`, throwing during evaluation on drift. It reads the rendered
-unit rather than `common.timeSync.interval`, since the claim worth making is that
-systemd was told the value, not that the option holds it.
+middle of a subtest that places the clock by hand, and both override the server
+list and the floor so their impersonated providers are the ones dialled — which
+leaves the values the hosts actually ship uncovered by either.
+`time-sync-deployed` is the eval-only check that closes that. It renders
+`time-correction.timer` from both deployed host configs and asserts
+`OnBootSec=1min`, `OnUnitActiveSec=1h`, no `OnCalendar` and no `Persistent`; it
+renders `time-correction.service` and asserts the argument vector — one `--nts`
+per entry of `lib/nts-servers.nix` with its operator, one `--doh` per provider in
+`lib/doh-stamps.nix` with both families, `--sample 2`, `--tolerance 60`,
+`--timeout 10`, and a `--floor` that is present and numeric. Both throw during
+evaluation on drift. It reads the rendered units rather than
+`common.timeSync.interval`, since the claim worth making is that systemd was told
+the value, not that the option holds it. The count assertions are the load-bearing
+half: `selected` in `modules/time-sync.nix` filters `lib/nts-servers.nix` by
+`cfg.servers` while chrony reads `cfg.servers` directly, so a hostname that stops
+matching leaves chrony using the name while time-correction silently loses that
+operator. That the wrapper on `PATH` carries the same arguments as the unit is
+asserted in `time-correction` itself, where both are observable.
 
 `nix flake check` also works, but it evaluates every check in one nix process
 (~15 GiB peak) and leaves no output symlinks — prefer the `make run-*` targets,

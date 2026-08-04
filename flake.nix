@@ -733,7 +733,7 @@
       };
       # Stand-in for the machine-unique parts that live on the device, so the deployable laptop
       # system can be evaluated here at all. Shared by anyaFeherLaptopEval and
-      # timeSyncCadenceTest, which both need the host config forced but neither of which may
+      # timeSyncDeployedTest, which both need the host config forced but neither of which may
       # depend on the device's real hardware-configuration.nix.
       laptopStubHw = {
         fileSystems."/" = {
@@ -765,11 +765,18 @@
         inherit pkgs dohStamps;
       };
       # Unlike the eval checks above this one is not pure data -- it forces both deployed host
-      # configs to render their time-correction.timer, which costs an eval of each. Worth it
-      # because the values it asserts are the ones no VM test can see: both time tests override
-      # the cadence so their own subtests are not interrupted by a timed run.
-      timeSyncCadenceTest = import ./tests/time-sync-cadence.nix {
-        inherit pkgs;
+      # configs to render time-correction.timer and time-correction.service, which costs an eval
+      # of each. Worth it because the values it asserts are the ones no VM test can see: both
+      # time tests override the cadence so their own subtests are not interrupted by a timed run,
+      # and both override the server list and the floor so their impersonated providers are the
+      # ones dialled.
+      # The other side of the same module: that it REFUSES the configurations it says it does.
+      # One base evaluation plus an extendModules per case, rather than a system build per case.
+      timeSyncAssertionsTest = import ./tests/time-sync-assertions.nix {
+        inherit pkgs nixpkgs;
+      };
+      timeSyncDeployedTest = import ./tests/time-sync-deployed.nix {
+        inherit pkgs ntsServers dohStamps;
         hosts = {
           rpi5 = rpi5Base;
           anya-feher-laptop = mkAnyaFeherLaptop { modules = [ laptopStubHw ]; };
@@ -988,7 +995,8 @@
         doh-endpoints = dohEndpointsTest;
         nts-servers = ntsServersTest;
         doh-providers = dohProvidersTest;
-        time-sync-cadence = timeSyncCadenceTest;
+        time-sync-deployed = timeSyncDeployedTest;
+        time-sync-assertions = timeSyncAssertionsTest;
       };
     in
     {

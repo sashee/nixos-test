@@ -23,6 +23,26 @@
 # Two servers rather than one, both correct to begin with, because the falseticker subtest
 # needs a second source to disagree with -- skewing one of them afterwards is what turns
 # "multiple servers" from a configuration detail into something observable.
+#
+# IPv4-only, deliberately, and it is worth saying why rather than leaving it to be re-discovered.
+# The spec says "everything should work in IPv6-only networks and IPv4-only networks as well",
+# and this node's interceptor answers AAAA with NODATA while the DoH v6 addresses are routed
+# `unreachable` -- so nothing here crosses a v6 socket. What that leaves uncovered is only
+# chronyd's own NTS-KE and NTPv4 over IPv6, because the two legs either side of it are covered
+# elsewhere and both are the halves this repo actually writes:
+#
+#   * dnscrypt-proxy over IPv6 only, by the dedicated `ipv6Client` node in tests/doh-upstream.nix,
+#     which makes the v4 upstreams unreachable and asserts resolution still works;
+#   * time-correction over IPv6 only, by three subtests in tests/time-correction.nix -- a v4-only
+#     host, a v6-only host, and an NTS server reachable only over IPv6, which is the case that
+#     caught the program asking for A records alone.
+#
+# chronyd reaches its sources by hostname through the system resolver, and nothing in
+# modules/time-sync.nix says anything about address families, so the remaining gap is upstream
+# chrony's socket handling rather than this repo's configuration of it. Closing it would cost a
+# fifth VM in what is already the slowest check in the suite (four VMs, a real reboot and several
+# chrony synchronisations, 2400s of headroom on the TCG aarch64 runner). If the v6 path ever does
+# break, it breaks in chrony and this is the note that says where to start.
 
 let
   lib = nixpkgs.lib;
@@ -419,6 +439,30 @@ nixpkgs.lib.nixos.runTest {
         # vanishing.
         conf = chrony_conf()
         assert "minsources 2" in conf, conf
+
+        # `rtcsync`, and the `enableRTCTrimming = false` that makes room for it. Both are ours
+        # and both are load-bearing, in opposite directions:
+        #
+        #   * dropping `rtcsync` from our extraConfig is SILENT. chronyd would keep
+        #     disciplining the clock and this whole test would still pass, while STA_UNSYNC
+        #     stayed set forever -- so the kernel would never copy the system time to the RTC,
+        #     and the laptop's next boot would start from a stale RTC that `chronyd -s` then
+        #     believes. Nothing else in the suite looks at it.
+        #   * `enableRTCTrimming` coming back (it is the nixpkgs DEFAULT) emits `rtcfile` and
+        #     `rtcautotrim`, which conflict with `rtcsync`. That direction is not silent --
+        #     nixpkgs' chrony module asserts on the combination -- so this half is a statement
+        #     of intent rather than the guard, and it is one line.
+        assert "rtcsync" in conf, conf
+        for directive in ["rtcfile", "rtcautotrim"]:
+            assert directive not in conf, f"enableRTCTrimming is back on: {conf}"
+
+        # And the effect, which is the part worth having: `rtcsync` is what makes chronyd clear
+        # the kernel's STA_UNSYNC, and systemd's NTPSynchronized is read straight off that bit
+        # (timedated calls ntp_gettime and tests it). Asserting the directive alone would pass on
+        # a chrony that parsed it and did nothing.
+        machine.wait_until_succeeds(
+            "timedatectl show -p NTPSynchronized --value | grep -qx yes", timeout=180
+        )
         # Each hostname must become exactly one `server` line ending in `nts`. Both halves can
         # drift independently: nixpkgs emits `pool` instead of `server` for any hostname
         # containing "pool" (one name, several sources, which defeats the counting minsources
@@ -751,6 +795,36 @@ nixpkgs.lib.nixos.runTest {
 
         sources = machine.succeed("${pkgs.chrony}/bin/chronyc sources")
         machine.log("sources with one skewed server:\n" + sources)
+
+    with subtest("the correction service refuses a quorum that disagrees"):
+        # chrony's half of "multiple servers to detect incorrect servers" is the subtest above.
+        # This is the correction service's half, and it is the only place it is exercised against
+        # real servers: tests/time-correction.nix forces `sample` to 1 (one of its two NTS
+        # fixtures is deliberately expired, so a sample of two could never converge) and leaves
+        # the arithmetic to fixtures in quorum.rs. Here `sample` is the deployed default of 2,
+        # both certificates are valid, both names resolve, and ntsliar is three hours out --
+        # which the subtest above already staged, so this costs no nodes and no setup.
+        #
+        # It is also the ONLY thing that exercises common.timeSync.tolerance at all. The option
+        # has no other test: not the default, not the --tolerance argument, not the behaviour.
+        # Hence matching on the bound as well as on the verdict -- a run that refused because
+        # the module had threaded some other number through would pass a laxer assertion.
+        #
+        # --dry-run and NOT --force: the disagreement is decided in `quorum::decide`, which runs
+        # before the stand-down rule, so no flag is needed to reach it and the clock is never a
+        # candidate to be touched. Driven through the wrapper rather than `systemctl start` so
+        # this leaves no failed unit behind for anything after it.
+        output = machine.fail("time-correction --dry-run 2>&1")
+        assert "operators disagree by" in output, output
+        assert "(>60s)" in output, f"the deployed tolerance did not reach the binary: {output}"
+        # Both operators are named in the spread, which is what makes the failure actionable --
+        # and proves both were actually asked rather than one having simply failed.
+        for operator in ["cloudflare", "netnod"]:
+            assert operator in output, f"{operator} is missing from the spread: {output}"
+        # Non-vacuity: it must have failed on the disagreement, not on a pair that broke on the
+        # way. Those exit through a different message and would satisfy nothing above, but they
+        # would also mean this subtest never reached the quorum at all.
+        assert "provider pairs failed" not in output, output
 
   '';
 }
