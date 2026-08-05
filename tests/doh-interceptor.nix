@@ -93,8 +93,11 @@ let
 
     def txt(query, *strings, ttl=60):
         # TXT rdata is a sequence of length-prefixed character-strings (RFC 1035),
-        # so each string carries its own one-byte length. 255 chars max each.
-        rdata = b"".join(bytes([len(s)]) + s.encode("ascii") for s in strings)
+        # so each string carries its own one-byte length. 255 bytes max each.
+        # Length is taken after encoding, not from len(str): the two agree only
+        # for ascii, and a wrong prefix would corrupt the whole record.
+        encoded = [s.encode("ascii") for s in strings]
+        rdata = b"".join(bytes([len(b)]) + b for b in encoded)
         return answer_rdata(query, rdata, ttl)
 
     ${respond}
