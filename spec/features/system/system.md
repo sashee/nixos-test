@@ -2,6 +2,8 @@
 
 * zram swap enabled
 * everything should work in IPv6-only networks and IPv4-only networks as well
+* vm.dirty_bytes = 268435456
+* vm.dirty_background_bytes = 67108864
 
 ### Time synchronization
 
