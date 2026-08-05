@@ -212,15 +212,34 @@ let
   # the leaf twice -- once in the chain listing and once under "Server certificate" -- so counting
   # PEM blocks there answers 3 for a chain of 2. This asks the TLS stack what arrived. Unverified
   # deliberately: the question is what was sent, so the answer must not depend on the trust store.
+  #
+  # Retried, because a single connect is a coin flip on the KVM-less aarch64 runner: this test
+  # boots six TCG VMs on four cores, and dnscrypt-proxy's periodic re-probe opens a fresh TLS
+  # connection to every one of its eight upstream entries -- all of which route to the one
+  # interceptor node, whose accept loop does the handshakes itself (the harness wraps the LISTENING
+  # socket). A probe landing in that burst waited out its whole 10s connect timeout on CI while the
+  # same subtest took 1.5s on x86_64.
+  #
+  # Retrying cannot mask a wrong answer: only OSError is caught -- the transport never made it far
+  # enough to report a chain -- and the caller still pins the count exactly. So the loop can turn a
+  # connect failure into an answer, never one answer into another.
   peerChainCount = pkgs.writeShellScript "peer-chain-count" ''
     exec ${pkgs.python3}/bin/python3 -c '
-    import socket, ssl, sys
+    import socket, ssl, sys, time
     context = ssl._create_unverified_context()
-    with context.wrap_socket(
-        socket.create_connection((sys.argv[1], 443), timeout=10),
-        server_hostname=sys.argv[2],
-    ) as tls:
-        print(len(tls.get_unverified_chain()))
+    deadline = time.monotonic() + 120
+    while True:
+        try:
+            with context.wrap_socket(
+                socket.create_connection((sys.argv[1], 443), timeout=30),
+                server_hostname=sys.argv[2],
+            ) as tls:
+                print(len(tls.get_unverified_chain()))
+                break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(1)
     ' "$@"
   '';
 
@@ -248,6 +267,9 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
   skipTypeCheck = true;
   inherit globalTimeout;
+
+  # Six nodes brought up together, which is the shape that made this necessary; see the file.
+  defaults = import ./slow-tcg-node.nix;
 
   nodes.dohgood = { nodes, ... }: {
     networking = {
