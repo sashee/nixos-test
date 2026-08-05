@@ -233,14 +233,22 @@ nixpkgs.lib.nixos.runTest {
     # key size, future-proof). Generated to a file so the secret never lands in
     # argv; the plaintext is captured only to assert later that it does not
     # leak, then removed. This mirrors the operator flow in the README.
+    #
+    # The generator's stderr is kept, not discarded: it prints the connect
+    # command operators are told to save (docs/rpi5-rescue.md), and that ticket
+    # must be byte-identical to the one the provisioned host publishes — both
+    # derive it from the key with id_ticket. Nothing else pins that promise.
     server.succeed("install -d -m 0700 /etc/credentials/iroh-ssh")
-    server.succeed("${irohSsh}/bin/iroh-ssh-generate-secret > /root/k 2>/dev/null")
+    server.succeed("${irohSsh}/bin/iroh-ssh-generate-secret > /root/k 2>/root/k.ticket")
     secret = server.succeed("cat /root/k").strip()
+    generated = server.succeed(
+        "grep -oE 'endpoint[a-z0-9]+' /root/k.ticket | tail -n1"
+    ).strip()
     server.succeed(
         "${pkgs.systemd}/bin/systemd-creds encrypt --name=iroh-secret"
         " /root/k /etc/credentials/iroh-ssh/iroh-secret"
     )
-    server.succeed("rm -f /root/k")
+    server.succeed("rm -f /root/k /root/k.ticket")
 
     # Unit shape: encrypted credential, sandboxed dynamic user.
     server.succeed("systemctl cat iroh-ssh.service | grep -F 'LoadCredentialEncrypted=iroh-secret:/etc/credentials/iroh-ssh/iroh-secret'")
@@ -249,28 +257,12 @@ nixpkgs.lib.nixos.runTest {
     server.succeed("systemctl cat iroh-ssh.service | grep -F 'ProcSubset=pid'")
     server.succeed("systemctl cat iroh-ssh.service | grep -F '~@resources'")
 
-    # The ticket publisher derives the canonical ticket from the secret alone, so
-    # it needs no network at all — asserted on the unit, since that is the whole
-    # reason it can run before the listener has ever reached a relay.
-    server.succeed("systemctl cat iroh-ssh-ticket.service | grep -F 'PrivateNetwork=true'")
-    server.succeed("systemctl cat iroh-ssh-ticket.service | grep -F 'LoadCredentialEncrypted=iroh-secret:/etc/credentials/iroh-ssh/iroh-secret'")
+    # The listener publishes the ticket the failsafe probes (ExecStartPre), so it
+    # cannot drift from the credential the listener loaded.
+    server.succeed("systemctl cat iroh-ssh.service | grep -F 'RuntimeDirectory=iroh-ssh'")
+    server.succeed("systemctl cat iroh-ssh.service | grep -F 'RuntimeDirectoryMode=0700'")
     # The long-running failsafe must never be handed the secret; it reads the file.
     server.fail("systemctl cat iroh-ssh-failsafe.service | grep -F 'LoadCredential'")
-
-    # Condition-skipped at boot (no credential), so writing the blob above is
-    # what must bring the ticket into existence — iroh-ssh-ticket.path watches
-    # the secret. Waited for rather than hand-started on purpose: starting the
-    # unit here would assert only that the binary works, and a missing trigger
-    # would stay invisible while the failsafe probed nothing forever. No
-    # listener and no relay are involved. grep .: an empty file must not pass
-    # as a ticket.
-    published = server.wait_until_succeeds("grep . /run/iroh-ssh/ticket", timeout=60).strip()
-    assert published.startswith("endpoint"), f"unexpected ticket: {published}"
-
-    # Pure function of the secret: re-running reproduces it byte for byte.
-    server.succeed("systemctl restart iroh-ssh-ticket.service")
-    again = server.succeed("cat /run/iroh-ssh/ticket").strip()
-    assert again == published, f"ticket not reproducible: {published} vs {again}"
 
     # Fetch this run's short ticket (node id + relay url). The listener prints it
     # only after reaching the (impersonated) relay; if the 5s online timeout
@@ -293,6 +285,40 @@ nixpkgs.lib.nixos.runTest {
 
     ticket = relay_ticket()
 
+    # Published in ExecStartPre, so it exists as soon as the listener has started
+    # — no wait, no relay contact, and no unit started by hand. grep .: an empty
+    # file must not pass as a ticket.
+    published = server.succeed("grep . /run/iroh-ssh/ticket").strip()
+    assert published.startswith("endpoint"), f"unexpected ticket: {published}"
+
+    # What the generator printed when the key was created is what the host now
+    # publishes. This is the promise docs/rpi5-rescue.md asks operators to rely
+    # on when they save that connect command, and the whole basis for verifying a
+    # rotation before committing to it.
+    assert published == generated, \
+        f"generator and host disagree: {generated} vs {published}"
+
+    # Root-only: the failsafe is the only reader and it runs as root, so nothing
+    # else should get at the file. Asserted by an actual unprivileged read, not
+    # from the unit's mode settings — an earlier revision published this
+    # world-readable on purpose and the mode bits said so while the behaviour
+    # disagreed.
+    mode = server.succeed("stat -c %a /run/iroh-ssh/ticket").strip()
+    assert mode == "600", f"ticket mode is {mode}, expected 600"
+    server.fail("${pkgs.util-linux}/bin/runuser -u nobody -- cat /run/iroh-ssh/ticket")
+
+    # Where the reason for that lives: DynamicUser plus RuntimeDirectoryPreserve
+    # makes systemd keep the real directory in /run/private (0700 root:root) and
+    # leave /run/iroh-ssh as a symlink into it, so the directory mode above is
+    # belt-and-braces and *no* setting of it could expose the ticket. Pinned here
+    # because it is surprising, it is what made the earlier revision's
+    # RuntimeDirectoryMode=0755 a dead letter, and exec-invoke.c carries a stale
+    # comment claiming runtime directories are exempt.
+    server.succeed("test -L /run/iroh-ssh")
+    assert server.succeed("readlink /run/iroh-ssh").strip() == "private/iroh-ssh"
+    private_mode = server.succeed("stat -c '%a %U:%G' /run/private").strip()
+    assert private_mode == "700 root:root", f"/run/private is {private_mode}"
+
     # The provisioned secret never leaks into the service journal, environment,
     # or argv. (load_secret has no random fallback, so a mis-read credential
     # fails the service outright rather than silently swapping identity.)
@@ -307,6 +333,11 @@ nixpkgs.lib.nixos.runTest {
     second = relay_ticket()
     assert len(os.path.commonprefix([ticket, second])) >= 50, \
         f"node id changed across restart: {ticket} vs {second}"
+
+    # That restart re-ran ExecStartPre: a pure function of the secret reproduces
+    # the ticket byte for byte rather than drifting.
+    again = server.succeed("cat /run/iroh-ssh/ticket").strip()
+    assert again == published, f"ticket not reproducible: {published} vs {again}"
 
     # Same identity from both directions: the published ticket is the same node id
     # the listener advertises, just without the relay-url tail — so it is strictly
@@ -345,14 +376,32 @@ nixpkgs.lib.nixos.runTest {
     ).strip()
     assert hostname == "iroh-server", f"unexpected hostname: {hostname}"
 
-    # Rotation (the flow in docs/rpi5-rescue.md): the published ticket is a
-    # function of the secret, so replacing the blob must repoint the probe. If it
-    # did not, the failsafe would keep dialing the retired endpoint id — nothing
-    # answers there any more, so it would hold port 22 open indefinitely against
-    # a perfectly healthy tunnel, and /run/iroh-ssh/ticket would hand operators a
-    # dead ticket. Removing the blob first mirrors "regenerate and re-encrypt"
-    # and keeps the write unconditional.
+    # Half a rotation is inert. The documented flow (docs/rpi5-rescue.md) stages a
+    # new credential under a new directory and only then changes
+    # credentialDirectory in the repo, so a host routinely holds a blob it is not
+    # using yet. Nothing may react to that: no unit watches the secret, the
+    # published ticket keeps naming the identity the listener actually answers on,
+    # and the failsafe stays closed. Getting this wrong is what would hold port 22
+    # open indefinitely against a perfectly healthy tunnel.
+    server.succeed("install -d -m 0700 /etc/credentials/iroh-ssh-2")
     server.succeed("${irohSsh}/bin/iroh-ssh-generate-secret > /root/k2 2>/dev/null")
+    server.succeed(
+        "${pkgs.systemd}/bin/systemd-creds encrypt --name=iroh-secret"
+        " /root/k2 /etc/credentials/iroh-ssh-2/iroh-secret"
+    )
+    # Long enough that a failsafe which had started counting would have opened the
+    # port by now (delaySeconds=15, recheckIntervalSeconds=5).
+    server.sleep(25)
+    staged = server.succeed("cat /run/iroh-ssh/ticket").strip()
+    assert staged == published, \
+        f"staging a second credential moved the ticket: {published} vs {staged}"
+    server.succeed(f"test -z \"$({nft_chain} | grep -F 'iroh-ssh-failsafe' || true)\"")
+
+    # And the ticket does follow the credential, on the restart that a
+    # credentialDirectory change performs. Overwriting the blob in place is the
+    # same event from the unit's point of view (a different key behind the same
+    # LoadCredentialEncrypted path) without needing a second system closure, so
+    # this is where the specialisation switch would otherwise go.
     server.succeed("rm -f /etc/credentials/iroh-ssh/iroh-secret")
     server.succeed(
         "${pkgs.systemd}/bin/systemd-creds encrypt --name=iroh-secret"
@@ -360,16 +409,9 @@ nixpkgs.lib.nixos.runTest {
     )
     server.succeed("rm -f /root/k2")
 
-    # Again no unit is started by hand: writing the blob is the whole trigger.
-    rotated = server.wait_until_succeeds(
-        f"grep . /run/iroh-ssh/ticket | grep -vFx '{published}'",
-        timeout=60,
-    ).strip()
-    assert rotated.startswith("endpoint"), f"unexpected rotated ticket: {rotated}"
-
-    # The listener picks up the new identity on restart; publisher and listener
-    # must then agree, exactly as they did before the rotation.
     third = relay_ticket()
+    rotated = server.succeed("cat /run/iroh-ssh/ticket").strip()
+    assert rotated != published, "ticket did not follow the rotated credential"
     assert len(os.path.commonprefix([rotated, third])) >= 50, \
         f"published ticket does not match the rotated listener: {rotated} vs {third}"
 
