@@ -147,9 +147,10 @@ let
     # per-connection thread: `wrap_socket` below wraps the LISTENING socket, so `accept()` returns
     # only once it has finished negotiating, and connections behind it sit in the kernel's queue.
     # socketserver's default of 5 is short enough to matter on a KVM-less aarch64 runner, where a
-    # node handshaking on ~1% of a core turns a burst of connects -- dnscrypt-proxy re-probes all
-    # eight of its upstream entries at once, and a test may route every one of them here -- into
-    # dropped SYNs, i.e. a caller that times out rather than merely waits.
+    # node handshaking on ~1% of a core turns a burst of connects -- dnscrypt-proxy re-probes
+    # every one of its upstream entries at once (one per entry in lib/doh-stamps.nix), and a test
+    # may route all of them here -- into dropped SYNs, i.e. a caller that times out rather than
+    # merely waits.
     class _Queued(http.server.ThreadingHTTPServer):
         request_queue_size = 128
 

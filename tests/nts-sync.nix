@@ -1,6 +1,6 @@
 # The ceiling should stay above the sum of the waits inside the test, so a slow run fails on the
 # subtest that was slow rather than on the global deadline.
-{ nixpkgs, pkgs, stateVersion, machineModule, dohStamps, globalTimeout ? 1200 }:
+{ nixpkgs, pkgs, stateVersion, machineModule, dohStamps, ntsServers, globalTimeout ? 1200 }:
 
 # The whole time chain, on the real host config: correction service -> DNS -> chrony over NTS.
 #
@@ -49,9 +49,16 @@ let
 
   # The subset of lib/nts-servers.nix this test points at. Two, because `minsources 2` needs
   # two selectable sources: a third unreachable name would only add resolution delay, and the
-  # real four-name list is guarded at eval time by tests/nts-servers.nix instead.
-  goodHost = "time.cloudflare.com";
-  liarHost = "nts.netnod.se";
+  # deployed list is guarded at eval time by tests/nts-servers.nix instead.
+  #
+  # Selected by role rather than named here (see tests/nts-fixtures.nix): the two must be under
+  # different operators or the falseticker and disagreement subtests would be one vote arguing
+  # with itself.
+  roles = import ./nts-fixtures.nix { inherit lib ntsServers; };
+  good = roles.good;
+  liar = roles.stale;
+  goodHost = good.hostname;
+  liarHost = liar.hostname;
 
   # One certificate for both servers, SAN'd for both names, so which node answers which
   # hostname is a routing decision rather than a certificate one.
@@ -98,6 +105,18 @@ let
   # because the driver has to stat and touch it and there is no option exposing it.
   driftFile = "/var/lib/chrony/chrony.drift";
 
+  # One ordered list of (hostname, node) drives both the argv slots the interceptor reads and
+  # the addresses the dohpeer node passes, so a hostname cannot end up pointed at the other
+  # server's address by an argv index edited on one side only.
+  dnsOrder = [
+    { host = goodHost; node = "ntsgood"; }
+    { host = liarHost; node = "ntsliar"; }
+  ];
+  mappingExpr =
+    "{"
+    + lib.concatStringsSep ", " (lib.imap0 (i: e: "\"${e.host}\": ARGS[${toString i}]") dnsOrder)
+    + "}";
+
   interceptor = import ./doh-interceptor.nix {
     inherit pkgs dohStamps;
     name = "nts-sync";
@@ -108,7 +127,7 @@ let
     respond = ''
       def respond(query, meta):
           name, qtype, _, _ = read_question(query)
-          mapping = {"${goodHost}": ARGS[0], "${liarHost}": ARGS[1]}
+          mapping = ${mappingExpr}
           if name not in mapping:
               return nxdomain(query)
           if qtype != 1:
@@ -140,10 +159,7 @@ nixpkgs.lib.nixos.runTest {
     };
     virtualisation.memorySize = 512;
     systemd.services.fake-doh = interceptor.mkService {
-      args = [
-        nodes.ntsgood.networking.primaryIPAddress
-        nodes.ntsliar.networking.primaryIPAddress
-      ];
+      args = map (e: nodes.${e.node}.networking.primaryIPAddress) dnsOrder;
     };
     system.stateVersion = stateVersion;
   };
@@ -802,7 +818,7 @@ nixpkgs.lib.nixos.runTest {
         assert "(>60s)" in output, f"the deployed tolerance did not reach the binary: {output}"
         # Both operators are named in the spread, which is what makes the failure actionable --
         # and proves both were actually asked rather than one having simply failed.
-        for operator in ["cloudflare", "netnod"]:
+        for operator in ["${good.operator}", "${liar.operator}"]:
             assert operator in output, f"{operator} is missing from the spread: {output}"
         # Non-vacuity: it must have failed on the disagreement, not on a pair that broke on the
         # way. Those exit through a different message and would satisfy nothing above, but they

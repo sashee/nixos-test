@@ -233,8 +233,8 @@ common.firewall.enable = false;
 ```
 
 `modules/doh.nix` enables system-wide DNS over HTTPS through `dnscrypt-proxy`
-with static IPv4 and IPv6 DoH resolver stamps for Cloudflare, Mullvad, Quad9,
-and Google. It points local resolver configuration at localhost and blocks
+with static IPv4 and IPv6 DoH resolver stamps for every provider in
+`lib/doh-stamps.nix`. It points local resolver configuration at localhost and blocks
 direct outbound TCP and UDP port 53 except to localhost. It is always enabled
 for `common-desktop` hosts and has no opt-out, so plaintext DNS egress can never
 be silently re-enabled. To keep captive portals usable behind that lock, the
@@ -247,9 +247,9 @@ asserting it reports `full` on an open network and `portal` once the endpoint
 redirects.
 
 `modules/time-sync.nix` owns the clock. chrony replaces systemd-timesyncd and
-synchronises over NTS — authenticated NTP — against the four servers in
-`lib/nts-servers.nix` (Cloudflare, Netnod, and PTB's two hosts), with
-`minsources 2` so no single reachable server can set the time unchallenged.
+synchronises over NTS — authenticated NTP — against the servers in
+`lib/nts-servers.nix`, with `minsources 2` so no single reachable server can set
+the time unchallenged.
 `enableNTS` brings `ntsdumpdir` with it, so cookies survive a reboot and a cold
 boot does not have to redo key establishment before it can ask the time. The
 module also sets `rtcsync`, which keeps the RTC current (so a host that has one
