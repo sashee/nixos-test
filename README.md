@@ -392,12 +392,16 @@ probe. sshd is key-only, so an engaged failsafe exposes only the ssh handshake
 to the local network. This also makes first-time provisioning possible over the
 LAN: the first probe runs at boot, so a freshly installed host with no iroh
 credential yet (a traffic-free check for the ticket file) has port 22 open
-minutes after boot until the secret lands. The probe inspects nothing about the
-listener at all — not even its output: the ticket it dials is derived from the
-secret by `iroh-ssh-ticket` and published to `/run/iroh-ssh/ticket` (at boot,
-and again whenever the secret is written, so provisioning or rotating it needs
-no reboot), so the listener stays a faithful dumbpipe derivative and could be
-swapped for stock dumbpipe unchanged. That ticket is also the one operators
+minutes after boot until the secret lands and a rebuild starts the tunnel. The
+probe inspects nothing about the listener at all — not even its output: the
+ticket it dials is derived from the secret by `iroh-ssh-ticket`, which the
+listener runs as an `ExecStartPre` before it binds, publishing to
+`/run/iroh-ssh/ticket` (root-only — the failsafe is the only reader). So the
+listener stays a faithful dumbpipe derivative and could be swapped for stock
+dumbpipe unchanged, and the probed ticket can never name an endpoint the running
+listener does not answer on: both come from the same credential, so rotation
+moves them together or not at all, and a credential staged for a rotation that
+has not happened yet changes nothing. That ticket is also the one operators
 distribute, so the probe exercises the path clients actually use — endpoint-id
 discovery — rather than a relay url that no distributed ticket contains. The
 flip side is that the failsafe is fate-shared with that discovery: while
@@ -410,7 +414,8 @@ the monitoring check reports when the failsafe is engaged.
 `iroh-ssh` is wire-compatible with [dumbpipe](https://www.dumbpipe.dev) (same
 ALPN and handshake), reduced to the ssh-tunnel use case and split into one
 binary per command (`iroh-ssh-listen`, `iroh-ssh-connect`,
-`iroh-ssh-generate-secret`) so it needs no CLI-parser dependency. Two changes
+`iroh-ssh-generate-secret`, `iroh-ssh-ticket`) so it needs no CLI-parser
+dependency. Two changes
 from dumbpipe: the listener reads the key from the decrypted systemd credential
 (`$CREDENTIALS_DIRECTORY/iroh-secret`) instead of the environment, and relay TLS
 is verified against the operating system trust store instead of dumbpipe's
@@ -448,14 +453,23 @@ Read the connect ticket from the running host. It is derived from the secret, so
 it is stable across restarts, networks and relay changes — grab it once:
 
 ```bash
-cat /run/iroh-ssh/ticket
+sudo cat /run/iroh-ssh/ticket
 ```
 
-This is the canonical form: the endpoint id and nothing else. Prefer it over the
-tickets the listener logs, which also embed the relay urls it happens to be using
-at that moment — pinning a client to a relay that may later go away. The id-only
-ticket is resolved through endpoint-id discovery instead, so it keeps working
-wherever the node moves.
+This is the canonical form: the endpoint id and nothing else, byte-identical to
+the connect command `iroh-ssh-generate-secret` printed when the key was created.
+Prefer it over the tickets the listener logs, which also embed the relay urls it
+happens to be using at that moment — pinning a client to a relay that may later
+go away. The id-only ticket is resolved through endpoint-id discovery instead, so
+it keeps working wherever the node moves. `sudo`, not `cat`: the file is public
+data but only the failsafe needs it, so it is kept root-only.
+
+To rotate the key, stage a new credential under a *new* directory and point
+`common.irohSsh.credentialDirectory` at it in a commit, rather than overwriting
+the blob in place — the switch then restarts the listener as a side effect of the
+rebuild, and reverting the commit converges the host back onto a credential that
+is still on disk and a ticket you still hold. `docs/rpi5-rescue.md` has the full
+flow.
 
 Connect from any machine, no IP address needed (`nix run
 github:sashee/nixos-test#iroh-ssh` works in place of an installed

@@ -28,9 +28,10 @@ nixpkgs.lib.nixos.runTest {
 
     # Mock the tunnel unit so its active state is controllable without a
     # relay: mkForce replaces the whole hardened serviceConfig (including the
-    # credential load and Restart=always) and drops the ConditionPathExists
-    # skip, leaving a plain oneshot that is active after start, inactive after
-    # stop.
+    # credential load, Restart=always, and the ExecStartPre that publishes the
+    # connect ticket -- which would fail here, there being no credential) and
+    # drops the ConditionPathExists skip, leaving a plain oneshot that is active
+    # after start, inactive after stop.
     systemd.services.iroh-ssh.serviceConfig = lib.mkForce {
       Type = "oneshot";
       RemainAfterExit = true;

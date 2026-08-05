@@ -113,11 +113,43 @@ committed host config stays closed.
 
        sudo nixos-rebuild switch --flake /etc/nixos#rpi5
 
-   closes port 22 and starts the tunnel. Check that
+   closes port 22 and starts the tunnel. Starting the tunnel is also what
+   publishes the connect ticket, so `sudo cat /run/iroh-ssh/ticket` should now
+   print exactly the ticket saved in step 4 -- that match is the cheapest proof
+   the credential decrypts and the identity is the expected one. Check that
    `sudo nft list chain inet nixos-fw input-allow` has no `dport 22` rule and
    that ssh through the saved connect command works. (Doing nothing also
    converges: the nightly auto-upgrade rebuilds from github main and reboots --
    but port 22 stays open until then.)
 
-If a pre-staged or retired card is lost, rotate the iroh secret (regenerate
-and re-encrypt on the Pi, update saved tickets).
+## Rotating the iroh secret
+
+If a pre-staged or retired card is lost, the iroh identity on it is compromised
+and must be replaced. Do it as a config change, not an edit in place -- so a bad
+new credential is a revert away instead of a lockout:
+
+1. Stage the new credential under a **new** directory on the Pi, leaving the old
+   one untouched. SAVE the connect command this prints:
+
+       sudo install -d -m 0700 /etc/credentials/iroh-ssh-2
+       iroh-ssh-generate-secret | sudo systemd-creds encrypt --name=iroh-secret - /etc/credentials/iroh-ssh-2/iroh-secret
+
+2. Point the host at it in the common repo (`common.irohSsh.credentialDirectory
+   = "/etc/credentials/iroh-ssh-2"`) and merge to main. The nightly auto-upgrade
+   picks it up; `sudo nixos-rebuild switch --flake /etc/nixos#rpi5` does it now.
+   Either way the unit definition changed, so the listener restarts and
+   republishes the ticket from the new credential.
+
+3. Verify: `sudo cat /run/iroh-ssh/ticket` matches the ticket saved in step 1,
+   and ssh through the new connect command works.
+
+4. If it does not, revert the commit. The old blob is still on disk and its
+   ticket still works, so the Pi comes back to a reachable identity on the next
+   auto-upgrade -- and until it does, the failsafe opens port 22 on the LAN 15
+   minutes after the tunnel stops answering. Delete the retired directory only
+   after step 3 passes.
+
+Writing a new blob without changing `credentialDirectory` does nothing on its
+own: no unit watches the secret, and the published ticket keeps naming the
+identity the running listener actually answers on. So a half-finished rotation
+cannot strand the failsafe against a healthy tunnel.
