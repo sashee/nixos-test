@@ -196,6 +196,14 @@ in
           ticket makes probes depend on n0 DNS discovery, and dns.iroh.link
           serves not-found with a 600s negative TTL that LAN resolvers cache
           (observed ~11 min outage on the rpi5, 2026-07-18).
+
+          The probe is what poisons that cache: it queries the endpoint's
+          `_iroh.*.dns.iroh.link` name before the listener has published, gets
+          NXDOMAIN, and then keeps hitting the cached negative for its full
+          600s however often it rechecks. So the budget is time-to-publish plus
+          600s -- ~660s observed -- against this 900s default. Roughly four
+          minutes of headroom, and it is spent by any boot that takes longer to
+          publish. Tune downward only with that arithmetic redone.
         '';
       };
 

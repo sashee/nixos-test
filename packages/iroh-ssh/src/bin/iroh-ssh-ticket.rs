@@ -11,8 +11,18 @@
 //!
 //! The secret is read exactly as the listener reads it (see `load_secret`): the
 //! argument as an explicit path, else the systemd credential, else
-//! `$IROH_SECRET`. The service passes no argument; the path is for re-deriving a
-//! ticket from a key file when the one printed at generation time was lost.
+//! `$IROH_SECRET`. The service passes no argument.
+//!
+//! The path argument is for re-deriving a ticket when both the one printed at
+//! generation time and `/run/iroh-ssh/ticket` are gone -- the latter happens
+//! whenever the listener has not started this boot, which is exactly when an
+//! operator most wants the ticket. It reads *plaintext* hex, so the encrypted
+//! blob on a provisioned host has to be decrypted on the way in:
+//!
+//!   systemd-creds decrypt --name=iroh-secret \
+//!     /etc/credentials/iroh-ssh/iroh-secret - | iroh-ssh-ticket /dev/stdin
+//!
+//! (a pipe, so the plaintext key never lands on disk).
 use std::path::PathBuf;
 
 use iroh_ssh::{id_ticket, load_secret};

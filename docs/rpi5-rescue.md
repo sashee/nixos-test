@@ -153,3 +153,19 @@ Writing a new blob without changing `credentialDirectory` does nothing on its
 own: no unit watches the secret, and the published ticket keeps naming the
 identity the running listener actually answers on. So a half-finished rotation
 cannot strand the failsafe against a healthy tunnel.
+
+## Recovering a lost ticket
+
+`sudo cat /run/iroh-ssh/ticket` is the normal way to read it, but that file only
+exists once the listener has started this boot -- so it is missing in exactly the
+situation where the ticket matters most: the tunnel is broken, you are in over
+the failsafe's port-22 opening, and you want to know which identity the Pi is
+supposed to be. Re-derive it straight from the credential instead:
+
+    sudo systemd-creds decrypt --name=iroh-secret \
+      /etc/credentials/iroh-ssh/iroh-secret - | iroh-ssh-ticket /dev/stdin
+
+The result is the same ticket -- it is a pure function of the key -- and the
+plaintext stays in the pipe. Note `iroh-ssh-ticket` reads *plaintext* hex, so
+pointing it straight at the encrypted blob fails; the `systemd-creds decrypt` is
+not optional.
