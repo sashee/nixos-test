@@ -129,6 +129,10 @@ nixpkgs.lib.nixos.runTest {
   # TCG emulation on the KVM-less aarch64 runner.
   inherit globalTimeout;
 
+  # Four nodes rather than six, so the margin here is wider than the run that forced this -- but
+  # the reboots re-roll it, and a lost backdoor is unrecoverable. See the file.
+  defaults = import ./slow-tcg-node.nix;
+
   nodes.dohpeer = { nodes, ... }: {
     networking = {
       hostName = "dohpeer";

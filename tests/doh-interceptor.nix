@@ -143,13 +143,23 @@ let
             self.send_header("content-length", str(len(r)))
             self.end_headers(); self.wfile.write(r)
 
-    class _V6(http.server.ThreadingHTTPServer):
+    # A backlog, because the TLS handshake happens in the accept loop rather than in the
+    # per-connection thread: `wrap_socket` below wraps the LISTENING socket, so `accept()` returns
+    # only once it has finished negotiating, and connections behind it sit in the kernel's queue.
+    # socketserver's default of 5 is short enough to matter on a KVM-less aarch64 runner, where a
+    # node handshaking on ~1% of a core turns a burst of connects -- dnscrypt-proxy re-probes all
+    # eight of its upstream entries at once, and a test may route every one of them here -- into
+    # dropped SYNs, i.e. a caller that times out rather than merely waits.
+    class _Queued(http.server.ThreadingHTTPServer):
+        request_queue_size = 128
+
+    class _V6(_Queued):
         address_family = socket.AF_INET6
         def server_bind(self):
             self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
             super().server_bind()
 
-    def _serve(addr, family, cls=http.server.ThreadingHTTPServer):
+    def _serve(addr, family, cls=_Queued):
         httpd = cls(addr, type(f"{family}Handler", (Handler,), {"family": family}))
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain("${certFile}", "${keyFile}")
