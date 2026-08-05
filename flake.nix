@@ -215,7 +215,7 @@
         machineModule = commonDesktopModule;
       };
       dohTest = import ./tests/doh.nix {
-        inherit nixpkgs pkgs stateVersion;
+        inherit nixpkgs pkgs stateVersion dohStamps;
         machineModule = { ... }: {
           imports = [ commonDesktopModule ];
           common.autoUpgrade.enable = false;
@@ -279,6 +279,7 @@
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiSystemModule;
+        inherit dohStamps;
       };
       autoUpgradeTestRpi = import ./tests/auto-upgrade-mocked-service.nix {
         nixpkgs = nixrpi;
@@ -461,7 +462,7 @@
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
-        inherit dohStamps;
+        inherit dohStamps ntsServers;
         # Same reasoning as connectivityWatchdogTestRpi: hosts/rpi5 enables
         # connectivity-fallback, whose check would fire at the production 5min bootGrace
         # inside a test whose subtests span far longer than that. Push the deadline past the
@@ -479,7 +480,7 @@
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
-        inherit dohStamps;
+        inherit dohStamps ntsServers;
         machineModule = { ... }: {
           imports = [ rpiConnectivitySystemModule ./modules/time-sync.nix ];
           common.connectivityFallback.bootGrace = "3h";
@@ -694,13 +695,13 @@
       # through commonDesktopModule and is named again here so the composition each test runs
       # is readable at its call site.
       timeCorrectionTest = import ./tests/time-correction.nix {
-        inherit nixpkgs pkgs stateVersion dohStamps;
+        inherit nixpkgs pkgs stateVersion dohStamps ntsServers;
         machineModule = { ... }: {
           imports = [ commonDesktopModule ./modules/time-sync.nix ];
         };
       };
       ntsSyncTest = import ./tests/nts-sync.nix {
-        inherit nixpkgs pkgs stateVersion dohStamps;
+        inherit nixpkgs pkgs stateVersion dohStamps ntsServers;
         machineModule = { ... }: {
           imports = [ commonDesktopModule ./modules/time-sync.nix ];
         };
@@ -771,7 +772,7 @@
       # The other side of the same module: that it REFUSES the configurations it says it does.
       # One base evaluation plus an extendModules per case, rather than a system build per case.
       timeSyncAssertionsTest = import ./tests/time-sync-assertions.nix {
-        inherit pkgs nixpkgs;
+        inherit pkgs nixpkgs ntsServers;
       };
       timeSyncDeployedTest = import ./tests/time-sync-deployed.nix {
         inherit pkgs ntsServers dohStamps;
@@ -785,7 +786,7 @@
         machineModule = anyaFeherLaptopSystemModule;
       };
       anyaFeherLaptopDohTest = import ./tests/doh.nix {
-        inherit nixpkgs pkgs stateVersion;
+        inherit nixpkgs pkgs stateVersion dohStamps;
         machineModule = { ... }: {
           imports = [ anyaFeherLaptopSystemModule ];
           common.autoUpgrade.enable = false;
@@ -902,14 +903,14 @@
       # mkForce for. globalTimeout above the files' 1200 default because a ceiling is cheap and
       # three full desktop boots are not.
       anyaFeherLaptopTimeCorrectionTest = import ./tests/time-correction.nix {
-        inherit nixpkgs pkgs stateVersion dohStamps;
+        inherit nixpkgs pkgs stateVersion dohStamps ntsServers;
         machineModule = { ... }: {
           imports = [ anyaFeherLaptopDesktopNode ./modules/time-sync.nix ];
         };
         globalTimeout = 1800;
       };
       anyaFeherLaptopNtsSyncTest = import ./tests/nts-sync.nix {
-        inherit nixpkgs pkgs stateVersion dohStamps;
+        inherit nixpkgs pkgs stateVersion dohStamps ntsServers;
         machineModule = { ... }: {
           imports = [ anyaFeherLaptopDesktopNode ./modules/time-sync.nix ];
         };

@@ -26,7 +26,7 @@
 # which matters here, since this repo's CI has been killed by the evaluator's heap before.
 #
 # Fails with `throw` during evaluation, so this stays usable from a pure `nix flake check`.
-{ pkgs, nixpkgs }:
+{ pkgs, nixpkgs, ntsServers }:
 
 let
   lib = pkgs.lib;
@@ -72,11 +72,17 @@ let
     }
     {
       name = "sample exceeds the distinct operators";
-      # lib/nts-servers.nix has four servers across three operators (ptb1 and ptb2 are one), so
-      # four is over the line for the operators while still being within the DoH resolver count.
-      # Deliberately not a wild number: the interesting boundary is the one the operator field
-      # exists to create, not an obviously impossible sample.
-      module = { lib, ... }: { common.timeSync.sample = lib.mkForce 4; };
+      # One more than lib/nts-servers.nix has distinct operators (ptb1 and ptb2 are one), so this
+      # sits exactly on the boundary the `operator` field exists to create -- deliberately not a
+      # wild number, which any comparison at all would reject.
+      #
+      # Derived rather than written out: with the list's three operators the literal was 4, and
+      # adding a fourth operator would have made 4 legal, quietly turning this into a case that
+      # never fires. The assertion covers the DoH resolver count in the same message, so `want`
+      # matches whichever of the two bounds a given list trips first.
+      module = { lib, ... }: {
+        common.timeSync.sample = lib.mkForce (builtins.length ntsServers.operators + 1);
+      };
       want = "exceeds either the number of distinct";
     }
     {

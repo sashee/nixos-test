@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion, machineModule, dohStamps, globalTimeout ? 1200 }:
+{ nixpkgs, pkgs, stateVersion, machineModule, dohStamps, ntsServers, globalTimeout ? 1200 }:
 
 # The time-correction service, end to end over both of its TLS legs.
 #
@@ -41,10 +41,19 @@
 # of them, so the disagreement path is covered end to end there instead.
 
 let
+  lib = nixpkgs.lib;
+
   floor = 1000000000;
 
-  goodHost = "time.cloudflare.com";
-  staleHost = "nts.netnod.se";
+  # Which entries of lib/nts-servers.nix each fixture plays, chosen by role rather than named
+  # here -- see tests/nts-fixtures.nix. `key` is what `--only` takes below and `hostname` is
+  # what the certificates and chrony take; both come from the same place, so a rename in
+  # lib/nts-servers.nix cannot leave `--only` naming a provider that no longer exists (which
+  # evaluates fine and fails as an empty draw twenty minutes in).
+  roles = import ./nts-fixtures.nix { inherit lib ntsServers; };
+
+  goodHost = roles.good.hostname;
+  staleHost = roles.stale.hostname;
 
   # The redirect pair. An NTS server may answer key establishment itself and hand timestamping
   # to a DIFFERENT host, using records marked CRITICAL -- lib/nts-servers.nix records that
@@ -57,9 +66,10 @@ let
   # certificate is issued for) and the redirect names `redirectNtpHost`, which resolves back to
   # the same chronyd. One daemon, so the cookies it issued are the cookies it accepts and no
   # NTS key sharing is needed; two names, so following the redirect is observable rather than
-  # indistinguishable from ignoring it.
-  redirectKeHost = "ptbtime1.ptb.de";
-  redirectNtpHost = "ptbtime2.ptb.de";
+  # indistinguishable from ignoring it. The fixture hands back two names under ONE operator for
+  # this, which is the shape the production case has.
+  redirectKeHost = roles.redirectKe.hostname;
+  redirectNtpHost = roles.redirectNtp.hostname;
 
   # Valid now, so the NTS leg's pass 2 succeeds -- and DELIBERATELY not the same window as the
   # good DoH certificate below. The stand-down rule is defined over the validity of *every*
@@ -134,13 +144,57 @@ let
     system.stateVersion = stateVersion;
   };
 
-  # Answers the two NTS hostnames with the addresses passed as argv. Two instances of this exist
+  # The argv contract between the two interceptor nodes and `respond` below, written once. Both
+  # sides used to spell it out -- six hand-numbered positions in the Python and the same six
+  # addresses in the same order in each of the two node definitions -- so an inserted slot had
+  # to be matched in three places or a hostname silently resolved to another server's address.
+  argvSlots = [
+    { node = "ntsgood"; family = "v4"; }
+    { node = "ntsstale"; family = "v4"; }
+    { node = "ntsgood"; family = "v6"; }
+    { node = "ntsstale"; family = "v6"; }
+    { node = "ntsredirect"; family = "v4"; }
+    { node = "ntsredirect"; family = "v6"; }
+  ];
+
+  slotOf =
+    node: family:
+    let
+      idx = lib.lists.findFirstIndex (s: s.node == node && s.family == family) null argvSlots;
+    in
+    if idx == null then throw "tests/time-correction.nix: no argv slot for ${node}/${family}" else toString idx;
+
+  # Which node answers which name. The redirect's key-establishment name and its timestamping
+  # name both resolve to the same node, which is what lets one chronyd play both halves.
+  hostNodes = [
+    { host = goodHost; node = "ntsgood"; }
+    { host = staleHost; node = "ntsstale"; }
+    { host = redirectKeHost; node = "ntsredirect"; }
+    { host = redirectNtpHost; node = "ntsredirect"; }
+  ];
+
+  mapExpr =
+    family:
+    "{"
+    + lib.concatMapStringsSep ", " (e: "\"${e.host}\": ARGS[${slotOf e.node family}]") hostNodes
+    + "}";
+
+  # The addresses a node passes, in the order the slots above declare.
+  interceptorArgs =
+    nodes:
+    map (
+      s:
+      if s.family == "v4" then
+        nodes.${s.node}.networking.primaryIPAddress
+      else
+        nodes.${s.node}.networking.primaryIPv6Address
+    ) argvSlots;
+
+  # Answers the NTS hostnames with the addresses passed as argv. Two instances of this exist
   # on the network, differing only in certificate validity; the driver routes the provider
   # addresses to whichever one a subtest needs.
   # Both families, because time-correction asks for both: querying A alone would resolve an
   # IPv6-only host to an address it has no way to reach.
-  # The redirect's key-establishment name and its timestamping name both resolve to the same
-  # node, which is what lets one chronyd play both halves.
   respond = ''
     def respond(query, meta):
         name, qtype, _, _ = read_question(query)
@@ -152,18 +206,8 @@ let
         # kept talking to the key-establishment host, which answers correctly either way.
         with open("/tmp/queried-names", "a") as log:
             log.write(name + "\n")
-        v4 = {
-            "${goodHost}": ARGS[0],
-            "${staleHost}": ARGS[1],
-            "${redirectKeHost}": ARGS[4],
-            "${redirectNtpHost}": ARGS[4],
-        }
-        v6 = {
-            "${goodHost}": ARGS[2],
-            "${staleHost}": ARGS[3],
-            "${redirectKeHost}": ARGS[5],
-            "${redirectNtpHost}": ARGS[5],
-        }
+        v4 = ${mapExpr "v4"}
+        v6 = ${mapExpr "v6"}
         if name not in v4:
             return nxdomain(query)
         if qtype == 1:
@@ -215,10 +259,10 @@ let
   #
   # Retried, because a single connect is a coin flip on the KVM-less aarch64 runner: this test
   # boots six TCG VMs on four cores, and dnscrypt-proxy's periodic re-probe opens a fresh TLS
-  # connection to every one of its eight upstream entries -- all of which route to the one
-  # interceptor node, whose accept loop does the handshakes itself (the harness wraps the LISTENING
-  # socket). A probe landing in that burst waited out its whole 10s connect timeout on CI while the
-  # same subtest took 1.5s on x86_64.
+  # connection to every one of its upstream entries (one per entry in lib/doh-stamps.nix) -- all
+  # of which route to the one interceptor node, whose accept loop does the handshakes itself (the
+  # harness wraps the LISTENING socket). A probe landing in that burst waited out its whole 10s
+  # connect timeout on CI while the same subtest took 1.5s on x86_64.
   #
   # Retrying cannot mask a wrong answer: only OSError is caught -- the transport never made it far
   # enough to report a chain -- and the caller still pins the count exactly. So the loop can turn a
@@ -277,16 +321,7 @@ nixpkgs.lib.nixos.runTest {
       firewall.enable = false;
     };
     virtualisation.memorySize = 512;
-    systemd.services.fake-doh = dohGood.mkService {
-      args = [
-        nodes.ntsgood.networking.primaryIPAddress
-        nodes.ntsstale.networking.primaryIPAddress
-        nodes.ntsgood.networking.primaryIPv6Address
-        nodes.ntsstale.networking.primaryIPv6Address
-        nodes.ntsredirect.networking.primaryIPAddress
-        nodes.ntsredirect.networking.primaryIPv6Address
-      ];
-    };
+    systemd.services.fake-doh = dohGood.mkService { args = interceptorArgs nodes; };
     system.stateVersion = stateVersion;
   };
 
@@ -296,16 +331,7 @@ nixpkgs.lib.nixos.runTest {
       firewall.enable = false;
     };
     virtualisation.memorySize = 512;
-    systemd.services.fake-doh = dohStale.mkService {
-      args = [
-        nodes.ntsgood.networking.primaryIPAddress
-        nodes.ntsstale.networking.primaryIPAddress
-        nodes.ntsgood.networking.primaryIPv6Address
-        nodes.ntsstale.networking.primaryIPv6Address
-        nodes.ntsredirect.networking.primaryIPAddress
-        nodes.ntsredirect.networking.primaryIPv6Address
-      ];
-    };
+    systemd.services.fake-doh = dohStale.mkService { args = interceptorArgs nodes; };
     system.stateVersion = stateVersion;
   };
 
@@ -595,7 +621,7 @@ nixpkgs.lib.nixos.runTest {
         # The heart of it. ntsstale's certificate chains to a trusted CA, matches the hostname
         # and is accepted by pass 1 -- and expired in 2021, while the server's own clock is
         # correct. Only pass 2 can catch this.
-        output = dry_run("--only netnod", expect_success=False)
+        output = dry_run("--only ${roles.stale.key}", expect_success=False)
         assert "not valid at the time the server reported" in output, output
         assert "NTS-KE" in output, f"the failing leg should be named: {output}"
 
@@ -613,7 +639,7 @@ nixpkgs.lib.nixos.runTest {
         # subtest's command just as reliably, and for a reason that would leave a wrong clock
         # unrecoverable.
         use_resolver(dohstale)
-        output = dry_run("--only cloudflare", expect_success=False)
+        output = dry_run("--only ${roles.good.key}", expect_success=False)
         assert "not valid at the time the server reported" in output, output
         assert "DoH" in output, f"the failing leg should be named: {output}"
         assert "no instant" not in output, (
@@ -624,7 +650,7 @@ nixpkgs.lib.nixos.runTest {
     with subtest("a time below the floor is refused, before any chain is re-verified"):
         # Distinct from the two above: every chain is valid at this instant, and only the floor
         # rejects it. That is what bounds a rollback by a once-valid certificate.
-        output = dry_run(f"--only cloudflare --floor {2 ** 40}", expect_success=False)
+        output = dry_run(f"--only ${roles.good.key} --floor {2 ** 40}", expect_success=False)
         assert "earlier than the build-time floor" in output, output
         # The ORDER, which the spec states and which is not cosmetic: the floor is applied to each
         # provider's own answer before that answer is used to re-verify anything. Pass 2 asks "was
@@ -647,7 +673,7 @@ nixpkgs.lib.nixos.runTest {
         # ntsredirect establishes keys as ${redirectKeHost} and redirects to ${redirectNtpHost},
         # which resolves back to itself. One daemon, so its own cookies authenticate the reply.
         dohgood.succeed("truncate -s 0 /tmp/queried-names")
-        output = dry_run("--only ptb1", expect_success=True)
+        output = dry_run("--only ${roles.redirectKe.key}", expect_success=True)
         assert "would set the clock to" in output, output
 
         # The evidence, and the reason the redirect target has a different name from the key
@@ -676,7 +702,7 @@ nixpkgs.lib.nixos.runTest {
         # asks one pair, so ask for two and let the deliberately-stale one be the second: the run
         # must fail and must NAME the pair that failed, since resolution, key establishment and
         # the NTP exchange are three different faults to go and look at.
-        output = machine.fail("time-correction --force --dry-run --only cloudflare,netnod 2>&1")
+        output = machine.fail("time-correction --force --dry-run --only ${roles.good.key},${roles.stale.key} 2>&1")
         assert "provider pairs failed" in output, output
         assert "netnod" in output, f"the failing pair should be named: {output}"
 
@@ -690,7 +716,7 @@ nixpkgs.lib.nixos.runTest {
         # worked out by hand -- is off by the offset: anya-feher-laptop is Europe/Budapest, so
         # 2030-01-01 00:00:00 landed an hour early and the subtest read it as a clock that moved.
         machine.succeed(f"date -u -s '{when}'")
-        return machine.succeed("time-correction --only cloudflare 2>&1")
+        return machine.succeed("time-correction --only ${roles.good.key} 2>&1")
 
     with subtest("a clock already inside the certificates' validity is left alone"):
         # 2030 is wrong by years and inside both fixtures' validity, which is exactly the state
@@ -732,7 +758,7 @@ nixpkgs.lib.nixos.runTest {
         # here is that a healthy clock is left alone despite what the peer sent.
         machine.succeed(f"date -s @{int(ntsgood.succeed('date +%s').strip())}")
         healthy = clock()
-        output = machine.succeed("time-correction --only cloudflare 2>&1")
+        output = machine.succeed("time-correction --only ${roles.good.key} 2>&1")
         assert "already inside the certificates' validity" in output, output
         assert f"({BOTH_FROM}..{BOTH_UNTIL})" in output, output
         assert abs(clock() - healthy) < 120, f"a correct clock was stepped to {clock()}"
@@ -763,13 +789,13 @@ nixpkgs.lib.nixos.runTest {
         # left, so if --force did not override it this would report a stand-down on every healthy
         # host -- i.e. the escape hatch would be useless precisely where it is used.
         machine.succeed(f"date -u -s '{IN_2030}'")
-        output = machine.succeed("time-correction --force --dry-run --only cloudflare 2>&1")
+        output = machine.succeed("time-correction --force --dry-run --only ${roles.good.key} 2>&1")
         assert "would set the clock to" in output, output
         machine.succeed(f"date -s @{int(ntsgood.succeed('date +%s').strip())}")
 
     with subtest("a v4-only host still gets a clock"):
         disconnect(v4=False, v6=True)
-        dry_run("--only cloudflare", expect_success=True)
+        dry_run("--only ${roles.good.key}", expect_success=True)
         use_resolver(dohgood)
 
     with subtest("a v6-only host still gets a clock"):
@@ -788,7 +814,7 @@ nixpkgs.lib.nixos.runTest {
         # tests/doh-interceptor.nix for why that is not what is being waited on here.
         disconnect(v4=True, v6=False)
         machine.wait_until_succeeds(
-            "time-correction --force --dry-run --only cloudflare", timeout=120
+            "time-correction --force --dry-run --only ${roles.good.key}", timeout=120
         )
         use_resolver(dohgood)
 
@@ -805,7 +831,7 @@ nixpkgs.lib.nixos.runTest {
         # Retried for the same reason as the subtest above: this is the first traffic to the
         # NTS server over IPv6, so its neighbour entry is cold.
         machine.wait_until_succeeds(
-            "time-correction --force --dry-run --only cloudflare", timeout=120
+            "time-correction --force --dry-run --only ${roles.good.key}", timeout=120
         )
         machine.succeed(f"${pkgs.iproute2}/bin/ip route del unreachable {ntsgood_v4}/32")
 

@@ -1,5 +1,12 @@
-{ nixpkgs, pkgs, machineModule, stateVersion }:
+{ nixpkgs, pkgs, machineModule, stateVersion, dohStamps }:
 
+let
+  # The names modules/doh.nix puts in `server_names` and `[static]`, taken from the same
+  # attrset the module reads rather than restated here: a provider added to
+  # lib/doh-stamps.nix must show up in the generated toml, and a provider renamed there
+  # must not leave this test grepping for a name nothing emits any more.
+  stampNamesJson = builtins.toJSON (builtins.attrNames dohStamps.stamps);
+in
 nixpkgs.lib.nixos.runTest {
   name = "doh";
   hostPkgs = pkgs;
@@ -21,6 +28,10 @@ nixpkgs.lib.nixos.runTest {
   };
 
   testScript = ''
+    import json
+
+    stamp_names = json.loads("""${stampNamesJson}""")
+
     start_all()
 
     for node in machines:
@@ -40,14 +51,9 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("${pkgs.nftables}/bin/nft list table inet common-doh-egress")
     machine.succeed("grep -E '^nameserver 127\\.0\\.0\\.1$' /etc/resolv.conf")
     machine.succeed("grep -E '^nameserver ::1$' /etc/resolv.conf")
-    machine.succeed("${pkgs.gnugrep}/bin/grep cloudflare-ipv4 /nix/store/*-dnscrypt-proxy.toml")
-    machine.succeed("${pkgs.gnugrep}/bin/grep cloudflare-ipv6 /nix/store/*-dnscrypt-proxy.toml")
-    machine.succeed("${pkgs.gnugrep}/bin/grep mullvad-ipv4 /nix/store/*-dnscrypt-proxy.toml")
-    machine.succeed("${pkgs.gnugrep}/bin/grep mullvad-ipv6 /nix/store/*-dnscrypt-proxy.toml")
-    machine.succeed("${pkgs.gnugrep}/bin/grep quad9-ipv4 /nix/store/*-dnscrypt-proxy.toml")
-    machine.succeed("${pkgs.gnugrep}/bin/grep quad9-ipv6 /nix/store/*-dnscrypt-proxy.toml")
-    machine.succeed("${pkgs.gnugrep}/bin/grep google-ipv4 /nix/store/*-dnscrypt-proxy.toml")
-    machine.succeed("${pkgs.gnugrep}/bin/grep google-ipv6 /nix/store/*-dnscrypt-proxy.toml")
+    assert stamp_names, "lib/doh-stamps.nix produced no stamps at all"
+    for name in stamp_names:
+        machine.succeed(f"${pkgs.gnugrep}/bin/grep {name} /nix/store/*-dnscrypt-proxy.toml")
 
     dns_peer.succeed("rm -f /tmp/plain-dns-udp-ready /tmp/plain-dns-udp-received /tmp/plain-dns-tcp-ready /tmp/plain-dns-tcp-received")
     dns_peer.succeed("systemd-run --unit plain-dns-udp-server ${pkgs.python3}/bin/python3 -c \"import pathlib,socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('0.0.0.0', 53)); pathlib.Path('/tmp/plain-dns-udp-ready').touch(); data, _ = s.recvfrom(4096); pathlib.Path('/tmp/plain-dns-udp-received').write_bytes(data)\"")

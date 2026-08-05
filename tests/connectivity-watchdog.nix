@@ -85,8 +85,8 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
   skipTypeCheck = true;
 
-  # Impersonates all four DoH providers on their real addresses. Binds 0.0.0.0:443, so it
-  # needs its own node.
+  # Impersonates every DoH provider in lib/doh-stamps.nix on its real address. Binds
+  # 0.0.0.0:443, so it needs its own node.
   nodes.dohpeer = { ... }: {
     networking = {
       hostName = "dohpeer";

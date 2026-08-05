@@ -67,11 +67,15 @@ let
     + " 'https://${host}/dns-query?dns=${interceptor.dnsQuery}'";
   # Bracketed for v6: curl needs the brackets to tell the address apart from --resolve's
   # own host:port:addr colons.
+  #
+  # `v6` is optional in lib/doh-stamps.nix (entriesFor only emits the -ipv6 entry under
+  # `p ? v6`), so it has to be optional here too -- reading it unconditionally made a
+  # v4-only provider an eval error in a test that has nothing to do with it.
   upstreamProbes = pkgs.lib.concatMap
     (p: [
       { label = "${p.hostname} via ${p.v4}"; command = probeCommand p.hostname p.v4; }
-      { label = "${p.hostname} via ${p.v6}"; command = probeCommand p.hostname "[${p.v6}]"; }
-    ])
+    ] ++ pkgs.lib.optional (p ? v6)
+      { label = "${p.hostname} via ${p.v6}"; command = probeCommand p.hostname "[${p.v6}]"; })
     (pkgs.lib.attrValues dohStamps.providers);
   upstreamProbesJson = builtins.toJSON upstreamProbes;
 in

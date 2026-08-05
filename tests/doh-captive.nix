@@ -76,7 +76,7 @@ nixpkgs.lib.nixos.runTest {
 
     def wait_mapped(name, qtype, want, server="127.0.0.1"):
         # Set equality, not "contains": asserting that each expected address appears would
-        # still pass if the map served only one of the four, which is exactly the failure
+        # still pass if the map served only a subset of them, which is exactly the failure
         # this test exists to catch. An unexpected EXTRA answer fails here too.
         got = []
         for _ in range(30):
