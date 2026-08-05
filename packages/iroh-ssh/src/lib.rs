@@ -76,8 +76,11 @@ pub fn id_ticket(key: &SecretKey) -> EndpointTicket {
     EndpointTicket::from(EndpointAddr::new(key.public()))
 }
 
-/// A ticket that only includes the endpoint id and relay urls, which stays
-/// valid across network changes.
+/// A ticket carrying the endpoint id plus the relay urls in use at the time it
+/// was made. It survives the endpoint's addresses changing, but it pins the
+/// dialing side to those relays -- and stops working once one of them goes away
+/// -- so prefer `id_ticket` for anything distributed or probed. The listener
+/// logs this form as a fallback for when discovery is unavailable.
 pub fn short_ticket(addr: &EndpointAddr) -> EndpointTicket {
     let mut short = EndpointAddr::new(addr.id);
     for relay_url in addr.relay_urls() {

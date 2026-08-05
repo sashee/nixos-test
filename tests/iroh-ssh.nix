@@ -283,6 +283,19 @@ nixpkgs.lib.nixos.runTest {
                 return server.succeed(f"{j} | grep -oE 'endpoint[a-z0-9]+' | tail -n1").strip()
         raise Exception("listener never reached the impersonated relay")
 
+    def engagements():
+        # Count openings in the journal rather than sampling the nft chain.
+        # Sampling answers "is the port open right now", which is the wrong
+        # question for an assertion that nothing happened during a window: an
+        # engagement that opened and re-closed inside the window leaves no trace
+        # in the chain. open_port logs exactly once per insert, so the counter
+        # only moves when the failsafe actually engaged. grep -c exits 1 on zero
+        # matches while still printing 0, hence the `|| true`.
+        return int(server.succeed(
+            "journalctl -u iroh-ssh-failsafe.service -o cat"
+            " | grep -cF 'opened port 22' || true"
+        ).strip())
+
     ticket = relay_ticket()
 
     # Published in ExecStartPre, so it exists as soon as the listener has started
@@ -318,6 +331,18 @@ nixpkgs.lib.nixos.runTest {
     assert server.succeed("readlink /run/iroh-ssh").strip() == "private/iroh-ssh"
     private_mode = server.succeed("stat -c '%a %U:%G' /run/private").strip()
     assert private_mode == "700 root:root", f"/run/private is {private_mode}"
+
+    # RuntimeDirectoryPreserve: the ticket outlives the listener. That is the
+    # whole reason for the setting — the moment an operator wants to read the
+    # ticket is the moment the failsafe has opened port 22 over the LAN, and by
+    # definition the listener is not running then. Without preserve systemd takes
+    # the runtime directory down with the unit and the file is simply gone.
+    server.succeed("systemctl stop iroh-ssh.service")
+    preserved = server.succeed("grep . /run/iroh-ssh/ticket").strip()
+    assert preserved == published, \
+        f"ticket did not survive the listener stopping: {published} vs {preserved}"
+    server.succeed("systemctl reset-failed iroh-ssh.service")
+    server.succeed("systemctl start iroh-ssh.service")
 
     # The provisioned secret never leaks into the service journal, environment,
     # or argv. (load_secret has no random fallback, so a mis-read credential
@@ -383,6 +408,7 @@ nixpkgs.lib.nixos.runTest {
     # published ticket keeps naming the identity the listener actually answers on,
     # and the failsafe stays closed. Getting this wrong is what would hold port 22
     # open indefinitely against a perfectly healthy tunnel.
+    before_staging = engagements()
     server.succeed("install -d -m 0700 /etc/credentials/iroh-ssh-2")
     server.succeed("${irohSsh}/bin/iroh-ssh-generate-secret > /root/k2 2>/dev/null")
     server.succeed(
@@ -395,7 +421,11 @@ nixpkgs.lib.nixos.runTest {
     staged = server.succeed("cat /run/iroh-ssh/ticket").strip()
     assert staged == published, \
         f"staging a second credential moved the ticket: {published} vs {staged}"
-    server.succeed(f"test -z \"$({nft_chain} | grep -F 'iroh-ssh-failsafe' || true)\"")
+    # Absence of an event, so this cannot be a wait_until_succeeds. Counted from
+    # before the staging began, so the whole window is covered and not just the
+    # instant a chain sample would have looked at.
+    assert engagements() == before_staging, \
+        "failsafe engaged while a second credential was merely staged"
 
     # And the ticket does follow the credential, on the restart that a
     # credentialDirectory change performs. Overwriting the blob in place is the
@@ -438,5 +468,49 @@ nixpkgs.lib.nixos.runTest {
         f"test -z \"$({nft_chain} | grep -F 'iroh-ssh-failsafe' || true)\"",
         timeout=60,
     )
+
+    # A ticket derivation that fails must leave the previous ticket alone. The
+    # write is a mktemp + rename for exactly this: truncating in place would
+    # briefly publish an empty ticket (reads as no credential) and a partial
+    # write could publish a string that is not this host's endpoint at all.
+    # Keeping the stale one is the fail-safe outcome — nothing answers on it, so
+    # the failsafe engages, which is what a broken credential deserves.
+    #
+    # A blob that does not *decrypt* never reaches the script (systemd fails the
+    # credential load first), so the case has to be a well-formed credential
+    # carrying a malformed key. Last in the file: it leaves the listener
+    # permanently unstartable.
+    good = server.succeed("cat /run/iroh-ssh/ticket").strip()
+    server.succeed("echo notahexkey > /root/bad")
+    server.succeed("rm -f /etc/credentials/iroh-ssh/iroh-secret")
+    server.succeed(
+        "${pkgs.systemd}/bin/systemd-creds encrypt --name=iroh-secret"
+        " /root/bad /etc/credentials/iroh-ssh/iroh-secret"
+    )
+    server.succeed("rm -f /root/bad")
+    server.succeed("systemctl reset-failed iroh-ssh.service")
+    server.fail("systemctl restart iroh-ssh.service")
+    server.fail("systemctl is-active --quiet iroh-ssh.service")
+    # For the expected reason: without this the block would also pass if the
+    # pre-script died to a sandbox denial, which proves nothing about the
+    # derivation's failure handling.
+    server.succeed("journalctl -u iroh-ssh.service -o cat | grep -F 'invalid secret key'")
+
+    # RestartSec=5 with no reachable start limit means this retries every five
+    # seconds indefinitely; give it a few goes, then stop so the check below is
+    # not racing an in-flight derivation. A temp file leaked per attempt would
+    # fill the runtime directory of a host that is already in trouble, which is
+    # what the script's EXIT trap is there to prevent.
+    server.sleep(20)
+    server.succeed("systemctl stop iroh-ssh.service")
+    leftovers = server.succeed("ls /run/iroh-ssh | grep -vx ticket || true").strip()
+    assert leftovers == "", f"failed derivation left temp files: {leftovers}"
+
+    kept = server.succeed("grep . /run/iroh-ssh/ticket").strip()
+    assert kept == good, f"a failed derivation clobbered the ticket: {good} vs {kept}"
+
+    # The consequence the whole mechanism exists for: nothing answers on the
+    # stale ticket, so the failsafe reopens port 22 over the LAN.
+    server.wait_until_succeeds(f"{nft_chain} | grep -F 'iroh-ssh-failsafe'", timeout=120)
   '';
 }

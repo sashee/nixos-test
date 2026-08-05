@@ -95,8 +95,12 @@ let
         # TXT rdata is a sequence of length-prefixed character-strings (RFC 1035),
         # so each string carries its own one-byte length. 255 bytes max each.
         # Length is taken after encoding, not from len(str): the two agree only
-        # for ascii, and a wrong prefix would corrupt the whole record.
+        # for ascii, and a wrong prefix would corrupt the whole record. Over 255
+        # the length byte wraps and the corruption is silent, so refuse instead
+        # of handing back a record the caller will spend a test run debugging.
         encoded = [s.encode("ascii") for s in strings]
+        for b in encoded:
+            assert len(b) <= 255, f"TXT character-string too long ({len(b)}): {b!r}"
         rdata = b"".join(bytes([len(b)]) + b for b in encoded)
         return answer_rdata(query, rdata, ttl)
 

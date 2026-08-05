@@ -462,7 +462,10 @@ Prefer it over the tickets the listener logs, which also embed the relay urls it
 happens to be using at that moment — pinning a client to a relay that may later
 go away. The id-only ticket is resolved through endpoint-id discovery instead, so
 it keeps working wherever the node moves. `sudo`, not `cat`: the file is public
-data but only the failsafe needs it, so it is kept root-only.
+data but only the failsafe needs it, so it is kept root-only. It is also only
+there once the listener has started this boot; when it is not,
+`iroh-ssh-ticket` re-derives the same string from the credential
+(`docs/rpi5-rescue.md`, "Recovering a lost ticket").
 
 To rotate the key, stage a new credential under a *new* directory and point
 `common.irohSsh.credentialDirectory` at it in a commit, rather than overwriting
