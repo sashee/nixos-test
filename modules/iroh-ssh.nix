@@ -21,27 +21,50 @@ let
   # StateDirectory on the failsafe unit.
   failsafeStateDir = "/var/lib/iroh-ssh-failsafe";
 
+  # The canonical connect ticket: endpoint id only, no relay urls. Derived from
+  # the secret alone (see packages/iroh-ssh/src/bin/iroh-ssh-ticket.rs), so it is
+  # exactly the ticket operators distribute -- which is why the failsafe probes
+  # this and nothing else. Public data (an endpoint id), hence world-readable.
+  ticketPath = "/run/iroh-ssh/ticket";
+
+  ticketScript = pkgs.writeShellApplication {
+    name = "iroh-ssh-publish-ticket";
+    runtimeInputs = [ pkg pkgs.coreutils ];
+    text = ''
+      # Written atomically: the failsafe reads this on a timer and must never
+      # observe a half-written ticket.
+      tmp="$(mktemp '${ticketPath}.XXXXXX')"
+      iroh-ssh-ticket > "$tmp"
+      chmod 0644 "$tmp"
+      mv -f "$tmp" '${ticketPath}'
+    '';
+  };
+
   failsafeScript = pkgs.writeShellApplication {
     name = "iroh-ssh-failsafe";
-    runtimeInputs = [ pkg pkgs.nftables pkgs.systemd pkgs.coreutils pkgs.gnugrep pkgs.gnused ];
+    runtimeInputs = [ pkg pkgs.nftables pkgs.coreutils pkgs.gnugrep pkgs.gnused ];
     text = ''
       probe_interval=${toString cfg.failsafe.probeIntervalSeconds}
       recheck_interval=${toString cfg.failsafe.recheckIntervalSeconds}
       down=0
 
-      # Liveness is a functional probe, not unit-state inspection: connect
-      # through the tunnel itself (the short ticket is public — node id +
-      # relay urls — and the listener prints it at every start) and expect
-      # sshd's banner back. Four bytes of "SSH-" prove the relay path, the
-      # QUIC handshake, the local forward, and sshd answering — so a missing
-      # credential, a crash loop, a blocked relay, and a dead sshd all read
-      # as the same thing: not ready. Nothing here depends on the listener's
-      # implementation except the ticket-grep pattern below — adjust that if
-      # the listener is ever swapped for stock dumbpipe.
+      # Liveness is a functional probe, not unit-state inspection: dial the
+      # canonical ticket and expect sshd's banner back. Four bytes of "SSH-"
+      # prove discovery, the QUIC handshake, the local forward, and sshd
+      # answering — so a missing credential, a crash loop, a blocked relay,
+      # unresolvable discovery, and a dead sshd all read as the same thing:
+      # not ready. Nothing here depends on the listener's implementation at
+      # all: the ticket comes from the secret, not from the listener's output,
+      # so the listener could be swapped for stock dumbpipe unchanged.
+      #
+      # Probing the id-only ticket is the point, not an accident. It is what
+      # operators hold, and it exercises discovery — the path a ticket with a
+      # baked-in relay url would skip, hiding exactly the failure that leaves
+      # a distributed ticket unresolvable.
       probe_ok() {
-        # -b: this boot only. A unit that never started this boot leaves no
-        # ticket, which correctly reads as not-ready.
-        ticket="$(journalctl -b -u iroh-ssh.service -o cat | grep -oE 'endpoint[a-z0-9]+' | tail -n1 || true)"
+        # No file means the credential is not provisioned yet (the publisher
+        # unit is condition-skipped), which correctly reads as not-ready.
+        ticket="$(cat '${ticketPath}' 2>/dev/null || true)"
         [ -n "$ticket" ] || return 1
         # sshd speaks first, so nothing needs to be sent. head's early close
         # SIGPIPEs the connect tool — guard the pipeline; timeout bounds it.
@@ -89,7 +112,7 @@ let
       # probe_interval (hourly by default); a failure switches to the fast
       # recheck_interval so the delaySeconds window is actually measurable
       # and a recovered tunnel closes port 22 promptly. The first probe runs
-      # right away, so a credential-less boot (journal grep only, no relay
+      # right away, so a credential-less boot (a missing ticket file, no
       # traffic) opens port 22 delaySeconds after boot, not an hour later.
       # Counting iterations is monotonic by construction: wall-clock jumps
       # (NTP, tests warping `date -s`) must not trip the failsafe early, so
@@ -245,6 +268,57 @@ in
       };
     };
 
+    # Publishes the canonical (id-only) ticket for the failsafe to probe. Split
+    # from both the listener and the failsafe so the long-running failsafe never
+    # needs the secret — it reads a file holding public data. The derivation is
+    # offline (hence PrivateNetwork), so the ticket exists before the listener
+    # has ever reached a relay: a freshly provisioned host is probeable at once,
+    # and a lost relay race at boot cannot change what gets probed.
+    systemd.services.iroh-ssh-ticket = {
+      description = "Publish the iroh-ssh connect ticket";
+      wantedBy = [ "multi-user.target" ];
+      # Same gate as the listener: skip quietly until the operator provisions
+      # the blob, rather than failing on every boot.
+      unitConfig.ConditionPathExists = [ secretPath ];
+      serviceConfig = {
+        Type = "oneshot";
+        # Keeps the runtime directory (and so the ticket) alive after exit.
+        RemainAfterExit = true;
+        ExecStart = lib.getExe ticketScript;
+        RuntimeDirectory = "iroh-ssh";
+        RuntimeDirectoryMode = "0755";
+        RuntimeDirectoryPreserve = "yes";
+        LoadCredentialEncrypted = [ "iroh-secret:${secretPath}" ];
+        DynamicUser = true;
+        NoNewPrivileges = true;
+        CapabilityBoundingSet = "";
+        # Deriving a public key from a secret needs no network at all.
+        PrivateNetwork = true;
+        RestrictAddressFamilies = [ "AF_UNIX" ];
+        SystemCallFilter = [ "@system-service" "~@resources" ];
+        SystemCallArchitectures = "native";
+        MemoryDenyWriteExecute = true;
+        ProcSubset = "pid";
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectProc = "invisible";
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        LockPersonality = true;
+        RemoveIPC = true;
+        KeyringMode = "private";
+      };
+    };
+
     # Failsafe: while the tunnel is not ready, the host would be unreachable
     # for exactly the repairs that need it, so after delaySeconds of downtime
     # port 22 opens to the local network (sshd itself is key-only) and closes
@@ -256,7 +330,10 @@ in
     systemd.services.iroh-ssh-failsafe = lib.mkIf (cfg.failsafe.enable && firewallManaged) {
       description = "Open firewall port 22 while the iroh SSH tunnel is down";
       wantedBy = [ "multi-user.target" ];
-      after = [ "nftables.service" ];
+      # iroh-ssh-ticket publishes the ticket this probes. Ordering only: when the
+      # credential is missing that unit is condition-skipped, and the probe must
+      # still run and read a missing file as not-ready.
+      after = [ "nftables.service" "iroh-ssh-ticket.service" ];
       serviceConfig = {
         ExecStart = lib.getExe failsafeScript;
         Restart = "always";

@@ -28,3 +28,7 @@ path = "src/bin/iroh-ssh-connect.rs"
 [[bin]]
 name = "iroh-ssh-generate-secret"
 path = "src/bin/iroh-ssh-generate-secret.rs"
+
+[[bin]]
+name = "iroh-ssh-ticket"
+path = "src/bin/iroh-ssh-ticket.rs"
