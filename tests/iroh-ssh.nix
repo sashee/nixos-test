@@ -9,6 +9,17 @@ let
   # regions don't silently drift the test.
   relayDomain = "relay.n0.iroh.link";
 
+  # Endpoint-id discovery lives under this domain: the canonical (id-only) ticket
+  # carries no relay url, so the dialing side resolves
+  # `_iroh.<z32-endpoint-id>.dns.iroh.link TXT` to find the endpoint.
+  discoveryDomain = "dns.iroh.link";
+
+  # Handed back as the discovered home relay. Every relay hostname resolves to the
+  # one impersonated relay node, so which region label we advertise does not
+  # matter -- the relay routes by endpoint id. Trailing dot matches how iroh's own
+  # defaults spell these urls.
+  discoveredRelayUrl = "https://euc1-1.${relayDomain}.";
+
   # DoH interception (shared harness): impersonate the deployed DoH upstreams so
   # the stock nodes resolve the relay hostnames to our relay node.
   interceptor = import ./doh-interceptor.nix {
@@ -21,7 +32,15 @@ let
               return a(query, ARGS[0])   # ARGS[0] = the relay node's IP
           if name.endswith(".${relayDomain}"):
               return nodata(query)       # fall back to A
-          return nxdomain(query)         # dns.iroh.link discovery, bootstrap, ...
+          # Endpoint-id discovery, for any id: the canonical ticket has no relay
+          # url, so this is the only way the dialing side finds the listener.
+          # Answering statically keeps the node stock -- it still publishes to the
+          # (unreachable) real pkarr relay and resolves through its own DoH path.
+          if name.startswith("_iroh.") and name.endswith(".${discoveryDomain}"):
+              if qtype == 16:
+                  return txt(query, "relay=${discoveredRelayUrl}")
+              return nodata(query)       # fall back to TXT
+          return nxdomain(query)         # bootstrap, everything else
     '';
   };
   dohIpv4Json = builtins.toJSON interceptor.dohIpv4;
@@ -230,6 +249,25 @@ nixpkgs.lib.nixos.runTest {
     server.succeed("systemctl cat iroh-ssh.service | grep -F 'ProcSubset=pid'")
     server.succeed("systemctl cat iroh-ssh.service | grep -F '~@resources'")
 
+    # The ticket publisher derives the canonical ticket from the secret alone, so
+    # it needs no network at all — asserted on the unit, since that is the whole
+    # reason it can run before the listener has ever reached a relay.
+    server.succeed("systemctl cat iroh-ssh-ticket.service | grep -F 'PrivateNetwork=true'")
+    server.succeed("systemctl cat iroh-ssh-ticket.service | grep -F 'LoadCredentialEncrypted=iroh-secret:/etc/credentials/iroh-ssh/iroh-secret'")
+    # The long-running failsafe must never be handed the secret; it reads the file.
+    server.fail("systemctl cat iroh-ssh-failsafe.service | grep -F 'LoadCredential'")
+
+    # Condition-skipped at boot (no credential); now that the blob exists it
+    # publishes. No listener and no relay are involved.
+    server.succeed("systemctl start iroh-ssh-ticket.service")
+    published = server.succeed("cat /run/iroh-ssh/ticket").strip()
+    assert published.startswith("endpoint"), f"unexpected ticket: {published}"
+
+    # Pure function of the secret: re-running reproduces it byte for byte.
+    server.succeed("systemctl restart iroh-ssh-ticket.service")
+    again = server.succeed("cat /run/iroh-ssh/ticket").strip()
+    assert again == published, f"ticket not reproducible: {published} vs {again}"
+
     # Fetch this run's short ticket (node id + relay url). The listener prints it
     # only after reaching the (impersonated) relay; if the 5s online timeout
     # expires under boot load it logs a warning and prints a relay-less ticket,
@@ -261,8 +299,18 @@ nixpkgs.lib.nixos.runTest {
     assert len(os.path.commonprefix([ticket, second])) >= 50, \
         f"node id changed across restart: {ticket} vs {second}"
 
+    # Same identity from both directions: the published ticket is the same node id
+    # the listener advertises, just without the relay-url tail — so it is strictly
+    # shorter and shares the id prefix.
+    assert len(os.path.commonprefix([published, ticket])) >= 50, \
+        f"published ticket is a different node id: {published} vs {ticket}"
+    assert len(published) < len(ticket), \
+        f"published ticket should carry no relay url: {published} vs {ticket}"
+
     # The tunnel is ready (relay_ticket saw a clean start), so the failsafe
     # closes its port-22 opening within one poll; wait rather than race it.
+    # This now also proves the id-only dial works: the probe resolves the endpoint
+    # id through discovery, with no relay url to short-circuit it.
     server.wait_until_succeeds(
         f"test -z \"$({nft_chain} | grep -F 'iroh-ssh-failsafe' || true)\"",
         timeout=60,
@@ -275,6 +323,15 @@ nixpkgs.lib.nixos.runTest {
     hostname = client.wait_until_succeeds(
         "ssh -o StrictHostKeyChecking=no"
         f" -o ProxyCommand='iroh-ssh-connect {ticket}' root@tunnel hostname",
+        timeout=180,
+    ).strip()
+    assert hostname == "iroh-server", f"unexpected hostname: {hostname}"
+
+    # End-to-end on the operator's actual path: the canonical id-only ticket, which
+    # has no relay url and so must be resolved through endpoint-id discovery.
+    hostname = client.wait_until_succeeds(
+        "ssh -o StrictHostKeyChecking=no"
+        f" -o ProxyCommand='iroh-ssh-connect {published}' root@tunnel hostname",
         timeout=180,
     ).strip()
     assert hostname == "iroh-server", f"unexpected hostname: {hostname}"

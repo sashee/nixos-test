@@ -91,6 +91,12 @@ let
     def aaaa(query, ip, ttl=60):
         return answer_rdata(query, socket.inet_pton(socket.AF_INET6, ip), ttl)
 
+    def txt(query, *strings, ttl=60):
+        # TXT rdata is a sequence of length-prefixed character-strings (RFC 1035),
+        # so each string carries its own one-byte length. 255 chars max each.
+        rdata = b"".join(bytes([len(s)]) + s.encode("ascii") for s in strings)
+        return answer_rdata(query, rdata, ttl)
+
     ${respond}
 
     class Handler(http.server.BaseHTTPRequestHandler):

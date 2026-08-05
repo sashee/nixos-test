@@ -381,8 +381,8 @@ network (`services.openssh` is enabled with `mkDefault` and
 (`common.irohSsh.enable = false` opts out).
 
 A **failsafe** watchdog probes the tunnel end-to-end: it dials the host's own
-listener over iroh (using the public short ticket from the journal and an
-ephemeral key) and checks that sshd answers with its banner — hourly while
+listener over iroh (using the canonical ticket and an ephemeral key) and
+checks that sshd answers with its banner — hourly while
 probes succeed, then every 30 seconds after a failure so the 5-minute window
 is actually measured. If the tunnel has not answered for 5 continuous minutes
 — missing or lost credential, crash loop, blocked relay, dead sshd all read
@@ -392,10 +392,14 @@ within one recheck of the first successful probe. sshd is key-only, so an
 engaged failsafe exposes only the ssh handshake to the local network. This
 also makes first-time provisioning possible over the LAN: the first probe
 runs at boot, so a freshly installed host with no iroh credential yet (a
-traffic-free journal check) has port 22 open minutes after boot until the
-secret lands. The probe inspects nothing about the listener's implementation
-(only the ticket text in the journal), keeping the binary a faithful dumbpipe
-derivative. Tune or disable with
+traffic-free check for the ticket file) has port 22 open minutes after boot
+until the secret lands. The probe inspects nothing about the listener at all —
+not even its output: the ticket it dials is derived from the secret by
+`iroh-ssh-ticket` and published to `/run/iroh-ssh/ticket`, so the listener
+stays a faithful dumbpipe derivative and could be swapped for stock dumbpipe
+unchanged. That ticket is also the one operators distribute, so the probe
+exercises the path clients actually use — endpoint-id discovery — rather than a
+relay url that no distributed ticket contains. Tune or disable with
 `common.irohSsh.failsafe.{enable,delaySeconds,probeIntervalSeconds,recheckIntervalSeconds}`;
 the monitoring check reports when the failsafe is engaged.
 
@@ -436,12 +440,18 @@ id to stderr while the secret goes to stdout for the pipe. Set
 refuses to decrypt it. Until the blob exists the unit skips gracefully
 (`ConditionPathExists`) instead of crash-looping.
 
-Read the connect ticket from the journal — the last printed (short) ticket is
-stable across restarts and networks because the key is stable, so grab it once:
+Read the connect ticket from the running host. It is derived from the secret, so
+it is stable across restarts, networks and relay changes — grab it once:
 
 ```bash
-journalctl -u iroh-ssh.service | grep 'iroh-ssh-connect'
+cat /run/iroh-ssh/ticket
 ```
+
+This is the canonical form: the endpoint id and nothing else. Prefer it over the
+tickets the listener logs, which also embed the relay urls it happens to be using
+at that moment — pinning a client to a relay that may later go away. The id-only
+ticket is resolved through endpoint-id discovery instead, so it keeps working
+wherever the node moves.
 
 Connect from any machine, no IP address needed (`nix run
 github:sashee/nixos-test#iroh-ssh` works in place of an installed
