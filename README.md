@@ -381,25 +381,29 @@ network (`services.openssh` is enabled with `mkDefault` and
 (`common.irohSsh.enable = false` opts out).
 
 A **failsafe** watchdog probes the tunnel end-to-end: it dials the host's own
-listener over iroh (using the canonical ticket and an ephemeral key) and
-checks that sshd answers with its banner — hourly while
-probes succeed, then every 30 seconds after a failure so the 5-minute window
-is actually measured. If the tunnel has not answered for 5 continuous minutes
-— missing or lost credential, crash loop, blocked relay, dead sshd all read
-the same — it opens firewall port 22 at runtime so the operator can still
-ssh in over the local network and repair remote management, and closes it
-within one recheck of the first successful probe. sshd is key-only, so an
-engaged failsafe exposes only the ssh handshake to the local network. This
-also makes first-time provisioning possible over the LAN: the first probe
-runs at boot, so a freshly installed host with no iroh credential yet (a
-traffic-free check for the ticket file) has port 22 open minutes after boot
-until the secret lands. The probe inspects nothing about the listener at all —
-not even its output: the ticket it dials is derived from the secret by
-`iroh-ssh-ticket` and published to `/run/iroh-ssh/ticket`, so the listener
-stays a faithful dumbpipe derivative and could be swapped for stock dumbpipe
-unchanged. That ticket is also the one operators distribute, so the probe
-exercises the path clients actually use — endpoint-id discovery — rather than a
-relay url that no distributed ticket contains. Tune or disable with
+listener over iroh (using the canonical ticket and an ephemeral key) and checks
+that sshd answers with its banner — hourly while probes succeed, then every 30
+seconds after a failure so the 15-minute window is actually measured. If the
+tunnel has not answered for 15 continuous minutes — missing or lost credential,
+crash loop, blocked relay, dead sshd all read the same — it opens firewall port
+22 at runtime so the operator can still ssh in over the local network and repair
+remote management, and closes it within one recheck of the first successful
+probe. sshd is key-only, so an engaged failsafe exposes only the ssh handshake
+to the local network. This also makes first-time provisioning possible over the
+LAN: the first probe runs at boot, so a freshly installed host with no iroh
+credential yet (a traffic-free check for the ticket file) has port 22 open
+minutes after boot until the secret lands. The probe inspects nothing about the
+listener at all — not even its output: the ticket it dials is derived from the
+secret by `iroh-ssh-ticket` and published to `/run/iroh-ssh/ticket` (at boot,
+and again whenever the secret is written, so provisioning or rotating it needs
+no reboot), so the listener stays a faithful dumbpipe derivative and could be
+swapped for stock dumbpipe unchanged. That ticket is also the one operators
+distribute, so the probe exercises the path clients actually use — endpoint-id
+discovery — rather than a relay url that no distributed ticket contains. The
+flip side is that the failsafe is fate-shared with that discovery: while
+`dns.iroh.link` is not answering, the tunnel reads as down, which is why the
+window is 15 minutes and not 5 (the negative-TTL story is in the `delaySeconds`
+option doc). Tune or disable with
 `common.irohSsh.failsafe.{enable,delaySeconds,probeIntervalSeconds,recheckIntervalSeconds}`;
 the monitoring check reports when the failsafe is engaged.
 

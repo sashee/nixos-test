@@ -67,6 +67,15 @@ pub async fn create_endpoint(secret_key: SecretKey, alpns: Vec<Vec<u8>>) -> Resu
         .anyerr()
 }
 
+/// The canonical connect ticket: the endpoint id and nothing else. A pure
+/// function of the key -- no endpoint is bound and no network is touched -- so
+/// it is stable across restarts, networks and relay changes, and the connecting
+/// side resolves the id through discovery. This is the form operators
+/// distribute, and the form the failsafe probes.
+pub fn id_ticket(key: &SecretKey) -> EndpointTicket {
+    EndpointTicket::from(EndpointAddr::new(key.public()))
+}
+
 /// A ticket that only includes the endpoint id and relay urls, which stays
 /// valid across network changes.
 pub fn short_ticket(addr: &EndpointAddr) -> EndpointTicket {

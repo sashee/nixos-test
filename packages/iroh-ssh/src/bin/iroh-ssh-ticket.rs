@@ -11,15 +11,13 @@
 //!
 //! The secret is read exactly as the listener reads it (see `load_secret`): an
 //! explicit path, the systemd credential, or `$IROH_SECRET`.
-use iroh::EndpointAddr;
-use iroh_ssh::load_secret;
+use iroh_ssh::{id_ticket, load_secret};
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_error::Result;
 
 /// Derive the id-only ticket. Pure: same secret in, same ticket out, offline.
 fn ticket() -> Result<EndpointTicket> {
-    let key = load_secret(None)?;
-    Ok(EndpointTicket::from(EndpointAddr::new(key.public())))
+    Ok(id_ticket(&load_secret(None)?))
 }
 
 fn main() -> ! {

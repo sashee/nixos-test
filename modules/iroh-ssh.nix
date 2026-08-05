@@ -32,8 +32,11 @@ let
     runtimeInputs = [ pkg pkgs.coreutils ];
     text = ''
       # Written atomically: the failsafe reads this on a timer and must never
-      # observe a half-written ticket.
+      # observe a half-written ticket. The trap matters because the derivation
+      # can fail (an unreadable or malformed credential) between mktemp and mv,
+      # which would otherwise litter the runtime directory on every retry.
       tmp="$(mktemp '${ticketPath}.XXXXXX')"
+      trap 'rm -f "$tmp"' EXIT
       iroh-ssh-ticket > "$tmp"
       chmod 0644 "$tmp"
       mv -f "$tmp" '${ticketPath}'
@@ -163,6 +166,12 @@ in
           the operator can still ssh in over the local network and repair
           remote management; close it again as soon as the tunnel is ready.
           Only active when this host runs the nftables firewall.
+
+          Readiness is measured on the operator's own connect path: the
+          canonical id-only ticket, dialed through endpoint-id discovery. A
+          discovery outage therefore also reads as not-ready -- correctly, since
+          a distributed ticket is unresolvable then too, but it does make the
+          failsafe fate-shared with n0 DNS (see delaySeconds).
         '';
       };
 
@@ -274,6 +283,15 @@ in
     # offline (hence PrivateNetwork), so the ticket exists before the listener
     # has ever reached a relay: a freshly provisioned host is probeable at once,
     # and a lost relay race at boot cannot change what gets probed.
+    #
+    # Runs at boot and, via iroh-ssh-ticket.path below, whenever the secret is
+    # written — the published ticket is a function of that file and must not
+    # outlive it. Deliberately *not* RemainAfterExit: an already-active oneshot
+    # swallows every later start, which would pin the ticket to whichever secret
+    # happened to be in place first (a rotated key would keep being probed under
+    # its old endpoint id, so the failsafe would hold port 22 open forever
+    # against a perfectly healthy tunnel). RuntimeDirectoryPreserve is what
+    # keeps the ticket readable after the unit exits.
     systemd.services.iroh-ssh-ticket = {
       description = "Publish the iroh-ssh connect ticket";
       wantedBy = [ "multi-user.target" ];
@@ -282,8 +300,6 @@ in
       unitConfig.ConditionPathExists = [ secretPath ];
       serviceConfig = {
         Type = "oneshot";
-        # Keeps the runtime directory (and so the ticket) alive after exit.
-        RemainAfterExit = true;
         ExecStart = lib.getExe ticketScript;
         RuntimeDirectory = "iroh-ssh";
         RuntimeDirectoryMode = "0755";
@@ -317,6 +333,19 @@ in
         RemoveIPC = true;
         KeyringMode = "private";
       };
+    };
+
+    # Republish whenever the secret is written: provisioning it on a running
+    # host, or rotating it, must reach the failsafe without a reboot. PathChanged
+    # (not PathExists) on purpose — it is edge-triggered on inotify, so it fires
+    # on creation and on close-after-write but does not re-fire while the file
+    # merely continues to exist, which with a plain oneshot would loop until the
+    # trigger rate limit stopped it. The boot case is the service's own
+    # wantedBy: PathChanged says nothing about a file that was already there.
+    systemd.paths.iroh-ssh-ticket = {
+      description = "Republish the iroh-ssh connect ticket when the secret changes";
+      wantedBy = [ "multi-user.target" ];
+      pathConfig.PathChanged = secretPath;
     };
 
     # Failsafe: while the tunnel is not ready, the host would be unreachable

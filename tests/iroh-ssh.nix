@@ -257,10 +257,14 @@ nixpkgs.lib.nixos.runTest {
     # The long-running failsafe must never be handed the secret; it reads the file.
     server.fail("systemctl cat iroh-ssh-failsafe.service | grep -F 'LoadCredential'")
 
-    # Condition-skipped at boot (no credential); now that the blob exists it
-    # publishes. No listener and no relay are involved.
-    server.succeed("systemctl start iroh-ssh-ticket.service")
-    published = server.succeed("cat /run/iroh-ssh/ticket").strip()
+    # Condition-skipped at boot (no credential), so writing the blob above is
+    # what must bring the ticket into existence — iroh-ssh-ticket.path watches
+    # the secret. Waited for rather than hand-started on purpose: starting the
+    # unit here would assert only that the binary works, and a missing trigger
+    # would stay invisible while the failsafe probed nothing forever. No
+    # listener and no relay are involved. grep .: an empty file must not pass
+    # as a ticket.
+    published = server.wait_until_succeeds("grep . /run/iroh-ssh/ticket", timeout=60).strip()
     assert published.startswith("endpoint"), f"unexpected ticket: {published}"
 
     # Pure function of the secret: re-running reproduces it byte for byte.
@@ -274,6 +278,11 @@ nixpkgs.lib.nixos.runTest {
     # so restart until an invocation connects cleanly (no warning).
     def relay_ticket():
         for _ in range(6):
+            # reset-failed: this helper is called several times and retries
+            # inside, and enough back-to-back restarts trip the unit's default
+            # start rate limit — which would fail the restart itself rather than
+            # the thing under test.
+            server.succeed("systemctl reset-failed iroh-ssh.service")
             server.succeed("systemctl restart iroh-ssh.service")
             inv = server.succeed("systemctl show -p InvocationID --value iroh-ssh.service").strip()
             j = f"journalctl _SYSTEMD_INVOCATION_ID={inv} -o cat"
@@ -335,6 +344,41 @@ nixpkgs.lib.nixos.runTest {
         timeout=180,
     ).strip()
     assert hostname == "iroh-server", f"unexpected hostname: {hostname}"
+
+    # Rotation (the flow in docs/rpi5-rescue.md): the published ticket is a
+    # function of the secret, so replacing the blob must repoint the probe. If it
+    # did not, the failsafe would keep dialing the retired endpoint id — nothing
+    # answers there any more, so it would hold port 22 open indefinitely against
+    # a perfectly healthy tunnel, and /run/iroh-ssh/ticket would hand operators a
+    # dead ticket. Removing the blob first mirrors "regenerate and re-encrypt"
+    # and keeps the write unconditional.
+    server.succeed("${irohSsh}/bin/iroh-ssh-generate-secret > /root/k2 2>/dev/null")
+    server.succeed("rm -f /etc/credentials/iroh-ssh/iroh-secret")
+    server.succeed(
+        "${pkgs.systemd}/bin/systemd-creds encrypt --name=iroh-secret"
+        " /root/k2 /etc/credentials/iroh-ssh/iroh-secret"
+    )
+    server.succeed("rm -f /root/k2")
+
+    # Again no unit is started by hand: writing the blob is the whole trigger.
+    rotated = server.wait_until_succeeds(
+        f"grep . /run/iroh-ssh/ticket | grep -vFx '{published}'",
+        timeout=60,
+    ).strip()
+    assert rotated.startswith("endpoint"), f"unexpected rotated ticket: {rotated}"
+
+    # The listener picks up the new identity on restart; publisher and listener
+    # must then agree, exactly as they did before the rotation.
+    third = relay_ticket()
+    assert len(os.path.commonprefix([rotated, third])) >= 50, \
+        f"published ticket does not match the rotated listener: {rotated} vs {third}"
+
+    # And the probe follows the rotation end to end: this only closes if the
+    # failsafe dialed the *new* id through discovery and got sshd's banner back.
+    server.wait_until_succeeds(
+        f"test -z \"$({nft_chain} | grep -F 'iroh-ssh-failsafe' || true)\"",
+        timeout=120,
+    )
 
     # Failure while the tunnel service keeps running: with sshd stopped the
     # probe still connects over iroh but gets no banner back, so the failsafe
