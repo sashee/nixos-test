@@ -259,10 +259,14 @@ let
   #
   # Retried, because a single connect is a coin flip on the KVM-less aarch64 runner: this test
   # boots six TCG VMs on four cores, and dnscrypt-proxy's periodic re-probe opens a fresh TLS
-  # connection to every one of its upstream entries (one per entry in lib/doh-stamps.nix) -- all
-  # of which route to the one interceptor node, whose accept loop does the handshakes itself (the
-  # harness wraps the LISTENING socket). A probe landing in that burst waited out its whole 10s
-  # connect timeout on CI while the same subtest took 1.5s on x86_64.
+  # connection to every one of its upstream entries (one per entry in lib/doh-stamps.nix), all of
+  # which route to the one interceptor node. A connect landing in that burst took the whole 10s
+  # timeout on CI while the same subtest took 1.5s on x86_64.
+  #
+  # Ordinary slowness is now all the retry is for. It used to cover head-of-line blocking as well:
+  # the harness handshook inside its accept loop, so one peer that connected and went quiet stalled
+  # every connection behind it -- which is what failed this subtest for 130s on the aarch64 runner
+  # before tests/doh-interceptor.nix moved the handshake into the per-connection thread.
   #
   # Retrying cannot mask a wrong answer: only OSError is caught -- the transport never made it far
   # enough to report a chain -- and the caller still pins the count exactly. So the loop can turn a
@@ -493,6 +497,26 @@ nixpkgs.lib.nixos.runTest {
 
     def clock():
         return int(machine.succeed("date +%s").strip())
+
+    def with_doh_diagnostics(thunk):
+        # For the one place that dials the interceptor's TLS directly rather than through
+        # time-correction, which reports its own failures. A bare "connect failed" from there is
+        # indistinguishable between "the server is gone", "the server is up but not accepting" and
+        # "the machine never got a packet out" -- telling those apart last time meant correlating
+        # dnscrypt-proxy's latency tables across two probe rounds. `execute` rather than `succeed`:
+        # this runs when something is already wrong, so a diagnostic that can itself fail the test
+        # is worse than useless.
+        try:
+            return thunk()
+        except Exception:
+            for node, command in [
+                (machine, "${pkgs.iproute2}/bin/ss -tan state all '( dport = :443 )'"),
+                (dohgood, "systemctl status fake-doh --no-pager --full"),
+                (dohgood, "${pkgs.iproute2}/bin/ss -ltn"),
+                (dohgood, "${pkgs.iproute2}/bin/ss -tan state all '( sport = :443 )'"),
+            ]:
+                print(f"### {node.name}: {command}\n{node.execute(command)[1]}")
+            raise
 
     def dry_run(args, expect_success):
         # --force because the machine's clock is often already fine here, and a clock inside the
@@ -748,9 +772,9 @@ nixpkgs.lib.nixos.runTest {
         # Non-vacuous in both directions, which matters more here than usual because the fixture is
         # only a fixture if the extra certificate really goes out on the wire: the peer is asked
         # what it sends, and the reported window is pinned exactly rather than merely "inside".
-        sent = int(machine.succeed(
+        sent = int(with_doh_diagnostics(lambda: machine.succeed(
             f"${peerChainCount} {doh_ipv4[0]} {doh_domains[0]}"
-        ).strip())
+        )).strip())
         assert sent == 2, f"dohgood sent {sent} certificates, not its leaf plus the off-path one"
 
         # The clock the NTS server itself keeps, i.e. right. Not IN_2030: the subtest above already
