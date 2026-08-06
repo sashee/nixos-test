@@ -7,6 +7,17 @@ FLAKE := path:$(CURDIR)
 # Override (e.g. MAX_JOBS=1) on RAM-constrained machines.
 MAX_JOBS := auto
 
+# Attempts per check before run-checks gives up. 1 everywhere except the
+# rpi/aarch64 set: that runner (ubuntu-24.04-arm) has no /dev/kvm, so its guests
+# run under TCG and timing-sensitive tests lose races they win with KVM - CI run
+# 31093886542 opened iroh-ssh's failsafe against a demonstrably healthy tunnel
+# because three probes in a row came back empty during relay churn. The x86 and
+# per-host sets run with KVM and get no retry, so a failure there stays a
+# failure. A retry re-runs the VM test for real: nix does not cache build
+# failures, and the check derivation is unchanged, so the same drv is built
+# again.
+ATTEMPTS := 1
+
 .PHONY: host-vm update-flake run-tests run-rpi-tests run-host-tests run-checks export-rpi-kernel import-rpi-kernel
 
 # QEMU runner for a laptop host config; run it with ./result/bin/run-<host>-vm
@@ -21,7 +32,7 @@ run-tests:
 	$(MAKE) run-checks SYSTEM=x86_64-linux SET=generic-x86
 
 run-rpi-tests:
-	$(MAKE) run-checks SYSTEM=aarch64-linux
+	$(MAKE) run-checks SYSTEM=aarch64-linux ATTEMPTS=2
 
 # Per-host check set (lib.checkSets.<host>), run by the host's own CI job.
 run-host-tests:
@@ -62,6 +73,12 @@ import-rpi-kernel:
 # SET (optional) names a lib.checkSets.<SET> subset to run; the checks are
 # still addressed as checks.$(SYSTEM).<name> (names are globally unique).
 # Without SET the whole checks.$(SYSTEM) runs (the rpi/aarch64 path).
+#
+# Each check gets up to ATTEMPTS runs (see above). A pass that needed a retry is
+# announced as "=== FLAKY: <name> ...", so grepping the CI log still shows which
+# tests are unstable instead of the retry quietly absorbing them. The loop stops
+# at the first check that exhausts its attempts, so a genuinely broken suite
+# costs one extra check run, not double.
 run-checks:
 	@test -n "$(SYSTEM)" || { echo "use 'make run-tests', 'make run-rpi-tests' or 'make run-host-tests HOST=...'" >&2; exit 1; }
 	set -euo pipefail; \
@@ -70,7 +87,16 @@ run-checks:
 	echo "$$names_attr:" $$attrs; \
 	mkdir -p results/$(SYSTEM); \
 	for name in $$attrs; do \
-		echo "=== check: $$name"; \
-		$(NIX) build -L --max-jobs $(MAX_JOBS) -o "results/$(SYSTEM)/$$name" "$(FLAKE)#checks.$(SYSTEM).$$name"; \
+		attempt=1; \
+		while :; do \
+			echo "=== check: $$name (attempt $$attempt/$(ATTEMPTS))"; \
+			if $(NIX) build -L --max-jobs $(MAX_JOBS) -o "results/$(SYSTEM)/$$name" "$(FLAKE)#checks.$(SYSTEM).$$name"; then \
+				if [ "$$attempt" -gt 1 ]; then echo "=== FLAKY: $$name passed on attempt $$attempt of $(ATTEMPTS)"; fi; \
+				break; \
+			fi; \
+			if [ "$$attempt" -ge $(ATTEMPTS) ]; then echo "=== FAILED: $$name after $(ATTEMPTS) attempt(s)" >&2; exit 1; fi; \
+			echo "=== RETRY: $$name failed on attempt $$attempt, retrying" >&2; \
+			attempt=$$((attempt + 1)); \
+		done; \
 	done; \
 	echo "=== all checks.$(SYSTEM) passed"
