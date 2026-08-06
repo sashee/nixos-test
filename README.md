@@ -809,6 +809,13 @@ make run-host-tests HOST=anya-feher-laptop
 make run-rpi-tests
 ```
 
+`run-rpi-tests` gives each check two attempts (`ATTEMPTS=2`), because the aarch64
+CI runner has no KVM and its TCG guests are slow enough to lose races the x86
+runs win. A check that only passed on the retry prints `=== FLAKY: <name> passed
+on attempt 2 of 2`, so retries stay visible in the log rather than silently
+absorbing an unstable test. The x86 and per-host suites get one attempt, so a
+failure there is a real failure; pass `ATTEMPTS=2` explicitly to retry them too.
+
 The default package is the graphical QEMU VM runner (no tests):
 
 ```bash
