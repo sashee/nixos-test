@@ -73,6 +73,24 @@
       testNodeTimeSyncOff = { lib, ... }: {
         common.timeSync.enable = lib.mkOverride 90 false;
       };
+      # The same treatment for the measurement receiver. Its clock gate refuses to start the
+      # service until the kernel's clock error estimate is small, and a test node has no time
+      # source to get there with: testNodeTimeSyncOff took chrony away and qemu-vm.nix had
+      # already disabled timesyncd. So the gate holds every boot for its full derived
+      # TimeoutStartSec and then fails the unit, which is how it broke the system-metrics test
+      # -- a test that holds its NTP node down on purpose, to watch the producer wait for a
+      # clock it does not have yet.
+      #
+      # This is the only place the gate is switched off. It is exercised by the two
+      # monitoringPlatformTests* suites, which are the only nodes that can satisfy it: each
+      # brings its own NTP node and forces this back on. The rpi one, against the real Pi
+      # config, is where the gate's correctness is decided.
+      #
+      # Priority 90 for the same reason as testNodeTimeSyncOff: leave mkForce free for the
+      # suite that must switch it back on.
+      testNodeClockGateOff = { lib, ... }: {
+        services.monitoring-platform.clockGate.enable = lib.mkOverride 90 false;
+      };
       # VM-test guest clock: tomorrow at 10:00 UTC. See lib/test-rtc-base.nix for why, and
       # for why it is a file rather than a binding here (a test file needs it for a helper
       # node that must share the clock of the node under test).
@@ -80,7 +98,7 @@
       # The desktop config as a VM-test node; all tests use this variant so the
       # real host timers (nix-gc, ...) stay enabled but can never elapse mid-test.
       commonDesktopModule = { ... }: {
-        imports = [ commonDesktopHostModule testNodeTimeSyncOff ];
+        imports = [ commonDesktopHostModule testNodeTimeSyncOff testNodeClockGateOff ];
         virtualisation.qemu.options = [ (testRtcBase pkgs.coreutils) ];
       };
       qemuDemoUserModule = ./modules/qemu-demo-user.nix;
@@ -104,6 +122,44 @@
           "nix-utils-${name}-driver-interactive" = test.driverInteractive;
         })
         nixUtilsTests;
+      # The monitoring platform's own VM suite on x86: the fast companion to the aarch64 run
+      # below, which stays the one that decides (its SPEC.md 11.1 -- the sandbox assertions
+      # are only meaningful against the systemd the target actually boots, and only the Pi
+      # deploys the service).
+      #
+      # What this buys, and why it is not redundant with either of the other two runs: the
+      # harness has to give the machine under test a working time source without touching how
+      # it keeps time, and getting that wrong fails at RUNTIME, not evaluation. Upstream's own
+      # synthetic machine runs no time daemon, so its suite cannot exercise that path at all;
+      # ours runs chrony over NTS with `minsources 2` against a four-name server list, which
+      # is what caught a harness that pointed every name at one address (one usable source,
+      # `minsources` unsatisfiable, the clock gate never opening). That property is
+      # arch-independent, so pinning it here means a laptop reproduces it in minutes instead
+      # of it only surfacing on hardware neither CI nor a laptop can emulate.
+      #
+      # Deliberately NOT commonDesktopModule, which would be the more faithful node: it
+      # imports modules/nix-utils.nix, which puts the sandboxed nix-utils `sqlite3` into
+      # system-wide environment.systemPackages, so root's sqlite3 is a bubblewrap wrapper
+      # restricted to /tmp and the harness cannot open the receiver's database to count rows.
+      # hosts/rpi5 has no such collision (nix-utils is on the nixos user's PATH only), so that
+      # is a desktop artifact rather than a property worth asserting on -- and the x86
+      # platform/desktop combination is already covered by systemMetricsTest.
+      monitoringPlatformNodeX86 = { ... }: {
+        imports = [
+          "${monitoring-platform}/nix/module.nix"
+          ./modules/time-sync.nix
+          # modules/time-sync.nix reads common.systemMetrics.enable to default
+          # requireClockSync, so the option has to exist even though nothing enables it here.
+          ./modules/system-metrics.nix
+          # The real enable + floor, from the same binding every host uses, so the chrony
+          # configuration under test cannot drift from the deployed one.
+          timeSyncSettings
+        ];
+      };
+      monitoringPlatformTestsX86 = import "${monitoring-platform}/nix/tests/lib.nix" {
+        inherit pkgs stateVersion;
+        machineModules = [ monitoringPlatformNodeX86 ];
+      };
       dohStamps = import ./lib/doh-stamps.nix { lib = nixpkgs.lib; };
       ntsServers = import ./lib/nts-servers.nix { lib = nixpkgs.lib; };
       resticLib = import ./lib/restic.nix { lib = nixpkgs.lib; };
@@ -256,7 +312,7 @@
       # no defined way. Such a node composes this; everything else takes the standard
       # RTC base by composing rpiSystemModule.
       rpiNodeBase = { ... }: {
-        imports = rpi5HostModules ++ [ rpiTestKernel testNodeTimeSyncOff ];
+        imports = rpi5HostModules ++ [ rpiTestKernel testNodeTimeSyncOff testNodeClockGateOff ];
         _module.args = rpiSystemArgs;
       };
       # The default rpi test node: rpiNodeBase plus the repo's standard RTC base, so
@@ -411,6 +467,12 @@
             # The tunnel has no credential in a VM so the unit would only skip, but
             # keep the node deterministic: nothing here is about remote access.
             common.irohSsh.enable = nixpkgs.lib.mkForce false;
+            # Undo testNodeClockGateOff, which every other rpi node inherits from
+            # rpiNodeBase. This suite is the one that tests the gate -- its clock-gate case
+            # asserts the gate is on the unit at all, so an off switch here would make the
+            # case fail rather than skip -- and it is also the only one that can satisfy the
+            # gate, because its harness gives the node a real NTP server.
+            services.monitoring-platform.clockGate.enable = nixpkgs.lib.mkForce true;
           }
         ];
       };
@@ -1012,7 +1074,16 @@
         system-metrics = systemMetricsTest;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
-        nixUtilsTests));
+        nixUtilsTests)
+      # Same renaming as the aarch64 set: the harness's `platform` key is its shared-VM run,
+      # so it takes the bare name and the isolated cases get suffixed. The names collide with
+      # the aarch64 ones by design -- checks are per-system attrsets and doh/system/firewall
+      # already do the same -- so a check name still identifies one test, on both arches.
+      // (nixpkgs.lib.mapAttrs'
+        (name: test: nixpkgs.lib.nameValuePair
+          (if name == "platform" then "monitoring-platform" else "monitoring-platform-${name}")
+          test)
+        monitoringPlatformTestsX86));
       # Eval-only runCommands (throw on drift), not VM tests: no kvm feature to drop, and
       # arch-independent since stamps/endpoints are pure data, so x86_64 only. These must
       # be part of the generic-x86 checkSet and not only of checks.${system}: the

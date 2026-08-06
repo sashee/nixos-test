@@ -51,11 +51,11 @@
     "monitoring-platform": {
       "flake": false,
       "locked": {
-        "lastModified": 1785571840,
-        "narHash": "sha256-xPCdl2lCTsfchbJyeHIHfag75bgnFFBxAh6Bmm3dW94=",
+        "lastModified": 1786010993,
+        "narHash": "sha256-ZSGMvlXs/nb7JXT1k2YkQUU8pouE0KABf7vgGu/KJyU=",
         "owner": "sashee",
         "repo": "monitoring-platform",
-        "rev": "7298df5e2bcb1c4c1fbc4eeb9e11809cfe8efda3",
+        "rev": "fa7e69da0e207ac562463eea5b7454d70fb2c956",
         "type": "github"
       },
       "original": {

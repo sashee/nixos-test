@@ -453,6 +453,31 @@ real Pi configuration as the `monitoring-platform*` aarch64 checks, which is the
 run that decides whether its hardening is right for the systemd the Pi actually
 boots.
 
+The same suite also runs as the `monitoring-platform*` **x86** checks, against a
+node built from `modules/time-sync.nix` rather than a whole host config. That is
+not about hardening — it is about the one thing the harness must do for any
+consumer and can only get wrong at runtime: give the machine a working time
+source without touching how it keeps time, so the receiver's boot-time clock gate
+can open. Our chrony configuration uses NTS with `minsources 2` against four
+server names, and a harness that resolved all four to one address left chrony a
+single usable source, so the gate never opened and every case timed out. That
+property is arch-independent, so having it on x86 means a laptop reproduces it in
+minutes rather than it surfacing only on hardware CI cannot emulate. The node
+deliberately skips `commonDesktopModule`: `modules/nix-utils.nix` puts the
+sandboxed `sqlite3` on root's system-wide PATH, which the harness cannot use to
+read the receiver's database — a desktop artifact the Pi does not have, since
+there nix-utils is on the `nixos` user's PATH only. The x86
+platform-plus-desktop combination is covered by the `system-metrics` check
+instead.
+
+Note the clock gate is switched off on every other test node, by
+`testNodeClockGateOff` in `flake.nix`: it blocks startup until the kernel's clock
+error estimate is small, and an ordinary test node has no time source to get
+there with (`testNodeTimeSyncOff` removed chrony, and `qemu-vm.nix` had already
+disabled `timesyncd`), so the gate would hold every boot for its full
+`TimeoutStartSec` and then fail the unit. The two suites above are where the gate
+is actually exercised; both bring their own NTP node and force it back on.
+
 `modules/system-metrics.nix` is that producer: a systemd oneshot on a 15-minute
 timer that collects the host's CPU (load, core count, utilisation over a
 1-second `/proc/stat` sample), memory (including swap), per-filesystem usage and
