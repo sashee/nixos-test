@@ -246,6 +246,12 @@ nixpkgs.lib.nixos.runTest {
     doh_ipv4 = ${builtins.toJSON interceptor.dohIpv4}
     doh_ipv6 = ${builtins.toJSON interceptor.dohIpv6}
     MARKER = "/run/chrony-wait/synchronized"
+    # The one question that decides whether this host has a resolver at all: an NTS hostname,
+    # asked of dnscrypt-proxy on the loopback address modules/doh.nix binds. Named once because
+    # it is asked in both directions -- wait_dns waits for it to succeed, and "with the clock
+    # years out" asserts it fails -- and a subtly different question on the two sides would let
+    # them disagree about what "DNS works" means.
+    RESOLVE = "${pkgs.dig}/bin/dig +short +time=3 +tries=1 @127.0.0.1 ${goodHost} | grep -q ."
 
     start_all()
 
@@ -317,6 +323,14 @@ nixpkgs.lib.nixos.runTest {
         for ip in doh_ipv6:
             machine.succeed(f"${pkgs.iproute2}/bin/ip -6 route replace unreachable {ip}/128")
 
+    def wait_dns(timeout=120):
+        # DNS is a PRECONDITION of every chrony wait in this file, not a part of it: chronyd
+        # reaches its sources by hostname through dnscrypt-proxy, so a host with no resolver
+        # simply has no sources and `chronyc waitsync` counts to sixty with refid 00000000.
+        # Waited on separately so that failure reports itself in two minutes as "DNS did not
+        # come back" instead of as a ten-minute chrony timeout with the cause a subtest away.
+        machine.wait_until_succeeds(RESOLVE, timeout=timeout)
+
     def clock(node=None):
         return int((node or machine).succeed("date +%s").strip())
 
@@ -370,9 +384,23 @@ nixpkgs.lib.nixos.runTest {
         # subtest asserts. Believing otherwise would make the retry loops below unsafe.
         machine.succeed("systemctl stop chronyd.service || true")
         machine.succeed(f"date -s '{when}'")
+        # dnscrypt-proxy has to be restarted across ANY step, and a BACKWARD one is what makes
+        # it mandatory rather than tidy. Its upstream re-probe is scheduled on the WALL clock
+        # (jedisct1/go-clocksmith, ten seconds after a failed probe), so a step back by three
+        # days parks the next probe three days out: the process stays active and silent, every
+        # name stops resolving, and nothing in the guest ever recovers on its own. That is how
+        # the 2026-08-07 CI run failed -- ten minutes of `refid 00000000` at the end of "the
+        # restore is forward-only", whose restore steps the clock back three days.
+        #
+        # Here rather than at the call sites, because a step is exactly when it is needed and
+        # the one call site that had it by hand was not the one that broke. Not in the deployed
+        # configuration: on a real host time-correction steps a stale clock FORWARD, which only
+        # makes the re-probe fire early, and dnscrypt-proxy keeps answering from the servers it
+        # already has.
+        machine.succeed("systemctl restart dnscrypt-proxy.service")
         align_rtc()
 
-    def resync():
+    def resync(dns=True):
         # Drop everything chrony knows and make it start over, so a subtest cannot pass on a
         # measurement taken before it changed anything.
         machine.succeed("rm -f " + MARKER)
@@ -385,8 +413,34 @@ nixpkgs.lib.nixos.runTest {
         # to where the correction service just rescued it from. In production `rtcsync` closes that
         # gap within 11 minutes; here it has to be closed on demand. See align_rtc.
         align_rtc()
+        # `dns=False` only for the subtests that park the clock outside the DoH certificates'
+        # validity on purpose, where an unresolvable host is the state under test rather than a
+        # fault. Everywhere else a resolver has to be there before chronyd is asked to find one.
+        if dns:
+            wait_dns()
         machine.succeed("systemctl restart chronyd.service")
         machine.succeed("systemctl start --no-block chrony-wait.service")
+
+    def wait_synced(timeout):
+        # Every wait for the sync marker goes through here, so a timeout anywhere in the file
+        # reports the same evidence. Written once because the first version of this dump existed
+        # on ONE of the five waits, and the run that failed timed out on one of the other four.
+        #
+        # Every command is `|| true` and every read is a succeed() that cannot fail: this runs
+        # with an exception in flight, and a failing command here would replace the real failure
+        # with itself. (Same reason chrony_conf() is inlined rather than called.)
+        try:
+            machine.wait_for_file(MARKER, timeout=timeout)
+        except Exception:
+            machine.log("RESOLVES:\n" + machine.succeed("${pkgs.dig}/bin/dig +short @127.0.0.1 ${goodHost} || true"))
+            machine.log("DNSCRYPT:\n" + machine.succeed("journalctl -b -u dnscrypt-proxy -o cat --no-pager | tail -40 || true"))
+            machine.log("DNSCRYPTUNIT:\n" + machine.succeed("systemctl status dnscrypt-proxy.service --no-pager || true"))
+            machine.log("SOURCES:\n" + machine.succeed("${pkgs.chrony}/bin/chronyc -N sources -v || true"))
+            machine.log("CHRONYD:\n" + machine.succeed("journalctl -u chronyd -o cat --no-pager | tail -40 || true"))
+            machine.log("CONF:\n" + machine.succeed("systemctl cat chronyd.service | grep -o '/nix/store/[^ ]*chrony.conf' | head -1 | xargs cat || true"))
+            ntsgood.log("SERVERJOURNAL:\n" + ntsgood.succeed("journalctl -u chronyd -o cat --no-pager | tail -40 || true"))
+            ntsgood.log("SERVERPORTS:\n" + ntsgood.succeed("${pkgs.iproute2}/bin/ss -lntu | head -20 || true"))
+            raise
 
     with subtest("nothing has synchronised yet"):
         # The precondition the whole run rests on: this host comes up with no reachable time
@@ -404,10 +458,11 @@ nixpkgs.lib.nixos.runTest {
 
     with subtest("with the clock years out, nothing resolves"):
         # The deadlock the correction service exists to break, demonstrated rather than assumed.
+        # set_clock restarts dnscrypt-proxy, which is what makes the failure below deterministic
+        # rather than a race with whatever the resolver had already cached or already dialled.
         set_clock("2001-01-01 00:00:00")
-        machine.succeed("systemctl restart dnscrypt-proxy.service")
         connect_upstream()
-        machine.fail(f"${pkgs.dig}/bin/dig +short +time=3 +tries=1 @127.0.0.1 {'${goodHost}'} | grep -q .")
+        machine.fail(RESOLVE)
 
     with subtest("the correction service breaks the deadlock and chrony takes over"):
         machine.succeed("systemctl reset-failed time-correction.service || true")
@@ -416,24 +471,10 @@ nixpkgs.lib.nixos.runTest {
         assert corrected > 1600000000, f"the clock was not corrected: {corrected}"
 
         # DNS only works because the clock does now.
-        machine.wait_until_succeeds(
-            f"${pkgs.dig}/bin/dig +short +time=3 +tries=1 @127.0.0.1 {'${goodHost}'} | grep -q .",
-            timeout=120,
-        )
+        wait_dns()
 
         resync()
-        try:
-            machine.wait_for_file(MARKER, timeout=150)
-        except Exception:
-            machine.log("SOURCES:\n" + machine.succeed("${pkgs.chrony}/bin/chronyc -N sources -v || true"))
-            machine.log("CHRONYD:\n" + machine.succeed("journalctl -u chronyd -o cat --no-pager | tail -40 || true"))
-            machine.log("RESOLVES:\n" + machine.succeed("${pkgs.dig}/bin/dig +short @127.0.0.1 ${goodHost} || true"))
-            # Not chrony_conf(): this runs while an exception is in flight, and a failing
-            # succeed() here would replace the real failure with this one.
-            machine.log("CONF:\n" + machine.succeed("systemctl cat chronyd.service | grep -o '/nix/store/[^ ]*chrony.conf' | head -1 | xargs cat || true"))
-            ntsgood.log("SERVERJOURNAL:\n" + ntsgood.succeed("journalctl -u chronyd -o cat --no-pager | tail -40 || true"))
-            ntsgood.log("SERVERPORTS:\n" + ntsgood.succeed("${pkgs.iproute2}/bin/ss -lntu | head -20 || true"))
-            raise
+        wait_synced(150)
 
         tracking = machine.succeed("${pkgs.chrony}/bin/chronyc tracking")
         assert "Leap status" in tracking and "Not synchronised" not in tracking, tracking
@@ -528,7 +569,7 @@ nixpkgs.lib.nixos.runTest {
         # And the host still gets there from a cold start, with the runtime routes gone --
         # which is the state a real power cycle leaves it in.
         connect_upstream()
-        machine.wait_for_file(MARKER, timeout=600)
+        wait_synced(600)
 
     # ------------------------------------------------------------------------------------
     # The persisted last-known-good clock: `chronyd -s` plus the drift file's mtime.
@@ -570,7 +611,7 @@ nixpkgs.lib.nixos.runTest {
             "systemctl show -p ExecStart --value chronyd.service"
         ).split(), "chronyd is not started with -s"
 
-        machine.wait_for_file(MARKER, timeout=300)
+        wait_synced(300)
         # Backdated to something no clock in this test ever sits at, so the wait below cannot be
         # satisfied by a write that happened before this subtest started.
         machine.succeed("touch -d '@1000000000' ${driftFile}")
@@ -705,11 +746,16 @@ nixpkgs.lib.nixos.runTest {
 
         # Put the host back where the remaining subtests expect it: a clock and an RTC that agree
         # with the servers', a drift file that cannot bump anything, and a resolver again.
+        #
+        # The clock step here is BACKWARD by three days -- the subtest above pushed the host that
+        # far into the future through the drift file -- which is the step that used to leave the
+        # host with no resolver for the rest of the run. See set_clock; the routes have to be back
+        # before resync() waits for a name to resolve through them.
         machine.succeed("systemctl stop chronyd.service || true")
         set_clock(f"@{clock(ntsgood)}")
         connect_upstream()
         resync()
-        machine.wait_for_file(MARKER, timeout=600)
+        wait_synced(600)
 
     with subtest("a clock step under a running chronyd does not break it for good"):
         # The step this guards against is the correction service's own. It applies a timestamp as
@@ -718,7 +764,7 @@ nixpkgs.lib.nixos.runTest {
         # chronyd, so chronyd is running when it lands. If that could kill chronyd for the rest of
         # the boot, this host would end up permanently unsynchronised while DNS kept working, so
         # nothing else would notice and the metrics gate would stay shut forever.
-        machine.wait_for_file(MARKER, timeout=300)
+        wait_synced(300)
 
         def chronyd_pid():
             return machine.succeed("systemctl show -p MainPID --value chronyd.service").strip()
@@ -760,7 +806,9 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed("systemctl stop chronyd.service")
         machine.succeed("rm -f /var/lib/chrony/*.nts")
         set_clock("2001-01-01 00:00:00")
-        resync()
+        # dns=False: the clock is back in 2001, so the DoH certificates are not yet valid and no
+        # name resolves. That is this subtest's own staging, not a fault to wait out.
+        resync(dns=False)
         machine.sleep(60)
         machine.fail(f"test -e {MARKER}")
         assert clock() < 1600000000, "the clock moved without NTS -- that is a plaintext fallback"
