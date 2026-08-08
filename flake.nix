@@ -644,6 +644,219 @@
         # outside the dropKvm mapAttrs since it isn't a runTest derivation.
         required-kernel-modules = rpi5Base.config.system.build.requiredKernelModulesCheck;
       };
+
+      # ---------------------------------------------------------------------------
+      # The rpi5 config on x86: the fast companion to the aarch64 set above.
+      #
+      # The aarch64 set stays the one that DECIDES -- it is the only run on the kernel and
+      # the arch the Pi actually boots. But it is also the one nobody can run: the patched
+      # kernel is in no binary cache (hours of emulated compile without the CI artifact),
+      # and even with the artifact imported the driver, QEMU and the guest all run under
+      # binfmt/TCG on a laptop. So the rpi-only features -- connectivity fallback and
+      # watchdog, the time-correction/NTS bootstrap, --delete-old GC, the measurement
+      # producer -- had no run a change could be iterated against.
+      #
+      # This set closes that gap: the SAME rpi5HostModules the deployed Pi and every
+      # aarch64 node compose, on x86 nixpkgs under KVM. That is possible at all because
+      # rpi5HostModules is deliberately hardware-free -- the nixos-raspberrypi modules
+      # (sd-image, raspberry-pi-5.base) are added only by mkRpi5 -- so the host config
+      # itself is arch-neutral apart from the two kernel-coupled options undone below.
+      #
+      # What it therefore CANNOT catch, and what the aarch64 run remains responsible for:
+      # a kernel bump dropping a module the Pi needs (required-kernel-modules), the
+      # tpm-crb-in-initrd class of build break, brcmfmac AP behaviour, RTC-less boot
+      # ordering, and anything whose outcome depends on TCG timing.
+      # ---------------------------------------------------------------------------
+
+      # The x86 counterpart of rpiTestKernel: what has to change for hosts/rpi5 to boot a
+      # kernel the Pi never runs. Three things, and only three -- everything else in that
+      # host config is arch-independent and is left exactly as deployed.
+      rpi5X86Kernel = { lib, ... }: {
+        # 1. headless-trim is a structuredExtraConfig, so left in place it would force a
+        #    full custom x86 kernel build -- the exact cost this whole variant exists to
+        #    avoid. Emptied, the `apply` on boot.kernelPackages overrides with
+        #    arg-identical values, so the node lands on the cached pkgs.linuxPackages.
+        #    Note what that costs: BTF is ON here and OFF on the Pi, so systemd's
+        #    RestrictFileSystems= actually works on this node and no-ops on the real one.
+        #    No ported check asserts on it; one that did would belong in the aarch64 set.
+        boot.kernelPatches = lib.mkForce [ ];
+        # 2. required-modules.txt is a snapshot of the live Pi (rp1_*, raspberrypi_*, vc4,
+        #    aes_ce_*, macb). The check is wired into system.checks, so it runs as part of
+        #    every toplevel build and this node would not build at all. Forced off rather
+        #    than pointed at a second x86 list: the list IS the point, and a parallel one
+        #    would be a thing to maintain that guards nothing. The check stays an aarch64
+        #    check (`required-kernel-modules`), which is where it means something.
+        common.requiredKernelModules.enable = lib.mkForce false;
+        # 3. The direct analogue of rpiTestKernel's rtc-pl031, and NOT free just because
+        #    x86 QEMU has an ordinary RTC: nixpkgs builds rtc_cmos as a module and does not
+        #    put it in the default initrd. modules/laptop-base.nix is where the laptops get
+        #    this line, and hosts/rpi5 does not import it. Left out, the clock sits at
+        #    systemd's build epoch through early boot and jumps forward in stage-2 -- which
+        #    wakes the Persistent nix-gc timers mid-test, the very thing rpiTestKernel's
+        #    rtc-pl031 exists to prevent. rpi5-x86-boot-clock is the guard: drop this line
+        #    and it fails, by name, quoting the fix.
+        boot.initrd.availableKernelModules = [ "rtc_cmos" ];
+        # boot.initrd.systemd.tpm2.enable = false (hosts/rpi5) is left alone on purpose:
+        # it is a no-op on x86 and forcing it back on would be a config the Pi never runs.
+      };
+      # The x86 counterpart of rpiNodeBase: same rpi5HostModules, same specialArgs
+      # re-supplied as _module.args, same two test-node overrides -- only the kernel
+      # differs. Note the top-level `nixpkgs`/`pkgs` here, not nixrpi/pkgsRpi.
+      rpi5X86NodeBase = { ... }: {
+        imports = rpi5HostModules ++ [ rpi5X86Kernel testNodeTimeSyncOff testNodeClockGateOff ];
+        # rpiSystemArgs verbatim: nixpkgs-stable is already the top-level `nixpkgs`, and
+        # hosts/rpi5 derives its `system` from pkgs.stdenv.hostPlatform, so the nix-utils
+        # env it builds follows the platform with no argument change.
+        _module.args = rpiSystemArgs;
+      };
+      # The default x86 rpi node: the repo's standard RTC base on top, so the real host
+      # timers stay enabled but can never elapse mid-test (mirrors rpiSystemModule).
+      rpi5X86SystemModule = { ... }: {
+        imports = [ rpi5X86NodeBase ];
+        virtualisation.qemu.options = [ (testRtcBase pkgs.coreutils) ];
+      };
+      # One binding for both roles the aarch64 side splits into rpiQuiescedSystemModule
+      # and rpiConnectivitySystemModule -- they are textually identical there. Only what
+      # cannot work in a VM is off: auto-upgrade needs /etc/nixos, monitoring needs
+      # credentials and its 30-min timer would fire mid-test. doh/dnscrypt, the firewall
+      # and iroh-ssh stay live.
+      rpi5X86QuiescedModule = { lib, ... }: {
+        imports = [ rpi5X86SystemModule ];
+        common.autoUpgrade.enable = lib.mkForce false;
+        common.monitoring.enable = lib.mkForce false;
+      };
+      # hosts/rpi5's stateVersion without evaluating a system; see hosts/rpi5/state-version.nix
+      # for why it is a file. Deliberately NOT rpi5Base.config.system.stateVersion, which the
+      # aarch64 checks use: that would drag a full nixos-raspberrypi evaluation into every x86
+      # check process, and the Makefile gives each check its own. Also not
+      # nixpkgs.lib.trivial.release -- that is 26.05 while the Pi deploys 24.11, and
+      # stateVersion changes module defaults, so the wrong one would quietly test a
+      # configuration no host has.
+      rpi5StateVersion = import ./hosts/rpi5/state-version.nix;
+      # Every entry below is the same call shape -- the same test file as its aarch64 twin,
+      # x86 nixpkgs/pkgs, the rpi config's own stateVersion -- so this factors that out and
+      # each check carries only what genuinely differs: its node module and the host
+      # constants (gcOptions, keptAfterGc, dirtyBytes, flakeRef), which are copied verbatim
+      # from the aarch64 call sites because they are properties of the config, not the arch.
+      # The globalTimeout arguments are NOT copied: they are TCG ceilings, and these run
+      # under KVM, so the test files' own defaults apply.
+      rpi5X86Test = file: args: import file ({
+        inherit nixpkgs pkgs;
+        stateVersion = rpi5StateVersion;
+      } // args);
+      # The dotfiles suite on the rpi5 config as the real Pi user. The aarch64 variant is
+      # still the one that decides -- its sandbox cases (userns/seccomp/bubblewrap) are
+      # kernel-dependent and the Pi runs a trimmed kernel -- but this one catches
+      # config-level breakage (the user's package env, PATH, sudo) in minutes.
+      rpi5X86NixUtilsTests = import "${dotfiles}/nix-utils/tests/lib.nix" {
+        inherit pkgs;
+        machineModules = [
+          rpi5X86SystemModule
+          {
+            # The suite sets no node hostName; without one the rpi config's mkDefault
+            # ties with the test framework's mkDefault "machine".
+            networking.hostName = "nix-utils-test";
+            system.stateVersion = rpi5StateVersion;
+            # The same 2 GiB the aarch64 node gets, not the generic 4: keeping the two
+            # runs resource-identical is what makes a divergence between them meaningful.
+            virtualisation.memorySize = nixpkgs.lib.mkDefault 2048;
+            common.autoUpgrade.enable = nixpkgs.lib.mkForce false;
+            common.monitoring.enable = nixpkgs.lib.mkForce false;
+            common.irohSsh.enable = nixpkgs.lib.mkForce false;
+          }
+        ];
+        user = "nixos";
+      };
+      # Node for the three checks whose subtests outlast connectivity-fallback's production
+      # bootGrace (5min). Same treatment and same reasoning as the aarch64 variants: push
+      # the deadline past the end of the run rather than removing the units, so the
+      # deployed fallback stack is still present around the feature under test.
+      rpi5X86LongRunModule = { ... }: {
+        imports = [ rpi5X86QuiescedModule ./modules/time-sync.nix ];
+        common.connectivityFallback.bootGrace = "3h";
+      };
+      # The x86 rpi check set. Deliberately absent, each because it would assert nothing new:
+      #   * required-kernel-modules -- aarch64 by definition (see rpi5X86Kernel).
+      #   * connectivity-fallback-timing -- an icount/`-rtc clock=vm` time-warp test whose
+      #     premise is TCG determinism; connectivityFallbackTimingTest already runs it on x86.
+      #   * monitoring-nix-gc, monitoring-iroh-ssh -- host-input-free unit tests, in the
+      #     aarch64 set only because it evaluates a different nixpkgs. testResults has them.
+      #   * monitoring-platform-* -- upstream's SPEC 11.1 puts the weight on the systemd the
+      #     target boots, and monitoringPlatformTestsX86 is already the x86 companion.
+      rpi5X86Checks = builtins.mapAttrs (_: dropKvm) ({
+        rpi5-x86-doh = rpi5X86Test ./tests/doh.nix {
+          machineModule = rpi5X86SystemModule;
+          inherit dohStamps;
+        };
+        rpi5-x86-doh-upstream = rpi5X86Test ./tests/doh-upstream.nix {
+          commonDesktopModule = rpi5X86QuiescedModule;
+          inherit dohStamps;
+        };
+        rpi5-x86-auto-upgrade = rpi5X86Test ./tests/auto-upgrade-mocked-service.nix {
+          autoUpgradeModule = ./modules/auto-upgrade.nix;
+          nodeModule = rpi5X86SystemModule;
+          flakeRef = "/etc/nixos#rpi5";
+        };
+        rpi5-x86-auto-upgrade-reboot = rpi5X86Test ./tests/auto-upgrade-reboot.nix {
+          machineModule = rpi5X86SystemModule;
+        };
+        rpi5-x86-nix-settings = rpi5X86Test ./tests/nix-settings.nix {
+          extraModule = rpi5X86SystemModule;
+          gcOptions = "--delete-old";
+        };
+        rpi5-x86-nix-gc-retention = rpi5X86Test ./tests/nix-gc-retention.nix {
+          machineModule = rpi5X86SystemModule;
+          keptAfterGc = 1;  # --delete-old keeps only the current generation
+        };
+        rpi5-x86-system = rpi5X86Test ./tests/system.nix {
+          machineModule = rpi5X86SystemModule;
+          dirtyBytes = 67108864;             # 64 MiB
+          dirtyBackgroundBytes = 16777216;   # 16 MiB
+        };
+        rpi5-x86-system-metrics = rpi5X86Test ./tests/system-metrics.nix {
+          machineModule = rpi5X86SystemModule;
+        };
+        rpi5-x86-monitoring = rpi5X86Test ./tests/monitoring/rpi.nix {
+          machineModule = rpi5X86SystemModule;
+        };
+        rpi5-x86-firewall = rpi5X86Test ./tests/firewall.nix {
+          machineModule = rpi5X86SystemModule;
+        };
+        # The guard on rpi5X86Kernel's rtc_cmos line -- see there. Its aarch64 twin guards
+        # rpiTestKernel's rtc-pl031, so this check earns its place in both sets by
+        # asserting a different fix each time.
+        rpi5-x86-boot-clock = rpi5X86Test ./tests/boot-clock.nix {
+          machineModule = rpi5X86SystemModule;
+        };
+        rpi5-x86-iroh-ssh = rpi5X86Test ./tests/iroh-ssh.nix {
+          machineModule = rpi5X86SystemModule;
+          inherit dohStamps;
+        };
+        rpi5-x86-restic = rpi5X86Test ./tests/restic.nix {
+          commonDesktopModule = rpi5X86QuiescedModule;
+        };
+        rpi5-x86-connectivity-fallback = rpi5X86Test ./tests/connectivity-fallback.nix {
+          machineModule = rpi5X86QuiescedModule;
+        };
+        rpi5-x86-connectivity-fallback-trigger = rpi5X86Test ./tests/connectivity-fallback-trigger.nix {
+          machineModule = rpi5X86QuiescedModule;
+        };
+        rpi5-x86-connectivity-watchdog = rpi5X86Test ./tests/connectivity-watchdog.nix {
+          machineModule = rpi5X86LongRunModule;
+          inherit dohStamps;
+        };
+        rpi5-x86-time-correction = rpi5X86Test ./tests/time-correction.nix {
+          machineModule = rpi5X86LongRunModule;
+          inherit dohStamps ntsServers;
+        };
+        rpi5-x86-nts-sync = rpi5X86Test ./tests/nts-sync.nix {
+          machineModule = rpi5X86LongRunModule;
+          inherit dohStamps ntsServers;
+        };
+      } // (nixpkgs.lib.mapAttrs'
+        (name: test: nixpkgs.lib.nameValuePair "rpi5-x86-nix-utils-${name}" test)
+        rpi5X86NixUtilsTests));
+
       dohUpstreamTest = import ./tests/doh-upstream.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion dohStamps;
       };
@@ -1110,10 +1323,12 @@
       lib.hosts.rpi5 = mkRpi5;
       lib.hosts.anya-feher-laptop = mkAnyaFeherLaptop;
       # Named check sets for the Makefile's run-checks (SET=...): the generic
-      # x86 suite and one set per laptop host, each run by its own CI job.
+      # x86 suite, one set per laptop host, and the rpi5 config on x86 -- each
+      # run by its own CI job.
       lib.checkSets = {
         generic-x86 = testResults // evalChecks;
         anya-feher-laptop = anyaFeherLaptopChecks;
+        rpi5-x86 = rpi5X86Checks;
       };
 
       legacyPackages.${system} = pkgs;
@@ -1122,7 +1337,7 @@
         qemu-graphical = qemuGraphical;
       };
 
-      checks.${system} = testResults // evalChecks // anyaFeherLaptopChecks;
+      checks.${system} = testResults // evalChecks // anyaFeherLaptopChecks // rpi5X86Checks;
       checks.aarch64-linux = aarch64TestResults;
       # The exact patched kernel every rpi check boots (rpiTestKernel pins the
       # node to this package, so the outPath matches the checks). CI exports its
