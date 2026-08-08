@@ -12,11 +12,13 @@
 #     to two hosts, `sample` to 1 and `floor` to a fixture; tests/nts-sync.nix forces `servers`
 #     and `floor`. So no test has ever seen a host ask the four real NTS servers through the
 #     four real DoH resolvers with the build-time floor.
-#   * the METRICS CLOCK GATE -- that system-metrics.service is conditioned on chrony's marker
-#     rather than on the one systemd-timesyncd writes and chrony never will. Invisible to the VM
-#     tests for a different reason: it is per-host. Only rpi5 deploys the collector, and until this
-#     check the only place the wiring was exercised was the generic x86 desktop test node, which is
-#     not a host anyone deploys. See gateDrift below.
+#   * the METRICS PRODUCER'S CLOCK HANDLING -- that system-metrics.service is in one of its two
+#     valid shapes and fully in that one: conditioned on chrony's marker (not on the one
+#     systemd-timesyncd writes and chrony never will) when it posts straight at a receiver, or
+#     ungated and aimed at mp-collector's socket when a collector is in the path. Invisible to the
+#     VM tests for a different reason: it is per-host. Only rpi5 deploys the producer, and until
+#     this check the only place the wiring was exercised was the generic x86 desktop test node,
+#     which is not a host anyone deploys. See gateDrift below.
 #
 # A drift in either of the first two is silent in the worst way: the unit stays green, the timer
 # stays armed, and the only symptom is that the hourly run which is supposed to catch a dead
@@ -182,23 +184,31 @@ let
             "${host}: --floor ${toString floor} is below ${toString floorLowerBound}, which is not a plausible build-time constant"
       );
 
-  # --- the metrics clock gate -----------------------------------------------------------
+  # --- the metrics producer's clock handling ---------------------------------------------
 
-  # That the collector is gated on CHRONY's marker rather than timesyncd's.
+  # Which of the two shapes a host's producer unit is in, and that it is fully in that one.
   #
-  # modules/system-metrics.nix defaults `requireClockSync` to `services.timesyncd.enable` and
-  # `syncedMarker` to the path timesyncd writes, and enabling chrony forces timesyncd off -- so
-  # without the `common.systemMetrics` block at the end of modules/time-sync.nix the gate would
-  # switch itself off on precisely the host that needs it, and the RTC-less Pi would go back to
-  # writing 1970-dated rows into a store with no retention. That is a two-line mkDefault whose
-  # failure is silent in both directions: a marker that never appears stops collection forever,
-  # and one that appears too early admits pre-sync timestamps.
+  # WITHOUT a collector, the producer posts straight at a receiver and must be gated on CHRONY's
+  # marker rather than timesyncd's. modules/system-metrics.nix defaults `requireClockSync` to
+  # `services.timesyncd.enable` and `syncedMarker` to the path timesyncd writes, and enabling
+  # chrony forces timesyncd off -- so without the `common.systemMetrics` block at the end of
+  # modules/time-sync.nix the gate would switch itself off on precisely the host that needs it,
+  # and the RTC-less Pi would go back to writing 1970-dated rows into a store with no retention.
+  # Silent in both directions: a marker that never appears stops collection forever, and one
+  # that appears too early admits pre-sync timestamps.
+  #
+  # WITH a collector in the path the gate is not merely unnecessary, it is wrong: the collector
+  # holds a pre-sync batch and re-dates it once the offset is known, so a condition on the marker
+  # would discard exactly the samples the collector exists to recover. The claim inverts -- there
+  # must be NO ConditionPathExists, and the producer must be posting at the collector's socket
+  # rather than past it. Both halves are needed: a producer with the gate dropped but still
+  # aimed at the receiver has the worst of both, writing 1970 rows nothing will correct.
   #
   # Read off the rendered unit for the same reason as everything above -- the claim is that
   # systemd was told the path, not that the option holds it. It is a rendered-unit claim and
   # therefore belongs here rather than in a VM: that systemd actually holds a unit back on an
-  # unmet ConditionPathExists and releases it when the file appears is covered against a real
-  # time source by tests/system-metrics.nix, and does not need repeating per host.
+  # unmet ConditionPathExists, and that the collector actually re-dates a held batch, are covered
+  # against a real time source by tests/system-metrics.nix and do not need repeating per host.
   gateDrift =
     host:
     let
@@ -207,26 +217,37 @@ let
       text = unitOf host "system-metrics.service";
       lines = trimmedLines text;
       conditions = lib.filter (l: lib.hasPrefix "ConditionPathExists=" l) lines;
+      execLines = lib.filter (l: lib.hasPrefix "ExecStart=" l) lines;
+      socket = hosts.${host}.config.services.mp-collector.socketPath;
+      posts = target: lib.any (l: lib.hasInfix (toString target) l) execLines;
     in
     lib.optionals cfg.systemMetrics.enable (
       if text == null then
         [
-          "${host}: common.systemMetrics is enabled but there is no system-metrics.service to gate"
+          "${host}: common.systemMetrics is enabled but there is no system-metrics.service"
         ]
+      else if cfg.systemMetrics.viaCollector then
+        lib.optional (conditions != [ ])
+          "${host}: system-metrics.service posts through mp-collector but still carries ${toString conditions} -- the gate would discard the pre-sync batches the collector exists to re-date"
+        ++ lib.optional (!posts socket)
+          "${host}: common.systemMetrics.viaCollector holds, but system-metrics.service does not post to ${toString socket}: ${toString execLines}"
       else if conditions == [ ] then
         [
-          "${host}: system-metrics.service has no ConditionPathExists at all, so it runs before the clock is known and writes timestamps that cannot be deleted"
+          "${host}: system-metrics.service posts straight at a receiver and has no ConditionPathExists at all, so it runs before the clock is known and writes timestamps that cannot be deleted"
         ]
       else
         lib.optional (conditions != [ want ])
           "${host}: system-metrics.service has ${toString conditions}, expected exactly ${want} -- the gate must follow chrony's marker, since enabling chrony forces timesyncd off and its marker never appears"
     );
 
-  # Named in the success output rather than passed over in silence: a host that stops deploying
-  # the collector makes `gateDrift` vacuous, and a check that quietly asserts nothing about a
-  # host reads exactly like one that asserted something.
-  gated = lib.filter (h: hosts.${h}.config.common.systemMetrics.enable) (builtins.attrNames hosts);
-  ungated = lib.subtractLists gated (builtins.attrNames hosts);
+  # Named in the success output rather than passed over in silence, and split by shape: a host
+  # that stops deploying the producer makes `gateDrift` vacuous, and a check that quietly asserts
+  # nothing about a host reads exactly like one that asserted something. Splitting them also makes
+  # a host silently changing shape visible in the passing output rather than only in a failure.
+  producing = lib.filter (h: hosts.${h}.config.common.systemMetrics.enable) (builtins.attrNames hosts);
+  buffered = lib.filter (h: hosts.${h}.config.common.systemMetrics.viaCollector) producing;
+  gated = lib.subtractLists buffered producing;
+  ungated = lib.subtractLists producing (builtins.attrNames hosts);
 
   errors = lib.concatMap (host: timerDrift host ++ serviceDrift host ++ gateDrift host) (
     builtins.attrNames hosts
@@ -247,17 +268,22 @@ if errors != [ ] then
     a provider from the arguments shrinks the pool those two sets are drawn from without changing
     anything a running host would report.
 
-    And the metrics clock gate: modules/system-metrics.nix defaults its marker to the one
+    And the metrics producer's clock handling, which has two valid shapes and no third: gated on
+    chrony's marker when it posts straight at a receiver (its own default marker is the one
     systemd-timesyncd writes, which enabling chrony forces off, so modules/time-sync.nix has to
-    repoint it or the gate silently disables itself on the host that needs it most.
+    repoint it or the gate silently disables itself on the host that needs it most), or ungated
+    and aimed at mp-collector, which re-dates what the gate would have thrown away.
   ''
 else
   pkgs.runCommand "time-sync-deployed-check" { } ''
     echo "cadence and provider arguments verified on: ${toString (builtins.attrNames hosts)}" > $out
     echo "metrics clock gate verified on: ${
-      if gated == [ ] then "no host (none deploys the collector)" else toString gated
+      if gated == [ ] then "no host (none posts straight at a receiver)" else toString gated
+    }" >> $out
+    echo "posts through mp-collector, so ungated by design: ${
+      if buffered == [ ] then "no host" else toString buffered
     }" >> $out
     ${lib.optionalString (ungated != [ ]) ''
-      echo "no collector deployed, so no gate to check: ${toString ungated}" >> $out
+      echo "no producer deployed, so nothing to check: ${toString ungated}" >> $out
     ''}
   ''

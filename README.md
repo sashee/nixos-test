@@ -259,7 +259,10 @@ exclusive with it and is therefore off, which costs nothing here — the Pi has 
 RTC battery at all. The module writes `/run/chrony-wait/synchronized` from a small
 `chrony-wait` unit and repoints `common.systemMetrics.syncedMarker` at it, since
 chrony has no equivalent of timesyncd's marker and `time-sync.target` is reached
-when chronyd *starts*, not when it has synchronised.
+when chronyd *starts*, not when it has synchronised. (It repoints the marker but
+no longer arms the gate on hosts whose metrics go through `mp-collector`, which
+re-dates pre-sync batches instead of discarding them — see the monitoring
+platform section below.)
 
 The rest of the module is the way out of a deadlock. DoH and NTS are both TLS, so
 a clock outside certificate validity blocks name resolution and time
@@ -449,8 +452,8 @@ only** — `RestrictAddressFamilies = [ "AF_UNIX" ]` makes that a kernel guarant
 — so there is no port for the firewall to open and no credential to provision;
 reaching it means being in the `monitoring-platform` group, which owns the 0750
 runtime directory. Remote devices still cannot reach it — upstream's iroh
-transport has not landed — so its only producer today is the host's own
-`modules/system-metrics.nix`, below. Upstream's own VM suite runs against the
+transport has not landed — so everything it stores today comes from the host
+itself, by way of the collector below. Upstream's own VM suite runs against the
 real Pi configuration as the `monitoring-platform*` aarch64 checks, which is the
 run that decides whether its hardening is right for the systemd the Pi actually
 boots.
@@ -478,46 +481,86 @@ error estimate is small, and an ordinary test node has no time source to get
 there with (`testNodeTimeSyncOff` removed chrony, and `qemu-vm.nix` had already
 disabled `timesyncd`), so the gate would hold every boot for its full
 `TimeoutStartSec` and then fail the unit. The two suites above are where the gate
-is actually exercised; both bring their own NTP node and force it back on.
+is actually exercised; both bring their own NTP node and force it back on. A
+third override beside those two, `testNodeCollectorHealthOff`, zeroes the
+collector's own health-event interval on test nodes: those events are ordinary
+measurements landing in the same table on a 60-second timer, which is wanted in
+production and ruinous next to a test asserting an exact set of types and an
+exact batch count.
 
-`modules/system-metrics.nix` is that producer: a systemd oneshot on a 15-minute
+**Nothing posts to the receiver directly.** In between sits `mp-collector`, the
+monitoring platform's on-host forwarding collector (`nix/collector-module.nix` in
+the same input, composed into `rpi5HostModules` beside the receiver). It takes
+OTLP on its own unix socket, forwards to whatever `forwardTo` names, and exists
+so that **moving the receiver is a change to one option on one service** — every
+producer keeps posting to the same local socket and needs no edit. Today
+`forwardTo` and `forwardToGroup` are left unstated because their defaults are
+already the receiver's socket and group; when the platform moves off the Pi,
+those two lines are the whole diff (`forwardToGroup = null` for an `http://`
+target, which also widens the collector's `RestrictAddressFamilies` off that same
+option, so there is no second switch to forget).
+
+The hop earns its place for a second reason on this hardware. The Pi has no RTC
+battery, so from boot until chrony first syncs its clock reads near the epoch.
+The collector holds batches stamped in that window, works out which clock frame
+they came from, and rewrites the timestamps once the true time is known — or
+flushes them marked `mp.clock.uncertain` if sync never arrives at all. Its unit
+is deliberately the inverse of the receiver's: the receiver refuses to start
+until the clock is good, while the collector is ordered *before* every time
+daemon, because a collector that is not running observes no clock step.
+
+`modules/system-metrics.nix` is the producer: a systemd oneshot on a 15-minute
 timer that collects the host's CPU (load, core count, utilisation over a
 1-second `/proc/stat` sample), memory (including swap), per-filesystem usage and
-current NixOS generation, and posts them to the receiver as one OTLP batch —
+current NixOS generation, and posts them to the collector as one OTLP batch —
 five measurement types, `system.cpu` / `system.memory` / `system.filesystem` /
 `system.generation` / `system.host`, each carrying `resource.attributes.host.name`
-so one query can serve a whole fleet later. The receiver only speaks binary OTLP
-protobuf and requires a non-empty `LogRecord.event_name` per record, so the
+so one query can serve a whole fleet later. The wire format only speaks binary
+OTLP protobuf and requires a non-empty `LogRecord.event_name` per record, so the
 producer is a small Rust binary in `packages/system-metrics` built on the same
 `opentelemetry-proto` crate the receiver decodes with, rather than a shell
 script. It runs under `DynamicUser` whose only privilege is membership of the
-receiver's group, and `RestrictAddressFamilies = [ "AF_UNIX" ]` makes "this
+collector's group, and `RestrictAddressFamilies = [ "AF_UNIX" ]` makes "this
 never talks to the network" a kernel guarantee on the producer side too. Two
-behaviours worth knowing: a run is skipped (not failed) until the clock is
-known-synchronised, because the RTC-less Pi would otherwise write permanent
-1970-dated rows into a store that has no retention; and a receiver that is down
-makes the unit **fail** rather than skip, since a silently-green unit that
-stopped measuring is the failure mode worth avoiding.
+behaviours worth knowing: a **collector** that is down makes the unit fail rather
+than skip, since a silently-green unit that stopped measuring is the failure mode
+worth avoiding — while a *receiver* that is down is not the producer's problem at
+all, because the collector buffers through it; and there is deliberately no clock
+gate on hosts where the collector is in the path.
 
-The gate is a `ConditionPathExists` on `common.systemMetrics.syncedMarker`. Its
-default is the marker systemd-timesyncd writes, because that is the stock NixOS
-time source — but the deployed hosts run chrony, which writes nothing of the
-kind, so `modules/time-sync.nix` (above) repoints the option at the marker its
-own `chrony-wait` unit writes.
+That last one used to be the opposite. `common.systemMetrics.requireClockSync`
+put a `ConditionPathExists` on `common.systemMetrics.syncedMarker` and skipped
+every run until the clock was known-synchronised, because the RTC-less Pi would
+otherwise write permanent 1970-dated rows into a store that has no retention.
+Once the collector is re-dating those batches, the gate is no longer the cheaper
+mistake — it discards exactly the samples the collector exists to recover — so it
+defaults off there. The switch is derived, not configured:
+`common.systemMetrics.viaCollector` is a read-only option that holds when
+`socketPath` is the enabled collector's socket, and both `requireClockSync` and
+the `mkDefault` at the end of `modules/time-sync.nix` read it, so pointing the
+socket elsewhere cannot leave a stale assumption behind. Where the gate does
+still apply, its marker default is the one systemd-timesyncd writes, and
+`modules/time-sync.nix` repoints it at chrony's `chrony-wait` marker, since
+enabling chrony forces timesyncd off and its marker never appears.
 
 The two halves of that are checked separately, because they fail differently. The
-*mechanism* — systemd holding the unit back while the file is absent and releasing
-it once it appears — is covered by the `system-metrics` check against a real NTP
-server rather than a hand-placed marker file: it runs a second node with chrony
-(`local stratum 10`, so an island with no upstream still serves a usable
-reference) and asserts that the host records nothing while that daemon is down,
-starts recording once `systemd-timesyncd` syncs to it, and stops again when it
-goes away. That helper node takes the same `-rtc base=tomorrow 10:00` as the node
-under test (`lib/test-rtc-base.nix`) — otherwise it would serve real wall-clock
-time and step the machine a day backwards mid-test. Which marker each *deployed*
-host is pointed at is a claim about rendered units, so `time-sync-deployed`
-asserts it per host at eval time; that also makes it the only check that covers
-the Pi, which is the host the gate exists for.
+*mechanism* is covered by the `system-metrics` check against a real NTP server
+rather than a hand-placed marker file: it runs a second node with chrony (`local
+stratum 10`, so an island with no upstream still serves a usable reference) and
+asserts that a batch produced while that daemon is down is **buffered rather than
+dropped**, lands in the store once `systemd-timesyncd` syncs to it, is not marked
+uncertain (so it flushed on sync, not on the 300-second cap), and carries the
+`mp.clock.*` attributes that prove it travelled through the collector at all. It
+also asserts the inverse of the old behaviour at the other end: losing NTP after
+a good sync does *not* stop recording, because nothing steps when a time source
+disappears — the clock free-runs and the error *bound* grows while the actual
+error stays in milliseconds, and blanking telemetry during a network outage would
+be paying for that with the data you most want. That helper node takes the same
+`-rtc base=tomorrow 10:00` as the node under test (`lib/test-rtc-base.nix`) —
+otherwise it would serve real wall-clock time and step the machine a day
+backwards mid-test. Which shape each *deployed* host is in is a claim about
+rendered units, so `time-sync-deployed` asserts it per host at eval time; that
+also makes it the only check that covers the Pi.
 
 It is opt-in (`common.systemMetrics.enable`) and enabled wherever a receiver
 runs. `system-metrics --dry-run` prints the batch a run would send without
@@ -525,9 +568,12 @@ sending it. Covered end to end by the `system-metrics` check on both x86 and
 aarch64: it posts through the real socket and reads the results back out of the
 receiver's own query API, which is what verifies the encoding.
 
-The generic x86 desktop configuration **temporarily** composes the receiver in
-too (`commonDesktopHostModule` in `flake.nix`), purely so the producer has a
-fast x86 VM target instead of only the slow aarch64 TCG one.
+The generic x86 desktop configuration **temporarily** composes the receiver and
+the collector in too (`commonDesktopHostModule` in `flake.nix`), purely so the
+producer has a fast x86 VM target instead of only the slow aarch64 TCG one. Both,
+not just the receiver: the deployed path is producer → collector → receiver, and
+an x86 check that skipped the middle hop would be exercising a topology nothing
+runs — including the clock gate being on, which is a consequence of that hop.
 `hosts/anya-feher-laptop` composes its own module list and is deliberately
 untouched by that.
 
@@ -922,10 +968,15 @@ renders `time-correction.service` and asserts the argument vector — one `--nts
 per entry of `lib/nts-servers.nix` with its operator, one `--doh` per provider in
 `lib/doh-stamps.nix` with both families, `--sample 2`, `--tolerance 60`,
 `--timeout 10`, and a `--floor` that is present and numeric. It also asserts, on
-each host that deploys the metrics collector, that `system-metrics.service` carries
-exactly `ConditionPathExists=<the chrony marker>` — the two-line `mkDefault` in
-`modules/time-sync.nix` whose failure is silent in both directions, and which no VM
-test covers on a host anyone deploys. All of these throw during
+each host that deploys the metrics producer, that `system-metrics.service` is in
+one of its two valid shapes and fully in that one: either gated on exactly
+`ConditionPathExists=<the chrony marker>` when it posts straight at a receiver —
+the two-line `mkDefault` in `modules/time-sync.nix` whose failure is silent in
+both directions — or, when `mp-collector` is in the path, carrying **no**
+condition at all *and* posting at the collector's socket. Both halves of that
+second shape are needed: a producer with the gate dropped but still aimed at the
+receiver has the worst of both, writing 1970-dated rows nothing will correct.
+No VM test covers this on a host anyone deploys. All of these throw during
 evaluation on drift. It reads the rendered units rather than
 `common.timeSync.interval`, since the claim worth making is that systemd was told
 the value, not that the option holds it. The count assertions are the load-bearing
