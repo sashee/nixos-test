@@ -1,4 +1,16 @@
-{ nixpkgs, pkgs, commonDesktopModule, qemuDemoUserModule, stateVersion }:
+# `user` (required): the already-configured desktop user whose session is
+# exercised — "demo" for the generic stack (with qemuDemoUserModule), or the
+# host's real user when commonDesktopModule is a host config (then
+# qemuDemoUserModule stays null; the host provides its own autologin).
+#
+# `bluetooth`: whether this node is expected to have bluetooth enabled. It comes
+# from laptop-base, not from modules/common-desktop.nix, so a host may turn it
+# back off — anya-feher-laptop does, per its spec, and asserts the disabled state
+# itself in tests/anya-feher-laptop.nix. Everything else below is the shared
+# desktop payload, which every consumer of the module has.
+{ nixpkgs, pkgs, commonDesktopModule, qemuDemoUserModule ? null, stateVersion, user
+, bluetooth ? true
+}:
 
 nixpkgs.lib.nixos.runTest {
   name = "common-desktop";
@@ -6,10 +18,8 @@ nixpkgs.lib.nixos.runTest {
   globalTimeout = 300;
 
   nodes.machine = {
-    imports = [
-      commonDesktopModule
-      qemuDemoUserModule
-    ];
+    imports = [ commonDesktopModule ]
+      ++ nixpkgs.lib.optional (qemuDemoUserModule != null) qemuDemoUserModule;
 
     networking.hostName = "common-desktop-test";
     common.autoUpgrade.enable = false;
@@ -21,11 +31,11 @@ nixpkgs.lib.nixos.runTest {
   testScript = ''
     machine.start()
     machine.wait_for_unit("graphical.target")
-    machine.wait_until_succeeds("pgrep -u demo plasmashell")
-    machine.wait_until_succeeds("pgrep -u demo kwin_wayland")
+    machine.wait_until_succeeds("pgrep -u ${user} plasmashell")
+    machine.wait_until_succeeds("pgrep -u ${user} kwin_wayland")
 
     machine.succeed("systemctl is-active NetworkManager.service")
-    machine.succeed("systemctl is-enabled bluetooth.service")
+    ${nixpkgs.lib.optionalString bluetooth ''machine.succeed("systemctl is-enabled bluetooth.service")''}
     machine.succeed("systemctl is-active cups.socket")
     machine.wait_until_succeeds("systemctl is-active upower.service")
     machine.succeed("(systemctl is-enabled power-profiles-daemon.service || true) | grep -E '^(enabled|linked)$'")

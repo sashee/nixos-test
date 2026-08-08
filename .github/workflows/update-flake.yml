@@ -45,193 +45,39 @@ jobs:
           path: flake.lock
           if-no-files-found: error
 
-  x86:
-    # Verify the x86_64 (laptop/QEMU) tests against the UPDATED lock.
-    needs: lock
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Use updated lock
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: flake-lock
-          path: .
-
-      - name: Reclaim disk space
-        run: |
-          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
-          # || true so a path missing on the arm64 image is not fatal.
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /usr/share/swift \
-            /usr/local/share/boost \
-            /opt/hostedtoolcache \
-            || true
-          sudo docker image prune --all --force || true
-          df -h
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
-        with:
-          enable_kvm: true
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            accept-flake-config = true
-
-      - name: Add swap
-        run: |
-          swapon --show || true
-          sudo fallocate -l 8G /mnt/ci-swapfile
-          sudo chmod 600 /mnt/ci-swapfile
-          sudo mkswap /mnt/ci-swapfile
-          sudo swapon /mnt/ci-swapfile
-          swapon --show
-          free -h
-          df -h
-
-      - name: Run VM tests (eval+run one check at a time)
-        # A single whole-flake eval peaks at ~15 GiB and OOMs the 16 GiB
-        # runner; the make target evaluates and runs each check one by one.
-        run: make run-tests
-
-  rpi:
-    # Verify the aarch64 Raspberry Pi 5 checks against the UPDATED lock, on a
-    # GitHub-hosted arm64 runner. Builds the real rpi kernel from source.
-    needs: lock
-    runs-on: ubuntu-24.04-arm
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Use updated lock
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: flake-lock
-          path: .
-
-      - name: Reclaim disk space
-        run: |
-          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
-          # || true so a path missing on the arm64 image is not fatal.
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /usr/share/swift \
-            /usr/local/share/boost \
-            /opt/hostedtoolcache \
-            || true
-          sudo docker image prune --all --force || true
-          df -h
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
-        with:
-          enable_kvm: true
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            accept-flake-config = true
-
-      - name: Add swap
-        run: |
-          swapon --show || true
-          sudo fallocate -l 8G /mnt/ci-swapfile
-          sudo chmod 600 /mnt/ci-swapfile
-          sudo mkswap /mnt/ci-swapfile
-          sudo swapon /mnt/ci-swapfile
-          swapon --show
-          free -h
-          df -h
-
-      - name: Build Raspberry Pi 5 checks (aarch64 VM tests, real kernel)
-        # Eval+run one check at a time; a whole-flake eval would OOM the runner.
-        run: make run-rpi-tests
-
-  rpi-x86:
-    # Verify the rpi5 host config on the stock x86 kernel (lib.checkSets.rpi5-x86)
-    # against the UPDATED lock. Mirrors the job of the same name in ci.yml, because
-    # this workflow gates an UNREVIEWED auto-commit to main: whatever CI would run on
-    # a PR has to run here too, or a nixpkgs bump could land something the next PR
-    # then fails on. Not redundant with the `rpi` job either -- that one pins the
-    # aarch64 vendor kernel and nixos-raspberrypi's own nixpkgs, so it cannot see a
-    # bump that breaks hosts/rpi5 against THIS flake's nixpkgs.
-    needs: lock
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Use updated lock
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: flake-lock
-          path: .
-
-      - name: Reclaim disk space
-        run: |
-          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
-          # || true so a path missing on the arm64 image is not fatal.
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /usr/share/swift \
-            /usr/local/share/boost \
-            /opt/hostedtoolcache \
-            || true
-          sudo docker image prune --all --force || true
-          df -h
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
-        with:
-          enable_kvm: true
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            accept-flake-config = true
-
-      - name: Add swap
-        run: |
-          swapon --show || true
-          sudo fallocate -l 8G /mnt/ci-swapfile
-          sudo chmod 600 /mnt/ci-swapfile
-          sudo mkswap /mnt/ci-swapfile
-          sudo swapon /mnt/ci-swapfile
-          swapon --show
-          free -h
-          df -h
-
-      - name: Run rpi5-on-x86 checks (eval+run one check at a time)
-        run: make run-rpi-x86-tests
-
-  hosts:
-    # Verify each laptop host's check set (lib.checkSets.<host>) against the
-    # UPDATED lock, parallel to the generic x86 and rpi jobs. A nixpkgs bump
-    # that breaks a host config cannot land. New host = one matrix entry.
+  checks:
+    # Verify every check set against the UPDATED lock, one leg per
+    # lib.checkSets entry -- the same matrix ci.yml runs, because this workflow
+    # gates an UNREVIEWED auto-commit to main: whatever CI would run on a PR has
+    # to run here too, or a nixpkgs bump could land something the next PR then
+    # fails on. The rpi5 leg is not redundant with rpi5-x86 either -- it pins the
+    # aarch64 vendor kernel and nixos-raspberrypi's own nixpkgs, so it cannot see
+    # a bump that breaks hosts/rpi5 against THIS flake's nixpkgs.
+    name: checks (${{ matrix.name }})
     needs: lock
     strategy:
+      fail-fast: false
       matrix:
-        host: [anya-feher-laptop]
-    runs-on: ubuntu-latest
+        include:
+          - name: eval
+            system: x86_64-linux
+            set: eval
+            runner: ubuntu-latest
+          - name: anya-feher-laptop
+            system: x86_64-linux
+            set: anya-feher-laptop
+            runner: ubuntu-latest
+          - name: rpi5-x86
+            system: x86_64-linux
+            set: rpi5-x86
+            runner: ubuntu-latest
+          # Builds the real rpi kernel from source; unlike ci.yml this workflow
+          # does not export it as an artifact, so run-checks builds it in place.
+          - name: rpi5
+            system: aarch64-linux
+            set: rpi5
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout
@@ -281,13 +127,15 @@ jobs:
           free -h
           df -h
 
-      - name: Run host checks (eval+run one check at a time)
-        run: make run-host-tests HOST=${{ matrix.host }}
+      - name: Run checks (eval+run one check at a time)
+        # A single whole-flake eval peaks at ~15 GiB and OOMs the 16 GiB runner;
+        # the make target evaluates and runs each check one by one.
+        run: make run-checks SYSTEM=${{ matrix.system }} SET=${{ matrix.set }}
 
   commit:
-    # Only reached if the x86_64, aarch64, rpi5-on-x86 and per-host checks ALL
-    # passed -- the same set of jobs ci.yml's automerge gates on.
-    needs: [x86, rpi, rpi-x86, hosts]
+    # Only reached if every check leg passed -- the same job ci.yml's automerge
+    # gates on.
+    needs: [checks]
     runs-on: ubuntu-latest
 
     steps:

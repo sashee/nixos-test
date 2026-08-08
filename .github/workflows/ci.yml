@@ -14,72 +14,42 @@ permissions:
   contents: read
 
 jobs:
-  full-build:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          # This job builds incoming flake code; don't leave a token in .git.
-          persist-credentials: false
-
-      - name: Reclaim disk space
-        run: |
-          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
-          # || true so a path missing on the arm64 image is not fatal.
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /usr/share/swift \
-            /usr/local/share/boost \
-            /opt/hostedtoolcache \
-            || true
-          sudo docker image prune --all --force || true
-          df -h
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
-        with:
-          enable_kvm: true
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            accept-flake-config = true
-
-      - name: Add swap
-        run: |
-          swapon --show || true
-          sudo fallocate -l 8G /mnt/ci-swapfile
-          sudo chmod 600 /mnt/ci-swapfile
-          sudo mkswap /mnt/ci-swapfile
-          sudo swapon /mnt/ci-swapfile
-          swapon --show
-          free -h
-          df -h
-
-      - name: Run VM tests (eval+run one check at a time)
-        # A single whole-flake eval peaks at ~15 GiB and OOMed the runner; the
-        # make target instead evaluates and runs each check strictly one by
-        # one, each in its own short-lived nix process.
-        run: make run-tests
-
-      - name: Upload VM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: plasma-screenshots
-          path: |
-            results/x86_64-linux/plasma-firefox/plasma-desktop.png
-            results/x86_64-linux/plasma-firefox/firefox-page.png
-          if-no-files-found: warn
-
-  rpi:
-    # aarch64 Raspberry Pi 5 checks on the real rpi kernel. GitHub-hosted arm64
-    # runner (free for public repos). NOTE: the patched rpi kernel is not in any
-    # binary cache, so without a cache this job compiles it from source (~1-2h).
-    runs-on: ubuntu-24.04-arm
+  checks:
+    # One leg per lib.checkSets entry (see the header there for what each covers).
+    # Each is an independently reported suite whose failures point straight at one
+    # config: `eval` at the pure-data and deployed-config assertions, the host sets
+    # at that host, `rpi5` at the Pi's real kernel on aarch64. The architecture is
+    # just another matrix field -- runs-on takes an expression -- so aarch64 needs
+    # no separate job. rpi5-x86 finishes in minutes while rpi5 is still compiling
+    # the kernel, so a config regression surfaces early; it does NOT replace rpi5
+    # (see the header on rpi5X86Checks in flake.nix for what only aarch64 catches).
+    name: checks (${{ matrix.name }})
+    strategy:
+      # Independent legs, as the four separate jobs they replace were: one failing
+      # suite must not cancel the others.
+      fail-fast: false
+      matrix:
+        include:
+          - name: eval
+            system: x86_64-linux
+            set: eval
+            runner: ubuntu-latest
+          - name: anya-feher-laptop
+            system: x86_64-linux
+            set: anya-feher-laptop
+            runner: ubuntu-latest
+          - name: rpi5-x86
+            system: x86_64-linux
+            set: rpi5-x86
+            runner: ubuntu-latest
+          # aarch64 Raspberry Pi 5 checks on the real rpi kernel. GitHub-hosted arm64
+          # runner (free for public repos). NOTE: the patched rpi kernel is not in any
+          # binary cache, so without a cache this leg compiles it from source (~1-2h).
+          - name: rpi5
+            system: aarch64-linux
+            set: rpi5
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout
@@ -126,140 +96,46 @@ jobs:
       - name: Build + export rpi kernel
         # The kernel is the ~1-2h part and every rpi check reuses it, so build
         # it first: a later test failure still yields the kernel artifact.
+        if: matrix.system == 'aarch64-linux'
         run: make export-rpi-kernel
 
       - name: Upload rpi kernel cache
         # Downloadable file:// binary cache of the patched rpi kernel closure.
         # Import on a dev machine with `make import-rpi-kernel CACHE=...` to run
         # the rpi checks locally without the emulated kernel compile.
+        if: matrix.system == 'aarch64-linux'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rpi-kernel-cache
           path: rpi-kernel-cache
 
-      - name: Build Raspberry Pi 5 checks (aarch64 VM tests, real kernel)
-        # Eval+run one check at a time so the evaluator's heap stays bounded;
-        # a single whole-flake eval would OOM the runner.
-        run: make run-rpi-tests
+      - name: Run checks (eval+run one check at a time)
+        # A single whole-flake eval peaks at ~15 GiB and OOMed the runner; the
+        # make target instead evaluates and runs each check strictly one by
+        # one, each in its own short-lived nix process.
+        run: make run-checks SYSTEM=${{ matrix.system }} SET=${{ matrix.set }}
 
-  rpi-x86:
-    # The rpi5 host config on x86 (lib.checkSets.rpi5-x86): the same feature tests the
-    # `rpi` job runs, against the same rpi5HostModules, but on the stock x86 kernel and
-    # under KVM. Its own job rather than a `full-build` step for the same reason the rpi
-    # set has one: an independent parallel run whose failures point straight at the Pi's
-    # config. It finishes in minutes while the `rpi` job is still compiling the kernel,
-    # so a config regression surfaces early -- but it does NOT replace that job (see the
-    # header on rpi5X86Checks in flake.nix for what only aarch64 can catch).
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Upload VM artifacts
+        # The desktop screenshots, from the host that deploys the desktop.
+        if: always() && matrix.name == 'anya-feher-laptop'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          # This job builds incoming flake code; don't leave a token in .git.
-          persist-credentials: false
-
-      - name: Reclaim disk space
-        run: |
-          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
-          # || true so a path missing on the arm64 image is not fatal.
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /usr/share/swift \
-            /usr/local/share/boost \
-            /opt/hostedtoolcache \
-            || true
-          sudo docker image prune --all --force || true
-          df -h
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
-        with:
-          enable_kvm: true
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            accept-flake-config = true
-
-      - name: Add swap
-        run: |
-          swapon --show || true
-          sudo fallocate -l 8G /mnt/ci-swapfile
-          sudo chmod 600 /mnt/ci-swapfile
-          sudo mkswap /mnt/ci-swapfile
-          sudo swapon /mnt/ci-swapfile
-          swapon --show
-          free -h
-          df -h
-
-      - name: Run rpi5-on-x86 checks (eval+run one check at a time)
-        run: make run-rpi-x86-tests
-
-  host-checks:
-    # Per-host check sets (lib.checkSets.<host>): each laptop host's tests run
-    # against its real config in a job parallel to the generic x86 and rpi
-    # suites, like the rpi's own aarch64 set. New host = one matrix entry.
-    strategy:
-      matrix:
-        host: [anya-feher-laptop]
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          # This job builds incoming flake code; don't leave a token in .git.
-          persist-credentials: false
-
-      - name: Reclaim disk space
-        run: |
-          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
-          # || true so a path missing on the arm64 image is not fatal.
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /usr/share/swift \
-            /usr/local/share/boost \
-            /opt/hostedtoolcache \
-            || true
-          sudo docker image prune --all --force || true
-          df -h
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
-        with:
-          enable_kvm: true
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            accept-flake-config = true
-
-      - name: Add swap
-        run: |
-          swapon --show || true
-          sudo fallocate -l 8G /mnt/ci-swapfile
-          sudo chmod 600 /mnt/ci-swapfile
-          sudo mkswap /mnt/ci-swapfile
-          sudo swapon /mnt/ci-swapfile
-          swapon --show
-          free -h
-          df -h
-
-      - name: Run host checks (eval+run one check at a time)
-        run: make run-host-tests HOST=${{ matrix.host }}
+          name: plasma-screenshots
+          path: |
+            results/x86_64-linux/anya-feher-laptop-plasma-firefox/plasma-desktop.png
+            results/x86_64-linux/anya-feher-laptop-plasma-firefox/firefox-page.png
+          if-no-files-found: warn
 
   automerge:
     # DIY auto-merge: main has no branch protection (so update-flake.yml can
     # push to it with the plain GITHUB_TOKEN), which also disables GitHub's
     # native auto-merge. `needs` gives the same semantics: this job only runs
-    # when both checks passed. Draft = "don't auto-merge yet": the payload flag
+    # when every check leg passed. Draft = "don't auto-merge yet": the payload flag
     # below only skips runs that *started* draft, so the merge step re-reads it
     # live (see the frozen-payload note on the triggers above). Owner-only so
     # fork PRs (read-only token anyway) are never merged unreviewed.
-    needs: [full-build, rpi, rpi-x86, host-checks]
+    # One entry, but it waits for every matrix leg of that job.
+    needs: [checks]
     if: >
       github.event_name == 'pull_request' &&
       !github.event.pull_request.draft &&
