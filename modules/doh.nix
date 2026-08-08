@@ -9,6 +9,22 @@ in
     enable = true;
     upstreamDefaults = false;
     settings = {
+      # Info (1), not the default Notice (2). On 2026-08-08 dnscrypt-proxy stopped answering
+      # on 127.0.0.1:53 for four hours while holding two reachable upstreams, and logged
+      # NOTHING for the entire window -- the outage was only visible because
+      # connectivity-watchdog probes the resolver directly. Info is where the two lines that
+      # would have named it live: xtransport.go's "Unable to resolve [%s] using resolver ..."
+      # and query_processing.go's SERVFAIL notice.
+      #
+      # Info is close to free on this host: the per-query call sites are all Debug (0), and
+      # the Info sites that could be chatty belong to features that are off here --
+      # plugin_forward (no forwarding rules), dnscrypt_certs (dnscrypt_servers = false),
+      # plugin_dns64. What is left fires per refresh, i.e. four-hourly, or on errors.
+      #
+      # Debug is deliberately not the choice: it costs 3-5 lines per query (getOne logs its
+      # WP2 candidate for every one), and it cannot be set from here anyway -- config_loader.go
+      # silently downgrades log_level 0 to Info unless DEBUG is set in the environment.
+      log_level = 1;
       listen_addresses = [
         "127.0.0.1:53"
         "[::1]:53"
