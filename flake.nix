@@ -168,8 +168,10 @@
       # system-wide environment.systemPackages, so root's sqlite3 is a bubblewrap wrapper
       # restricted to /tmp and the harness cannot open the receiver's database to count rows.
       # hosts/rpi5 has no such collision (nix-utils is on the nixos user's PATH only), so that
-      # is a desktop artifact rather than a property worth asserting on -- and the x86
-      # platform/desktop combination is already covered by systemMetricsTest.
+      # is a desktop artifact rather than a property worth asserting on. The producer over the
+      # real deployed path is covered on x86 by rpi5-x86-system-metrics, against hosts/rpi5 --
+      # a better target than the desktop config ever was, since the Pi is the host that
+      # deploys the receiver for real.
       monitoringPlatformNodeX86 = { ... }: {
         imports = [
           "${monitoring-platform}/nix/module.nix"
@@ -292,6 +294,7 @@
       };
       commonDesktopTest = import ./tests/common-desktop.nix {
         inherit nixpkgs pkgs commonDesktopModule qemuDemoUserModule stateVersion;
+        user = "demo";
       };
       localeFirefoxTest = import ./tests/locale-firefox.nix {
         inherit nixpkgs pkgs commonDesktopModule qemuDemoUserModule stateVersion;
@@ -816,14 +819,12 @@
         imports = [ rpi5X86QuiescedModule ./modules/time-sync.nix ];
         common.connectivityFallback.bootGrace = "3h";
       };
-      # The x86 rpi check set. Deliberately absent, each because it would assert nothing new:
-      #   * required-kernel-modules -- aarch64 by definition (see rpi5X86Kernel).
-      #   * connectivity-fallback-timing -- an icount/`-rtc clock=vm` time-warp test whose
-      #     premise is TCG determinism; connectivityFallbackTimingTest already runs it on x86.
-      #   * monitoring-nix-gc, monitoring-iroh-ssh -- host-input-free unit tests, in the
-      #     aarch64 set only because it evaluates a different nixpkgs. testResults has them.
-      #   * monitoring-platform-* -- upstream's SPEC 11.1 puts the weight on the systemd the
-      #     target boots, and monitoringPlatformTestsX86 is already the x86 companion.
+      # The x86 rpi check set: the rpi5 host config on the stock x86 kernel, plus (below the
+      # rpi5-x86-* block) the host-independent x86 checks that need a KVM leg to ride on and
+      # whose subject the Pi is the host that deploys.
+      #
+      # required-kernel-modules stays out and has no x86 twin: it is aarch64 by definition
+      # (see rpi5X86Kernel).
       rpi5X86Checks = builtins.mapAttrs (_: dropKvm) ({
         rpi5-x86-doh = rpi5X86Test ./tests/doh.nix {
           machineModule = rpi5X86SystemModule;
@@ -896,8 +897,43 @@
         };
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "rpi5-x86-nix-utils-${name}" test)
-        rpi5X86NixUtilsTests));
+        rpi5X86NixUtilsTests)
+      # Host-independent x86 checks that ride this leg, deliberately WITHOUT the rpi5-x86-
+      # prefix: a check set is a CI partition, not a namespace, and none of these runs on
+      # the rpi5 node. Re-pointing them at rpi5X86SystemModule would change what they
+      # assert -- connectivity-fallback-timing's premise is TCG determinism and its
+      # `-rtc clock=vm` warp would then meet the rtc_cmos initrd rpi5X86Kernel adds, which
+      # is the very thing rpi5-x86-boot-clock exists to guard.
+      #
+      # monitoring-nix-gc and monitoring-iroh-ssh are host-input-free module unit tests
+      # (tests/monitoring/{nix-gc,iroh-ssh}.nix build their own node and take no host
+      # module); anya enables common.monitoring and common.irohSsh too, so they are here
+      # for scheduling, not ownership. connectivity-fallback-timing and monitoring-platform-*
+      # do belong to the Pi: it is the only host that deploys either. All four have an
+      # aarch64 twin in the rpi5 set, which evaluates a different nixpkgs; these are the
+      # fast x86 runs.
+      // {
+        monitoring-nix-gc = monitoringNixGcTest;
+        monitoring-iroh-ssh = monitoringIrohSshTest;
+        connectivity-fallback-timing = connectivityFallbackTimingTest;
+      }
+      # Same renaming as the aarch64 set: the harness's `platform` key is its shared-VM run,
+      # so it takes the bare name and the isolated cases get suffixed. The names collide with
+      # the aarch64 ones by design -- checks are per-system attrsets and doh/system/firewall
+      # already do the same -- so a check name still identifies one test, on both arches.
+      // (nixpkgs.lib.mapAttrs'
+        (name: test: nixpkgs.lib.nameValuePair
+          (if name == "platform" then "monitoring-platform" else "monitoring-platform-${name}")
+          test)
+        monitoringPlatformTestsX86));
 
+      # NOT CI COVERAGE. Everything from here down that runs on commonDesktopModule exists
+      # only to back a <name>-driver / -driver-interactive package below: they are the
+      # interactive way into a test, and the generic desktop node is the cheapest one to
+      # boot by hand. None of them is in a checkSet or in checks.${system}, so CI never
+      # builds them -- each is covered by its anya-feher-laptop-* or rpi5-x86-* twin, which
+      # asserts the same thing against a config some host actually deploys. Adding one back
+      # to a set would just re-run a host test against the shared module.
       dohUpstreamTest = import ./tests/doh-upstream.nix {
         inherit nixpkgs pkgs commonDesktopModule stateVersion dohStamps;
       };
@@ -963,79 +999,21 @@
         dirtyBytes = 268435456;            # 256 MiB
         dirtyBackgroundBytes = 67108864;   #  64 MiB
       };
-      systemMetricsTest = import ./tests/system-metrics.nix {
-        inherit nixpkgs pkgs stateVersion;
-        machineModule = commonDesktopModule;
-      };
-      nixGcRetentionTest = import ./tests/nix-gc-retention.nix {
-        inherit nixpkgs pkgs stateVersion;
-        # The real laptop config (common-desktop imports nix-settings -> 14d default).
-        machineModule = { ... }: {
-          imports = [ commonDesktopModule ];
-          common.monitoring.enable = false;
-          common.irohSsh.enable = false;
-        };
-        keptAfterGc = 14;  # --delete-older-than 14d: ~14 days of history kept under daily GC
-      };
-      # No real image exists for x86 (the deployed system is aarch64-only), so the three
-      # x86 connectivity variants run on this minimal module+firewall node. The firewall is
-      # part of it deliberately: the setup script's runtime nixos-fw openings are only
+      # The node for connectivity-fallback-timing. No real image exists for x86 (the deployed
+      # system is aarch64-only), so it runs on this minimal module+firewall node. The firewall
+      # is part of it deliberately: the setup script's runtime nixos-fw openings are only
       # emitted when the nftables firewall is managed, so without it that path is dead code.
-      # The aarch64 variants of all three run on the real rpi config.
+      # The fallback/trigger/watchdog variants run on the real rpi config, on both arches.
       connectivityFallbackNode = { ... }: {
         imports = [ ./modules/connectivity-fallback.nix ./modules/firewall.nix ];
       };
-      connectivityFallbackTest = import ./tests/connectivity-fallback.nix {
-        inherit nixpkgs pkgs stateVersion;
-        machineModule = connectivityFallbackNode;
-      };
-      # Trigger decision logic (sustained non-association, flap tolerance, unusable
-      # radio), isolated from the radio stack. Regression test for the 2026-07-27
-      # reboot loop.
-      connectivityFallbackTriggerTest = import ./tests/connectivity-fallback-trigger.nix {
-        inherit nixpkgs pkgs stateVersion;
-        machineModule = connectivityFallbackNode;
-      };
-      # icount concept test: production timer constants under TCG time-warp.
+      # icount concept test: production timer constants under TCG time-warp. Its aarch64
+      # twin runs the same premise against the real rpi config; this one is the fast x86
+      # run on the minimal node.
       connectivityFallbackTimingTest = import ./tests/connectivity-fallback-timing.nix {
         inherit nixpkgs pkgs stateVersion;
         machineModule = connectivityFallbackNode;
         rtcOption = "-rtc clock=vm,base=$(${pkgs.coreutils}/bin/date -u -d tomorrow +%Y-%m-%dT10:00:00)";
-      };
-      # The two halves of the time chain on the generic desktop config, for fast local
-      # feedback; the aarch64 variants against hosts/rpi5 are the ones that cover the deployed
-      # target, since the RTC-less Pi is the host the bootstrap actually matters on.
-      # time-correction.nix covers the correction service itself -- its timer, quorum, floor and
-      # deferred certificate checks -- and nts-sync.nix covers the chain it exists to unblock,
-      # including chrony's own persisted last-known-good clock. time-sync.nix arrives
-      # through commonDesktopModule and is named again here so the composition each test runs
-      # is readable at its call site.
-      timeCorrectionTest = import ./tests/time-correction.nix {
-        inherit nixpkgs pkgs stateVersion dohStamps ntsServers;
-        machineModule = { ... }: {
-          imports = [ commonDesktopModule ./modules/time-sync.nix ];
-        };
-      };
-      ntsSyncTest = import ./tests/nts-sync.nix {
-        inherit nixpkgs pkgs stateVersion dohStamps ntsServers;
-        machineModule = { ... }: {
-          imports = [ commonDesktopModule ./modules/time-sync.nix ];
-        };
-      };
-      # The DNS-outage reboot failsafe on x86: the real desktop host config (which already
-      # imports modules/doh.nix, so dnscrypt-proxy and its cache are the deployed ones)
-      # with the watchdog module added and switched on. The feature ships only on the rpi,
-      # so this variant exists for fast local feedback; the aarch64 variant against
-      # hosts/rpi5 is the one that covers the deployed target.
-      connectivityWatchdogTest = import ./tests/connectivity-watchdog.nix {
-        inherit nixpkgs pkgs stateVersion dohStamps;
-        machineModule = { ... }: {
-          imports = [ commonDesktopModule ./modules/connectivity-watchdog.nix ];
-          common.autoUpgrade.enable = false;
-          common.monitoring.enable = false;
-          common.irohSsh.enable = false;
-          common.connectivityWatchdog.enable = true;
-        };
       };
       # The real anya-feher-laptop host config as a test node (mirrors
       # rpiSystemModule; plain x86, so no kernel neutralization is needed). The RTC
@@ -1065,6 +1043,17 @@
           toplevel = (mkAnyaFeherLaptop { modules = [ laptopStubHw ]; }).config.system.build.toplevel;
         in
         pkgs.runCommand "anya-feher-laptop-eval" { } ''
+          echo ${nixpkgs.lib.escapeShellArg (builtins.unsafeDiscardStringContext toplevel.drvPath)} > $out
+        '';
+      # Same shape, for the demo QEMU VM. It is packages.default and packages.qemu-vm --
+      # the entry point the README's "run it in QEMU" section builds -- and the only
+      # remaining consumer of modules/qemu-demo-user.nix, so without this nothing would
+      # notice it breaking: no CI leg builds nixosConfigurations.
+      qemuGraphicalEval =
+        let
+          toplevel = qemuGraphical.config.system.build.toplevel;
+        in
+        pkgs.runCommand "qemu-graphical-eval" { } ''
           echo ${nixpkgs.lib.escapeShellArg (builtins.unsafeDiscardStringContext toplevel.drvPath)} > $out
         '';
       dohStampEncodeTest = import ./tests/doh-stamp-encode.nix {
@@ -1242,7 +1231,20 @@
         commonDesktopModule = anyaFeherLaptopDesktopNode;
         user = "anya";
       };
-      # Same dotfiles suite as the generic nix-utils checks, on the real host
+      # The shared desktop payload -- the .desktop Exec= lines, the icons, desktop-file-validate
+      # -- asserted on the host that deploys it: hosts/anya-feher-laptop/configuration.nix
+      # imports modules/common-desktop.nix, so the whole payload is present. qemuDemoUserModule
+      # stays null because the host provides its own user and autologin.
+      anyaFeherLaptopCommonDesktopTest = import ./tests/common-desktop.nix {
+        inherit nixpkgs pkgs stateVersion;
+        commonDesktopModule = anyaFeherLaptopDesktopNode;
+        user = "anya";
+        # Spec: this host disables bluetooth (hosts/anya-feher-laptop/configuration.nix).
+        # anya-feher-laptop asserts the disabled state; asserting it here too would just
+        # duplicate it, and asserting the enabled state would contradict the spec.
+        bluetooth = false;
+      };
+      # Same dotfiles suite as the nix-utils driver packages, on the real host
       # config as the real primary user (the suite needs no sudo).
       anyaFeherLaptopNixUtilsTests = import "${dotfiles}/nix-utils/tests/lib.nix" {
         inherit pkgs;
@@ -1290,59 +1292,20 @@
         anya-feher-laptop-nts-sync = anyaFeherLaptopNtsSyncTest;
         anya-feher-laptop-plasma-firefox = anyaFeherLaptopPlasmaFirefoxTest;
         anya-feher-laptop-locale-firefox = anyaFeherLaptopLocaleFirefoxTest;
+        anya-feher-laptop-common-desktop = anyaFeherLaptopCommonDesktopTest;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "anya-feher-laptop-nix-utils-${name}" test)
         anyaFeherLaptopNixUtilsTests)) // {
         # Eval-only runCommand, not a VM test: no kvm feature to drop.
         anya-feher-laptop-eval = anyaFeherLaptopEval;
       };
-      testResults = builtins.mapAttrs (_: dropKvm) ({
-        auto-upgrade-mocked-service = autoUpgradeMockedServiceTest;
-        common-desktop = commonDesktopTest;
-        doh = dohTest;
-        doh-upstream = dohUpstreamTest;
-        iroh-ssh = irohSshTest;
-        doh-captive = dohCaptiveTest;
-        nm-captive-portal = nmCaptivePortalTest;
-        nm-captive-portal-ipv6 = nmCaptivePortalIpv6Test;
-        firewall = firewallTest;
-        locale-firefox = localeFirefoxTest;
-        monitoring-auto-upgrade = monitoringAutoUpgradeTest;
-        monitoring-disk-space = monitoringDiskSpaceTest;
-        monitoring-generations = monitoringGenerationsTest;
-        monitoring-reporting = monitoringReportingTest;
-        monitoring-restic = monitoringResticTest;
-        monitoring-nix-gc = monitoringNixGcTest;
-        monitoring-iroh-ssh = monitoringIrohSshTest;
-        nix-settings = nixSettingsTest;
-        nix-gc-retention = nixGcRetentionTest;
-        plasma-firefox = plasmaFirefoxTest;
-        restic = resticTest;
-        connectivity-fallback = connectivityFallbackTest;
-        connectivity-fallback-trigger = connectivityFallbackTriggerTest;
-        connectivity-watchdog = connectivityWatchdogTest;
-        time-correction = timeCorrectionTest;
-        nts-sync = ntsSyncTest;
-        connectivity-fallback-timing = connectivityFallbackTimingTest;
-        system = systemTest;
-        system-metrics = systemMetricsTest;
-      } // (nixpkgs.lib.mapAttrs'
-        (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
-        nixUtilsTests)
-      # Same renaming as the aarch64 set: the harness's `platform` key is its shared-VM run,
-      # so it takes the bare name and the isolated cases get suffixed. The names collide with
-      # the aarch64 ones by design -- checks are per-system attrsets and doh/system/firewall
-      # already do the same -- so a check name still identifies one test, on both arches.
-      // (nixpkgs.lib.mapAttrs'
-        (name: test: nixpkgs.lib.nameValuePair
-          (if name == "platform" then "monitoring-platform" else "monitoring-platform-${name}")
-          test)
-        monitoringPlatformTestsX86));
       # Eval-only runCommands (throw on drift), not VM tests: no kvm feature to drop, and
-      # arch-independent since stamps/endpoints are pure data, so x86_64 only. These must
-      # be part of the generic-x86 checkSet and not only of checks.${system}: the
-      # Makefile's run-checks builds a checkSet name by name, so a check outside one is
-      # never evaluated by CI.
+      # arch-independent since stamps/endpoints are pure data, so x86_64 only. They are
+      # their own checkSet, and therefore their own CI leg, precisely because they build
+      # no machine image: the leg needs no KVM and reports a data drift in about a minute
+      # instead of behind a VM suite. Being in SOME checkSet is not optional -- the
+      # Makefile's run-checks builds a checkSet name by name, so a check outside every set
+      # is never evaluated by CI.
       evalChecks = {
         doh-stamp-encode = dohStampEncodeTest;
         doh-endpoints = dohEndpointsTest;
@@ -1350,6 +1313,7 @@
         doh-providers = dohProvidersTest;
         time-sync-deployed = timeSyncDeployedTest;
         time-sync-assertions = timeSyncAssertionsTest;
+        qemu-graphical-eval = qemuGraphicalEval;
       };
     in
     {
@@ -1363,13 +1327,18 @@
       lib.restic = resticLib;
       lib.hosts.rpi5 = mkRpi5;
       lib.hosts.anya-feher-laptop = mkAnyaFeherLaptop;
-      # Named check sets for the Makefile's run-checks (SET=...): the generic
-      # x86 suite, one set per laptop host, and the rpi5 config on x86 -- each
-      # run by its own CI job.
+      # Named check sets for the Makefile's run-checks (SET=...), one per CI leg: the
+      # eval-only checks (no machine image, so no KVM), one set per laptop host, the rpi5
+      # config on x86, and the rpi5 config on aarch64. Every check lives in exactly one
+      # set -- run-checks builds a set name by name, so a check outside every set is never
+      # evaluated by CI. There is deliberately no generic set: a shared-module check whose
+      # subject some host deploys belongs to that host's set, where a regression names the
+      # config it broke.
       lib.checkSets = {
-        generic-x86 = testResults // evalChecks;
+        eval = evalChecks;
         anya-feher-laptop = anyaFeherLaptopChecks;
         rpi5-x86 = rpi5X86Checks;
+        rpi5 = aarch64TestResults;
       };
 
       legacyPackages.${system} = pkgs;
@@ -1378,7 +1347,7 @@
         qemu-graphical = qemuGraphical;
       };
 
-      checks.${system} = testResults // evalChecks // anyaFeherLaptopChecks // rpi5X86Checks;
+      checks.${system} = evalChecks // anyaFeherLaptopChecks // rpi5X86Checks;
       checks.aarch64-linux = aarch64TestResults;
       # The exact patched kernel every rpi check boots (rpiTestKernel pins the
       # node to this package, so the outPath matches the checks). CI exports its

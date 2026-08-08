@@ -87,9 +87,9 @@ Disable the timer on non-laptop systems with:
 common.autoUpgrade.enable = false;
 ```
 
-`.github/workflows/update-flake.yml` updates `flake.lock` daily, runs the x86,
-rpi, and per-host check suites one check at a time (the same `make run-*`
-targets CI uses), and commits the lock file only when they all pass.
+`.github/workflows/update-flake.yml` updates `flake.lock` daily, runs every check
+set one check at a time (the same matrix and `make run-checks` invocation CI uses),
+and commits the lock file only when they all pass.
 Hosts that point a local input at this repository can advance to those validated
 commits when their local upgrade timer updates `/etc/nixos/flake.lock`.
 
@@ -352,7 +352,7 @@ It is opt-in (`common.timeSync.enable`) and enabled on every host that gets the
 common desktop layer as well as on the Pi — `timeSyncSettings` in `flake.nix` is
 composed into all three module lists, which is also where `floor` comes from
 (`nixpkgs.lastModified` is only in scope there). Two VM checks cover it, each on
-four configurations — the generic x86 desktop, the aarch64 Pi, the laptop as
+three configurations — the aarch64 Pi, the laptop as
 `anya-feher-laptop-time-correction` / `anya-feher-laptop-nts-sync`, and the Pi's own
 config on the stock x86 kernel as `rpi5-x86-time-correction` / `rpi5-x86-nts-sync`
 (see "The rpi5 config on x86" below for what that last one does and does not prove).
@@ -568,14 +568,13 @@ sending it. Covered end to end by the `system-metrics` check on both x86 and
 aarch64: it posts through the real socket and reads the results back out of the
 receiver's own query API, which is what verifies the encoding.
 
-The generic x86 desktop configuration **temporarily** composes the receiver and
-the collector in too (`commonDesktopHostModule` in `flake.nix`), purely so the
-producer has a fast x86 VM target instead of only the slow aarch64 TCG one. Both,
-not just the receiver: the deployed path is producer → collector → receiver, and
-an x86 check that skipped the middle hop would be exercising a topology nothing
-runs — including the clock gate being on, which is a consequence of that hop.
-`hosts/anya-feher-laptop` composes its own module list and is deliberately
-untouched by that.
+The fast x86 target for the producer is `rpi5-x86-system-metrics`: the Pi's own
+config on the stock x86 kernel, so the whole producer → collector → receiver path
+is the deployed one rather than a stand-in. `commonDesktopHostModule` in
+`flake.nix` still **temporarily** composes the receiver and the collector into the
+generic x86 desktop config, which is what that scaffolding was originally for; it
+is now vestigial and can be dropped. `hosts/anya-feher-laptop` composes its own
+module list and is deliberately untouched by it.
 
 `modules/iroh-ssh.nix` keeps the laptop SSH-reachable by node identity
 instead of IP: a hardened long-running service runs `iroh-ssh-listen` (a small
@@ -828,8 +827,14 @@ kernel (BTF is on here and off there, and the module set is a different one), no
 aarch64, and not even the same nixpkgs — the aarch64 checks evaluate against
 `nixos-raspberrypi.inputs.nixpkgs`, these against this flake's own, so package
 versions and the systemd under test differ in both directions. Kernel-dependent
-behaviour is aarch64-only by construction, which is why the `nix-utils` sandbox
-cases, `required-kernel-modules` and the icount timing check stay out of this set.
+behaviour is aarch64-only by construction, which is why `required-kernel-modules`
+has no x86 twin at all.
+
+This set is also where the host-independent x86 checks live — `monitoring-platform*`,
+`monitoring-nix-gc`, `monitoring-iroh-ssh` and `connectivity-fallback-timing`, under
+unprefixed names because none of them runs on the rpi5 node. They are here because
+the Pi is the host that deploys their subject and this is the leg that already has
+KVM; each has an aarch64 twin in `lib.checkSets.rpi5`.
 
 ## Running the rpi tests locally
 
@@ -864,38 +869,52 @@ runtimes than CI's native arm64 runner.
 
 ## Running the tests
 
-Run the generic x86 suite with live logs, one check at a time (this is what CI
-runs; evaluating every check in a single nix process peaks at ~15 GiB, so each
-check gets its own short-lived eval+build process):
+The checks are partitioned into named sets (`lib.checkSets`), one per CI leg.
+Every check belongs to exactly one set — a check outside every set is never built
+by CI. Each suite runs with live logs, one check at a time (this is what CI runs;
+evaluating every check in a single nix process peaks at ~15 GiB, so each check
+gets its own short-lived eval+build process):
 
 ```bash
-make run-tests
+make run-eval-tests                        # lib.checkSets.eval
+make run-host-tests HOST=anya-feher-laptop # lib.checkSets.anya-feher-laptop
+make run-rpi-x86-tests                     # lib.checkSets.rpi5-x86
+make run-rpi-tests                         # lib.checkSets.rpi5 (aarch64)
 ```
 
-Each check's output lands under `results/x86_64-linux/<check-name>`, e.g.:
+`run-eval-tests` is the quick one: those checks are `runCommand`s that assert on
+pure data (DoH stamps, NTS server lists) and on the deployed host configs without
+building a machine image, so they need no KVM and finish in about a minute. They
+are their own set precisely so a data drift reports immediately instead of behind
+a VM suite.
+
+There is deliberately no generic suite. A check for a shared module belongs to the
+set of a host that deploys it, so a failure names the config it broke; the shared
+desktop payload, for instance, is asserted by `anya-feher-laptop-common-desktop`.
+The two exceptions ride the `rpi5-x86` leg under unprefixed names because they are
+host-independent but still need a KVM leg: see the header on `rpi5X86Checks` in
+`flake.nix`.
+
+Each check's output lands under `results/<system>/<check-name>`, e.g.:
 
 ```text
-results/x86_64-linux/common-desktop
-results/x86_64-linux/doh
-results/x86_64-linux/firewall
-results/x86_64-linux/plasma-firefox/plasma-desktop.png
-results/x86_64-linux/plasma-firefox/firefox-page.png
+results/x86_64-linux/anya-feher-laptop-doh
+results/x86_64-linux/rpi5-x86-firewall
+results/x86_64-linux/anya-feher-laptop-plasma-firefox/plasma-desktop.png
+results/x86_64-linux/anya-feher-laptop-plasma-firefox/firefox-page.png
 ```
 
-The per-host and rpi suites work the same way:
+Checks get two attempts when `SYSTEM=aarch64-linux` and one otherwise, because the
+reason for the retry is the system: the aarch64 CI runner has no KVM and its TCG
+guests are slow enough to lose races the x86 runs win. A check that only passed on
+the retry prints `=== FLAKY: <name> passed on attempt 2 of 2`, so retries stay
+visible in the log rather than silently absorbing an unstable test. A failure on an
+x86 suite is a real failure; pass `ATTEMPTS=2` explicitly to retry one by hand.
 
-```bash
-make run-host-tests HOST=anya-feher-laptop
-make run-rpi-x86-tests
-make run-rpi-tests
-```
-
-`run-rpi-tests` gives each check two attempts (`ATTEMPTS=2`), because the aarch64
-CI runner has no KVM and its TCG guests are slow enough to lose races the x86
-runs win. A check that only passed on the retry prints `=== FLAKY: <name> passed
-on attempt 2 of 2`, so retries stay visible in the log rather than silently
-absorbing an unstable test. The x86 and per-host suites get one attempt, so a
-failure there is a real failure; pass `ATTEMPTS=2` explicitly to retry them too.
+Many tests also exist as `<name>-driver-interactive` packages built on the generic
+desktop node (the cheapest one to boot by hand). Those are debugging entry points,
+**not** coverage: they are in no check set, so CI never builds them. Each is covered
+by its `anya-feher-laptop-*` or `rpi5-x86-*` twin.
 
 The default package is the graphical QEMU VM runner (no tests):
 
@@ -923,7 +942,7 @@ Tests always run one at a time — each loop iteration builds a single check, so
 check. On a RAM-constrained machine, serialize those too:
 
 ```bash
-make run-tests MAX_JOBS=1
+make run-host-tests HOST=anya-feher-laptop MAX_JOBS=1
 ```
 
 `doh-upstream` is hermetic: it routes `doh-test` default IPv4 traffic through
