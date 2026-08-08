@@ -138,17 +138,31 @@ in
   # kernel), so there is no port for the default-deny firewall to open and no
   # credential to provision: access is gated by the 0750 group-owned runtime directory,
   # i.e. by membership of the `monitoring-platform` group. Remote devices still cannot
-  # reach it -- upstream's iroh transport has not landed -- so its only producer today is
-  # this host's own system-metrics collector below.
+  # reach it -- upstream's iroh transport has not landed -- so everything it stores today
+  # arrives from this host, through the collector below.
   services.monitoring-platform.enable = true;
 
-  # First producer for the receiver: CPU, memory, filesystem usage and the current NixOS
-  # generation, every 5 minutes. Wired from the receiver's own options rather than
-  # restating its defaults, so the socket path and group cannot drift apart.
+  # The on-host collector every producer posts to, and the reason none of them names the
+  # receiver. It buffers, resolves which clock frame each record was stamped in, and rewrites
+  # the timestamps once the true time is known -- which is what this RTC-less box needs, since
+  # its clock reads near the epoch from boot until chrony first syncs.
+  #
+  # Both of its defaults are already right for today's layout and are left unstated
+  # deliberately: forwardTo is the receiver's socket above, and forwardToGroup the group that
+  # opens it. When the receiver moves off this box, those two options are the ONLY change --
+  # every producer keeps posting to the same local socket. (Set forwardToGroup = null when
+  # forwardTo becomes an http:// URL; the module widens RestrictAddressFamilies itself, off
+  # that same option, so there is no second switch to remember.)
+  services.mp-collector.enable = true;
+
+  # First producer: CPU, memory, filesystem usage and the current NixOS generation, every 15
+  # minutes. Wired from the collector's own options rather than restating its defaults, so the
+  # socket path and group cannot drift apart -- and pointed at the collector rather than the
+  # receiver so this block needs no edit when the receiver moves.
   common.systemMetrics = {
     enable = true;
-    socketPath = config.services.monitoring-platform.socketPath;
-    group = config.services.monitoring-platform.group;
+    socketPath = config.services.mp-collector.socketPath;
+    group = config.services.mp-collector.group;
   };
 
   users.users.nixos = {

@@ -1,14 +1,21 @@
 { config, lib, pkgs, ... }:
 
-# Periodically reports this host's own CPU, memory, filesystem usage and NixOS generation to a
-# LOCAL monitoring-platform receiver over its unix socket -- the first producer for what was
-# until now an empty receiver (upstream's remote iroh transport has not landed).
+# Periodically reports this host's own CPU, memory, filesystem usage and NixOS generation over a
+# LOCAL unix socket -- the first producer for what was until now an empty receiver (upstream's
+# remote iroh transport has not landed).
 #
 # Not to be confused with modules/monitoring.nix, which reports host *health* outward to a
 # Healthchecks URL and alerts on it. This module makes no judgements: it collects numbers and
 # stores them, so history exists to look at later.
 #
-# The receiver only accepts binary OTLP (protobuf, logs signal, Events), so the producer cannot
+# The socket it posts to is deliberately not named here. The hosts point it at the on-host
+# `mp-collector` (the monitoring-platform input's nix/collector-module.nix), which forwards to
+# whichever receiver is configured -- so when the receiver moves off the Pi, the only thing that
+# changes is the collector's `forwardTo`. This module, and every other producer, keeps posting to
+# the same local socket and needs no edit. Posting straight at a receiver still works and is what
+# the defaults below describe.
+#
+# The wire format only accepts binary OTLP (protobuf, logs signal, Events), so the producer cannot
 # be a shell script -- it is a small Rust binary in packages/system-metrics built on the same
 # opentelemetry-proto crate the receiver decodes with.
 
@@ -54,8 +61,15 @@ in
       type = lib.types.path;
       default = "/run/monitoring-platform/monitoring-platform.sock";
       description = ''
-        Unix socket of the receiver. Hosts should wire this from
-        `services.monitoring-platform.socketPath` rather than restating the default.
+        Unix socket to post to. Hosts should wire this from
+        `services.mp-collector.socketPath` (the on-host forwarding collector) or from
+        `services.monitoring-platform.socketPath` (a receiver on this host) rather than
+        restating either default.
+
+        The default is still the receiver's socket, because that is the only endpoint that
+        exists on a host importing nothing else. Wiring it to the collector instead is what
+        makes the receiver's location a property of one option on one service -- see the
+        module header, and [](#opt-common.systemMetrics.viaCollector).
       '';
     };
 
@@ -63,9 +77,35 @@ in
       type = lib.types.str;
       default = "monitoring-platform";
       description = ''
-        Group the collector joins in order to reach the socket. Membership is the receiver's
-        entire access control (its runtime directory is 0750 and group-owned), so this must
-        match `services.monitoring-platform.group`.
+        Group this producer joins in order to reach the socket. Membership is the entire
+        access control at either end (both runtime directories are 0750 and group-owned), so
+        this must match whichever service owns
+        [](#opt-common.systemMetrics.socketPath) -- `services.mp-collector.group` or
+        `services.monitoring-platform.group`.
+      '';
+    };
+
+    viaCollector = lib.mkOption {
+      type = lib.types.bool;
+      readOnly = true;
+      default = config.services ? mp-collector
+        && config.services.mp-collector.enable
+        && cfg.socketPath == config.services.mp-collector.socketPath;
+      defaultText = lib.literalExpression
+        "the on-host mp-collector is enabled and socketPath is its socket";
+      description = ''
+        Whether this producer posts through the on-host clock-correcting collector rather
+        than straight at a receiver.
+
+        Derived rather than set, and read-only, because it is not a policy -- it is a fact
+        about where [](#opt-common.systemMetrics.socketPath) points. Anything that has to
+        behave differently on the two paths (today: the clock gate below, and
+        `modules/time-sync.nix`, which would otherwise re-arm it) reads this, so pointing the
+        socket somewhere else cannot leave a stale assumption behind.
+
+        The `?` guard is load-bearing: on a host that does not import the collector module
+        the option does not exist, and reading it would be an evaluation error rather than a
+        `false`.
       '';
     };
 
@@ -105,8 +145,9 @@ in
 
     requireClockSync = lib.mkOption {
       type = lib.types.bool;
-      default = config.services.timesyncd.enable;
-      defaultText = lib.literalExpression "config.services.timesyncd.enable";
+      default = !cfg.viaCollector && config.services.timesyncd.enable;
+      defaultText = lib.literalExpression
+        "!config.common.systemMetrics.viaCollector && config.services.timesyncd.enable";
       description = ''
         Skip runs until the clock is reported synchronised, by conditioning the unit on
         [](#opt-common.systemMetrics.syncedMarker).
@@ -122,10 +163,20 @@ in
         failure, which is the honest description: nothing is broken, the host just does not yet
         know what time it is.
 
-        The default follows timesyncd only because that is the stock NixOS time source. It is
-        not "off unless timesyncd": `modules/time-sync.nix` turns it back on when chrony owns
-        the clock, which it must, since enabling chrony forces `services.timesyncd.enable` to
-        false and would otherwise switch this gate off on precisely the host that needs it.
+        **Off by default once [](#opt-common.systemMetrics.viaCollector) holds**, because then
+        it is no longer the cheaper mistake: the collector exists precisely to make the
+        pre-sync window recoverable. It holds a batch stamped against an unsynchronised clock,
+        rewrites the timestamps once the offset is known, and flushes marked
+        `mp.clock.uncertain` if sync never arrives at all -- so the samples this gate would
+        throw away are preserved and correctly dated instead. Keeping both would leave the
+        correction path dead code on the one host that needs it. It is still an ordinary
+        option: a host can set it back to `true`.
+
+        Where it does apply, the default follows timesyncd only because that is the stock NixOS
+        time source. It is not "off unless timesyncd": `modules/time-sync.nix` turns it back on
+        when chrony owns the clock, which it must, since enabling chrony forces
+        `services.timesyncd.enable` to false and would otherwise switch this gate off on
+        precisely the host that needs it.
       '';
     };
 
@@ -164,7 +215,7 @@ in
     assertions = [
       {
         assertion = cfg.group != "";
-        message = "common.systemMetrics.group must name the receiver's socket group.";
+        message = "common.systemMetrics.group must name the socket's owning group.";
       }
       {
         # Every tick would fail against a socket nothing is serving: a loud unit that says
@@ -179,16 +230,52 @@ in
           common.systemMetrics.socketPath at another one, or disable common.systemMetrics.
         '';
       }
+      {
+        # The same trap one hop earlier, and the likelier one now that the hosts point at the
+        # collector: importing collector-module.nix and wiring socketPath from it, but never
+        # setting `enable`. Same `?` guard, same reason.
+        assertion = !(config.services ? mp-collector)
+          || config.services.mp-collector.enable
+          || cfg.socketPath != config.services.mp-collector.socketPath;
+        message = ''
+          common.systemMetrics posts to ${cfg.socketPath}, but services.mp-collector.enable is
+          false on this host. Enable the collector, point common.systemMetrics.socketPath at a
+          receiver directly, or disable common.systemMetrics.
+        '';
+      }
+      {
+        # Membership of the wrong group leaves the socket unreachable and every tick failing,
+        # which is loud but says nothing about the cause. Checked against whichever service the
+        # producer resolved to, so a half-moved wiring (collector socket, receiver group) is a
+        # build error rather than a runtime one.
+        assertion = !cfg.viaCollector || cfg.group == config.services.mp-collector.group;
+        message = ''
+          common.systemMetrics posts through the collector at ${cfg.socketPath} but joins the
+          group "${cfg.group}", while that socket is owned by
+          "${config.services.mp-collector.group}". Access is the mode on the containing runtime
+          directory, so every run would fail on permissions. Wire common.systemMetrics.group
+          from services.mp-collector.group.
+        '';
+      }
     ];
 
     environment.systemPackages = [ collectCommand ];
 
     systemd.services.system-metrics = {
       description = "Report host measurements to the local monitoring platform";
-      # Ordering only, not Requires: the receiver is Type=notify, so After really does mean
-      # "the socket is bound and accepting" rather than "the process forked". A run with no
-      # receiver up should fail loudly on the timer rather than drag the receiver in.
-      after = [ "monitoring-platform.service" "time-sync.target" ];
+      # Ordering only, not Requires: both the collector and the receiver are Type=notify, so
+      # After really does mean "the socket is bound and accepting" rather than "the process
+      # forked". A run with nothing listening should fail loudly on the timer rather than drag
+      # a service in.
+      #
+      # Both hops are named regardless of which one this host posts to. Ordering against a unit
+      # that does not exist is a no-op -- the same idiom the collector module uses for the time
+      # daemons it must precede -- so naming both costs nothing and misses neither topology.
+      after = [
+        "mp-collector.service"
+        "monitoring-platform.service"
+        "time-sync.target"
+      ];
 
       # The measured half of "only report once the clock is real"; see requireClockSync. A
       # condition, not a check inside the collector, because systemd already knows how to skip

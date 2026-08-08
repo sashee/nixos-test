@@ -38,15 +38,22 @@
           # hosts/anya-feher-laptop/configuration.nix: that host composes its own module list
           # (anyaFeherLaptopHostModule) and so is untouched by this.
           "${monitoring-platform}/nix/module.nix"
+          # ...and the collector for the same reason. The producer's path on the Pi is
+          # producer -> collector -> receiver, and a fast x86 check that skipped the middle hop
+          # would be exercising a topology nothing deploys -- including the clock gate being
+          # OFF, which is a consequence of that hop (see common.systemMetrics.viaCollector).
+          "${monitoring-platform}/nix/collector-module.nix"
         ];
         _module.args.commonDotfiles = dotfiles;
         _module.args.unstable = unstable;
 
         services.monitoring-platform.enable = true;
+        services.mp-collector.enable = true;
+        # Pointed at the collector, not the receiver, exactly as hosts/rpi5 is.
         common.systemMetrics = {
           enable = true;
-          socketPath = config.services.monitoring-platform.socketPath;
-          group = config.services.monitoring-platform.group;
+          socketPath = config.services.mp-collector.socketPath;
+          group = config.services.mp-collector.group;
         };
       };
       # Turning time synchronisation on, for every host that does. `floor` is the reason this
@@ -91,6 +98,20 @@
       testNodeClockGateOff = { lib, ... }: {
         services.monitoring-platform.clockGate.enable = lib.mkOverride 90 false;
       };
+      # The collector's §9 health event is an ordinary measurement and lands in the same table
+      # as everything else, on a 60-second timer. That is wanted in production -- "no daemon has
+      # disciplined this device's clock since boot" is a work item, not a mystery -- and ruinous
+      # in a test: tests/system-metrics.nix asserts an exact set of measurement types and an
+      # exact batch count, both of which a row arriving on a timer breaks. Upstream's own harness
+      # defaults it to 0 for the same reason.
+      #
+      # Priority 90 like the two overrides above, and for the same reason: it has to beat the
+      # normal-priority definitions a host config makes, while leaving mkForce free for the
+      # upstream collector-clock case, which sets an interval of 5 because measuring the health
+      # event IS its subject.
+      testNodeCollectorHealthOff = { lib, ... }: {
+        services.mp-collector.healthIntervalSecs = lib.mkOverride 90 0;
+      };
       # VM-test guest clock: tomorrow at 10:00 UTC. See lib/test-rtc-base.nix for why, and
       # for why it is a file rather than a binding here (a test file needs it for a helper
       # node that must share the clock of the node under test).
@@ -98,7 +119,12 @@
       # The desktop config as a VM-test node; all tests use this variant so the
       # real host timers (nix-gc, ...) stay enabled but can never elapse mid-test.
       commonDesktopModule = { ... }: {
-        imports = [ commonDesktopHostModule testNodeTimeSyncOff testNodeClockGateOff ];
+        imports = [
+          commonDesktopHostModule
+          testNodeTimeSyncOff
+          testNodeClockGateOff
+          testNodeCollectorHealthOff
+        ];
         virtualisation.qemu.options = [ (testRtcBase pkgs.coreutils) ];
       };
       qemuDemoUserModule = ./modules/qemu-demo-user.nix;
@@ -172,6 +198,11 @@
       # system, rpiNodeBase for the test nodes), so no path can lose a declaration.
       rpi5HostModules = [
         "${monitoring-platform}/nix/module.nix"
+        # The on-host forwarding collector. A separate module from the receiver upstream
+        # because the two units are deliberate opposites -- the receiver refuses to start
+        # until the clock is good, the collector must be running BEFORE anything can step it
+        # -- and this host runs both.
+        "${monitoring-platform}/nix/collector-module.nix"
         timeSyncSettings
         ./hosts/rpi5/configuration.nix
       ];
@@ -312,7 +343,12 @@
       # no defined way. Such a node composes this; everything else takes the standard
       # RTC base by composing rpiSystemModule.
       rpiNodeBase = { ... }: {
-        imports = rpi5HostModules ++ [ rpiTestKernel testNodeTimeSyncOff testNodeClockGateOff ];
+        imports = rpi5HostModules ++ [
+          rpiTestKernel
+          testNodeTimeSyncOff
+          testNodeClockGateOff
+          testNodeCollectorHealthOff
+        ];
         _module.args = rpiSystemArgs;
       };
       # The default rpi test node: rpiNodeBase plus the repo's standard RTC base, so
@@ -703,7 +739,12 @@
       # re-supplied as _module.args, same two test-node overrides -- only the kernel
       # differs. Note the top-level `nixpkgs`/`pkgs` here, not nixrpi/pkgsRpi.
       rpi5X86NodeBase = { ... }: {
-        imports = rpi5HostModules ++ [ rpi5X86Kernel testNodeTimeSyncOff testNodeClockGateOff ];
+        imports = rpi5HostModules ++ [
+          rpi5X86Kernel
+          testNodeTimeSyncOff
+          testNodeClockGateOff
+          testNodeCollectorHealthOff
+        ];
         # rpiSystemArgs verbatim: nixpkgs-stable is already the top-level `nixpkgs`, and
         # hosts/rpi5 derives its `system` from pkgs.stdenv.hostPlatform, so the nix-utils
         # env it builds follows the platform with no argument change.

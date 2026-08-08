@@ -521,8 +521,14 @@ in
     # services.timesyncd.enable, which enabling chrony forces to false -- so the gate would
     # silently switch itself off exactly on the host that needs it, and the RTC-less Pi would
     # go back to writing 1970-dated rows into a store with no retention.
+    #
+    # ...unless the producer posts through the collector, which is the case that made the
+    # 1970-row argument obsolete: it holds pre-sync batches and rewrites their timestamps once
+    # the offset is known, so the gate would now be discarding recoverable samples rather than
+    # protecting the store. Conditioned on the producer's own derived `viaCollector` rather than
+    # re-deriving it here, so the two cannot disagree about which path this host is on.
     common.systemMetrics = lib.mkIf config.common.systemMetrics.enable {
-      requireClockSync = lib.mkDefault true;
+      requireClockSync = lib.mkDefault (!config.common.systemMetrics.viaCollector);
       syncedMarker = lib.mkDefault cfg.syncedMarker;
     };
   };
