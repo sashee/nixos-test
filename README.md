@@ -349,8 +349,10 @@ It is opt-in (`common.timeSync.enable`) and enabled on every host that gets the
 common desktop layer as well as on the Pi — `timeSyncSettings` in `flake.nix` is
 composed into all three module lists, which is also where `floor` comes from
 (`nixpkgs.lastModified` is only in scope there). Two VM checks cover it, each on
-three configurations — the generic x86 desktop, the aarch64 Pi, and the laptop as
-`anya-feher-laptop-time-correction` / `anya-feher-laptop-nts-sync`.
+four configurations — the generic x86 desktop, the aarch64 Pi, the laptop as
+`anya-feher-laptop-time-correction` / `anya-feher-laptop-nts-sync`, and the Pi's own
+config on the stock x86 kernel as `rpi5-x86-time-correction` / `rpi5-x86-nts-sync`
+(see "The rpi5 config on x86" below for what that last one does and does not prove).
 `time-correction` exercises the binary's quorum, floor,
 deferred certificate checks and stand-down rule, and the unit's timer, against
 controlled DoH resolvers and NTS servers; `nts-sync` reproduces the deadlock end to
@@ -754,7 +756,39 @@ If QEMU complains about KVM permissions, either add your host user to the `kvm` 
 QEMU_OPTS="-accel tcg" ./result/bin/run-nixos-qemu-vm
 ```
 
+## The rpi5 config on x86
+
+Most of what the rpi checks assert is arch-independent configuration — the DoH
+egress rules, the default-deny firewall, the connectivity-fallback trigger logic,
+the `--delete-old` GC policy, the reboot-on-change decision, the time chain. So the
+same `rpi5HostModules` the deployed Pi composes is also built as an x86 check set,
+`lib.checkSets.rpi5-x86`, and runs under KVM in minutes:
+
+```bash
+make run-rpi-x86-tests
+```
+
+That is possible because `rpi5HostModules` is deliberately hardware-free: the
+`nixos-raspberrypi` modules (`sd-image`, `raspberry-pi-5.base`) are added only by
+`mkRpi5`. Exactly three things are neutralized for x86 (`rpi5X86Kernel` in
+`flake.nix`): the `headless-trim` kernel patch is dropped so the node lands on the
+cached stock kernel, `common.requiredKernelModules` is switched off because its list
+is the Pi's hardware, and `rtc_cmos` is added to the initrd — the direct analogue of
+the aarch64 nodes' `rtc-pl031`, without which the clock jumps in stage-2 and wakes
+Persistent timers mid-test (`rpi5-x86-boot-clock` is the guard).
+
+**A green run here is not a substitute for `make run-rpi-tests`.** It is not the Pi's
+kernel (BTF is on here and off there, and the module set is a different one), not
+aarch64, and not even the same nixpkgs — the aarch64 checks evaluate against
+`nixos-raspberrypi.inputs.nixpkgs`, these against this flake's own, so package
+versions and the systemd under test differ in both directions. Kernel-dependent
+behaviour is aarch64-only by construction, which is why the `nix-utils` sandbox
+cases, `required-kernel-modules` and the icount timing check stay out of this set.
+
 ## Running the rpi tests locally
+
+For an arch-independent change, try `make run-rpi-x86-tests` above first — it needs
+none of the setup below. The rest of this section is for the run that decides.
 
 The aarch64 checks boot the exact patched rpi kernel, which is in no binary
 cache — built from scratch it takes hours under emulation. CI builds it on the
@@ -806,6 +840,7 @@ The per-host and rpi suites work the same way:
 
 ```bash
 make run-host-tests HOST=anya-feher-laptop
+make run-rpi-x86-tests
 make run-rpi-tests
 ```
 

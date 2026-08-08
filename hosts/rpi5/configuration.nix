@@ -184,7 +184,9 @@ in
   programs.ssh.systemd-ssh-proxy.enable = false;
   services.openssh.settings.PasswordAuthentication = false;
   security.sudo.wheelNeedsPassword = false;
-  system.stateVersion = lib.mkDefault "24.11";
+  # The literal lives in a file so flake.nix can read it without evaluating a system;
+  # see hosts/rpi5/state-version.nix. This is still the only definition.
+  system.stateVersion = lib.mkDefault (import ./state-version.nix);
   # Real system tools for root/services (flakes, auto-upgrade). The sandboxed
   # nix-utils tools live on the nixos user PATH only (see users.users.nixos).
   environment.systemPackages = [ pkgs.git ];

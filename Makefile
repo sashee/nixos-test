@@ -18,7 +18,7 @@ MAX_JOBS := auto
 # again.
 ATTEMPTS := 1
 
-.PHONY: host-vm update-flake run-tests run-rpi-tests run-host-tests run-checks export-rpi-kernel import-rpi-kernel
+.PHONY: host-vm update-flake run-tests run-rpi-tests run-rpi-x86-tests run-host-tests run-checks export-rpi-kernel import-rpi-kernel
 
 # QEMU runner for a laptop host config; run it with ./result/bin/run-<host>-vm
 host-vm:
@@ -33,6 +33,13 @@ run-tests:
 
 run-rpi-tests:
 	$(MAKE) run-checks SYSTEM=aarch64-linux ATTEMPTS=2
+
+# The rpi5 host config on x86 (lib.checkSets.rpi5-x86): the same feature tests as
+# run-rpi-tests, on the real config but the stock x86 kernel, so they run under KVM
+# in minutes instead of under aarch64 TCG. Not a substitute for run-rpi-tests - see
+# the header on rpi5X86Checks in flake.nix for what it cannot catch.
+run-rpi-x86-tests:
+	$(MAKE) run-checks SYSTEM=x86_64-linux SET=rpi5-x86
 
 # Per-host check set (lib.checkSets.<host>), run by the host's own CI job.
 run-host-tests:
