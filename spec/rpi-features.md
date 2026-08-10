@@ -45,6 +45,10 @@
 * [](./features/monitoring.md)
 * runs every 30 minutes
 
+### Monitoring-platform monitoring
+
+* [system metrics](./features/monitoring/system-metrics.md)
+
 ## Auto-reboot
 
 * every hour it tries to resolve a DNS address
