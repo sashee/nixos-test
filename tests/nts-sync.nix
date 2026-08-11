@@ -381,6 +381,26 @@ nixpkgs.lib.nixos.runTest {
             machine.succeed(f"${pkgs.iproute2}/bin/ip route replace {ip}/32 via {via} dev eth1")
         for ip in doh_ipv6:
             machine.succeed(f"${pkgs.iproute2}/bin/ip -6 route replace unreachable {ip}/128")
+        # Then restart the resolver, for the same family of reasons set_clock does: dnscrypt-proxy
+        # decides which upstreams are usable by probing them, and on this host it always probes
+        # before these routes can exist. It is listening on 127.0.0.1:53 within seconds of boot,
+        # while the driver cannot install a route until the backdoor shell is up -- so its first
+        # probe necessarily fails, and everything after that depends on its retry schedule rather
+        # than on the network being fixed. `cert_refresh_delay` is four-hourly (modules/doh.nix),
+        # i.e. far outside this test.
+        #
+        # This is a race that was always here and that the routes-then-wait ordering hid: nothing
+        # made the resolver re-evaluate reachability at the moment reachability changed. The
+        # post-reboot leg of "cookies survive a reboot" is where it surfaced, on 2026-08-11 --
+        # `dig` on the loopback timing out and `chronyc sources` empty for ten minutes, with the
+        # interceptor logging not one connection after the initial probe, so the resolver was
+        # neither forwarding nor re-probing. Which of the two it was is not in the log at
+        # `log_level = 1`; a fresh process cannot be in either state, which is what this buys.
+        #
+        # Not in the deployed configuration, and not something it needs: nothing there moves the
+        # route to a pinned DoH address out from under a running resolver. Here the driver does it
+        # on every boot.
+        machine.succeed("systemctl restart dnscrypt-proxy.service")
 
     def wait_dns(timeout=120):
         # DNS is a PRECONDITION of every chrony wait in this file, not a part of it: chronyd
@@ -499,6 +519,20 @@ nixpkgs.lib.nixos.runTest {
             machine.log("CONF:\n" + machine.succeed("systemctl cat chronyd.service | grep -o '/nix/store/[^ ]*chrony.conf' | head -1 | xargs cat || true"))
             ntsgood.log("SERVERJOURNAL:\n" + ntsgood.succeed("journalctl -u chronyd -o cat --no-pager | tail -40 || true"))
             ntsgood.log("SERVERPORTS:\n" + ntsgood.succeed("${pkgs.iproute2}/bin/ss -lntu | head -20 || true"))
+            # The two halves of the DoH leg, which the dumps above can only report second-hand.
+            # A silent resolver is ambiguous from this side -- not forwarding and forwarding to
+            # something that never answers look identical -- and the 2026-08-11 failure turned on
+            # exactly that distinction. The interceptor's journal settles it: it logs every
+            # connection it accepts, so an empty tail across the whole wait means nothing was sent.
+            # The routes are the other candidate, since they are runtime state that a reboot or a
+            # renewed lease can take away without anything here noticing.
+            machine.log("ROUTES:\n" + machine.succeed(
+                "${pkgs.iproute2}/bin/ip route show || true; "
+                "${pkgs.iproute2}/bin/ip -6 route show || true"
+            ))
+            dohpeer.log("INTERCEPTOR:\n" + dohpeer.succeed(
+                "journalctl -u fake-doh -o cat --no-pager | tail -40 || true"
+            ))
             raise
 
     with subtest("nothing has synchronised yet"):
