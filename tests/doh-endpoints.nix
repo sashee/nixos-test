@@ -12,7 +12,11 @@
 #     that reads the suffix instead of the field -- and the sorted `server_names` order
 #     dnscrypt-proxy is handed -- describe the wrong address family (see suffixDrift);
 #   * a key set that diverges from `stamps` means an endpoint reaching dnscrypt-proxy while
-#     being absent from the interceptor test's impersonation list.
+#     being absent from the interceptor test's impersonation list;
+#   * a provider list in which every hostname is stamped in both families leaves each
+#     hostname's dialled address to a race (lib/doh-stamps.nix header), and a
+#     single-family network then has no upstream it can rely on -- see guaranteeDrift,
+#     which is the only thing in the repo that would notice.
 #
 # Fails with `throw` during evaluation rather than at build time, and reads a source file
 # rather than a derivation, so this stays usable from a pure `nix flake check`.
@@ -75,8 +79,91 @@ let
     builtins.length names < 4
   ) "only ${toString (builtins.length names)} endpoints: the point of the list is that no single operator's outage leaves this host without DNS";
 
-  errors = nameDrift ++ familyDrift ++ suffixDrift ++ countDrift;
+  # --- the per-family guarantee ------------------------------------------------------
+  #
+  # dnscrypt-proxy keeps ONE pinned address per DoH hostname (see the header of
+  # lib/doh-stamps.nix), so two stamps sharing a hostname decide by race which address
+  # both of them dial. An endpoint is therefore only DEPENDABLY on its own family if no
+  # other stamp claims its hostname -- and what the shape of the provider list buys is
+  # that enough such endpoints exist in each family.
+  #
+  # Deliberately NOT "every hostname is unique": cloudflare/mullvad/quad9/google are
+  # stamped in both families on purpose, as upside for the day upstream implements
+  # DNSCrypt/dnscrypt-proxy#2913. Asserting uniqueness would forbid that; asserting the
+  # count below permits it while keeping the property the duals cannot provide.
+  #
+  # Two, not one, because the floor has to survive one operator's own outage -- the same
+  # reasoning as countDrift above, applied per family instead of to the total.
+  providers = dohStamps.providers;
+  providerNames = builtins.attrNames providers;
+  families = [
+    "ipv4"
+    "ipv6"
+  ];
+
+  # Every family every provider stamps for a hostname, so a hostname claimed twice is
+  # visible here even if the two claims come from different providers.
+  familiesByHost = lib.foldl' (
+    acc: p:
+    acc
+    // {
+      ${p.hostname} = (acc.${p.hostname} or [ ]) ++ p.stampFamilies;
+    }
+  ) { } (lib.attrValues providers);
+
+  soleFor =
+    family:
+    lib.filter (
+      n:
+      let
+        p = providers.${n};
+      in
+      lib.elem family p.stampFamilies && familiesByHost.${p.hostname} == [ family ]
+    ) providerNames;
+
+  guaranteeDrift = lib.concatMap (
+    family:
+    let
+      sole = soleFor family;
+    in
+    lib.optional (builtins.length sole < 2) ''
+      only ${toString (builtins.length sole)} ${family} endpoint(s) whose hostname is stamped in ${family} alone (${toString sole}): every other ${family} entry shares its hostname with the other family, so which address it dials is decided by a race inside dnscrypt-proxy and a ${family}-only network can end up with no usable upstream at all -- at which point the resolver answers nothing and logs nothing (lib/doh-stamps.nix header). Give at least two providers stampFamilies = [ "${family}" ]''
+  ) families;
+
+  # Guards on `stampFamilies` itself, kept apart from everything above because they are
+  # what stops lib/doh-stamps.nix from throwing `attribute 'v6' missing` from inside
+  # entriesFor -- a message that names neither the file nor the provider at fault. They
+  # therefore have to be reported BEFORE anything that forces `endpoints`.
+  stampDrift = lib.concatMap (
+    n:
+    let
+      p = providers.${n};
+      unknown = lib.subtractLists families (p.stampFamilies or [ ]);
+    in
+    lib.optional (!(p ? stampFamilies))
+      "${n}: no stampFamilies; it decides which families reach dnscrypt-proxy and has no safe default (both families is what collides)"
+    ++ lib.optionals (p ? stampFamilies) (
+      lib.optional (p.stampFamilies == [ ]) "${n}: stampFamilies is empty, so this provider reaches dnscrypt-proxy not at all"
+      ++ lib.optional (unknown != [ ]) "${n}: unknown stampFamilies ${toString unknown}; known families are ${toString families}"
+      ++ lib.optional (lib.elem "ipv4" p.stampFamilies && !(p ? v4)) "${n}: stamped ipv4 without a v4 address"
+      ++ lib.optional (lib.elem "ipv6" p.stampFamilies && !(p ? v6)) "${n}: stamped ipv6 without a v6 address"
+    )
+  ) providerNames;
+
+  errors = nameDrift ++ familyDrift ++ suffixDrift ++ countDrift ++ guaranteeDrift;
 in
+if stampDrift != [ ] then
+  throw ''
+    lib/doh-stamps.nix providers have a malformed stampFamilies.
+
+    ${lib.concatStringsSep "\n  " stampDrift}
+
+    stampFamilies selects which of a provider's addresses become dnscrypt-proxy stamps.
+    Reported on its own, ahead of the endpoint checks below, because entriesFor reads the
+    address a family names and would otherwise fail first with an unattributed
+    `attribute ... missing`.
+  ''
+else
 if errors != [ ] then
   throw ''
     lib/doh-stamps.nix endpoints are malformed.
@@ -91,4 +178,7 @@ if errors != [ ] then
 else
   pkgs.runCommand "doh-endpoints-check" { } ''
     echo "${toString (builtins.length names)} DoH endpoints verified" > $out
+    ${lib.concatMapStringsSep "\n" (
+      family: "echo '${family}: ${toString (builtins.length (soleFor family))} endpoint(s) on an unshared hostname' >> $out"
+    ) families}
   ''

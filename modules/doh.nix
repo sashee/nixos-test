@@ -16,6 +16,15 @@ in
       # would have named it live: xtransport.go's "Unable to resolve [%s] using resolver ..."
       # and query_processing.go's SERVFAIL notice.
       #
+      # That outage now has a cause: the one-pinned-address-per-hostname collision described
+      # in lib/doh-stamps.nix, which can leave the pool with zero usable servers -- and a
+      # dnscrypt-proxy with no usable server returns an empty response, so the listeners
+      # reply with nothing at all rather than SERVFAIL. Four hours is one cert_refresh_delay,
+      # i.e. exactly how long it took the next refresh to re-roll the race. Info stays: it is
+      # what made the reproduction in CI readable ("[quad9-ipv4] ... dial tcp
+      # [2620:fe::10]:443: connect: no route to host" is an Info line), and it is still the
+      # only level at which a wedged resolver says anything.
+      #
       # Info is close to free on this host: the per-query call sites are all Debug (0), and
       # the Info sites that could be chatty belong to features that are off here --
       # plugin_forward (no forwarding rules), dnscrypt_certs (dnscrypt_servers = false),
@@ -30,6 +39,14 @@ in
         "[::1]:53"
       ];
       server_names = builtins.attrNames doh.stamps;
+      # Both of these are NO-OPS for this configuration, and are kept only because their
+      # absence reads as an omission. They are SourceIPv4/SourceIPv6 internally and filter
+      # resolvers parsed from remote source lists; loadSources appends [static] entries
+      # unconditionally, and with upstreamDefaults = false there are no sources. So the
+      # address family a stamp is used on is decided entirely by `static` below -- which is
+      # why lib/doh-stamps.nix has to carry the per-family guarantee itself, and why the
+      # maintainer's suggested workaround for DNSCrypt/dnscrypt-proxy#2913 ("use
+      # ipv6_servers") does not apply here.
       ipv4_servers = true;
       ipv6_servers = true;
       dnscrypt_servers = false;
@@ -41,6 +58,13 @@ in
       # Stamps are generated from the readable components in lib/doh-stamps.nix; the
       # props bits they carry are load-bearing here, since require_nofilter below
       # filters the pool on them.
+      #
+      # Also read that file's header before adding, dropping or re-pinning an entry: two
+      # stamps sharing a hostname race for ONE cached address inside dnscrypt-proxy, so a
+      # "-ipv4" entry here is not a promise that v4 is what gets dialled. What keeps a
+      # single-family network working is the handful of providers stamped in one family
+      # only, and tests/doh-endpoints.nix fails the build if fewer than two of those remain
+      # per family.
       static = doh.stamps;
       # Answer OS/browser connectivity-check names from a static map so captive
       # portals can be detected and their login pages reached even while the DoH

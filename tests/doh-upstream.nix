@@ -1,3 +1,20 @@
+# Single-family DoH: with only one address family reachable, the client must still resolve
+# through an upstream pinned to that family.
+#
+# This is the test that caught the collision documented in lib/doh-stamps.nix, on
+# 2026-08-11 (CI leg rpi5-x86-doh-upstream). What the failure looked like, because it is
+# worth recognising again: dnscrypt-proxy active and listening, `live servers: 1`, sixty
+# `dig` attempts all timing out over 360s, `+tcp` getting an immediate EOF, the interceptor
+# logging not one upstream request for the entire window -- and in the journal three
+# "-ipv4" servers dialling v6 literals:
+#
+#   [quad9-ipv4] ... dial tcp [2620:fe::10]:443: connect: no route to host
+#
+# The legs below are deterministic only because lib/doh-stamps.nix now stamps some
+# providers in one family alone; the dual-stamped ones may dial either family here. So
+# nothing in this file may assert that a particular server NAME used a particular family --
+# upstream does not offer that. What is asserted is the family of the request that actually
+# arrived (check_request), which is the property the deployed host depends on.
 { nixpkgs, pkgs, commonDesktopModule, stateVersion, dohStamps }:
 
 let
