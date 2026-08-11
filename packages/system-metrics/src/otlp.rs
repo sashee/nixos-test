@@ -18,12 +18,16 @@ use crate::collect::{Record, Value};
 pub const SCOPE_NAME: &str = "system-metrics";
 pub const SCOPE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// `Value::Null` becomes an `AnyValue` with no variant set, which is OTLP's own spelling of an
+/// empty value -- the key stays in the kvlist, so a measurement type keeps one stable key set
+/// whether or not this host could read the field.
 fn any_value(value: &Value) -> AnyValue {
     let inner = match value {
         Value::Str(s) => any_value::Value::StringValue(s.clone()),
         Value::Int(i) => any_value::Value::IntValue(*i),
         Value::Double(d) => any_value::Value::DoubleValue(*d),
         Value::Bool(b) => any_value::Value::BoolValue(*b),
+        Value::Null => return AnyValue { value: None },
     };
     AnyValue { value: Some(inner) }
 }

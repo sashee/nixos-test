@@ -11,17 +11,32 @@ use std::path::Path;
 /// A value as it goes into a measurement body or attribute set. Mirrors the subset of OTLP's
 /// `AnyValue` this producer emits (see `otlp.rs`); anything richer would not survive the
 /// receiver's flat attribute model anyway.
+///
+/// `Null` is the "could not be collected" case. Every field in a record is emitted on every run,
+/// so a measurement type has one stable key set and a consumer never has to distinguish "the key
+/// is gone" from "the schema changed"; see the `From<Option<Value>>` impl below, which is how
+/// every fallible read reaches this enum.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Str(String),
     Int(i64),
     Double(f64),
     Bool(bool),
+    Null,
 }
 
 impl Value {
     pub fn str(s: impl Into<String>) -> Self {
         Value::Str(s.into())
+    }
+}
+
+/// The single conversion every fallible collector goes through: `None` becomes `Null` rather than
+/// dropping the key. Written as a `From` so call sites read `.with_field("current", maybe_value)`
+/// and no caller has to remember the convention.
+impl From<Option<Value>> for Value {
+    fn from(value: Option<Value>) -> Self {
+        value.unwrap_or(Value::Null)
     }
 }
 
@@ -39,24 +54,14 @@ impl Record {
         Record { event_name: event_name.to_owned(), attributes: Vec::new(), body: Vec::new() }
     }
 
-    pub fn with_attr(mut self, key: &str, value: Value) -> Self {
-        self.attributes.push((key.to_owned(), value));
+    pub fn with_attr(mut self, key: &str, value: impl Into<Value>) -> Self {
+        self.attributes.push((key.to_owned(), value.into()));
         self
     }
 
-    pub fn with_field(mut self, key: &str, value: Value) -> Self {
-        self.body.push((key.to_owned(), value));
+    pub fn with_field(mut self, key: &str, value: impl Into<Value>) -> Self {
+        self.body.push((key.to_owned(), value.into()));
         self
-    }
-
-    /// Same as `with_field`, but a `None` omits the key entirely rather than writing a null.
-    /// Used where the underlying fact may not exist on this host at all (e.g. no system
-    /// profile in a freshly booted VM): an absent key is unambiguous, a null is not.
-    pub fn with_optional_field(self, key: &str, value: Option<Value>) -> Self {
-        match value {
-            Some(v) => self.with_field(key, v),
-            None => self,
-        }
     }
 }
 
@@ -102,7 +107,8 @@ pub fn parse_cpu_times(proc_stat: &str) -> Option<CpuTimes> {
 }
 
 /// Busy share between two samples. `None` when the counters did not advance (a sample interval
-/// too short to have crossed a tick), which is honestly "unknown" rather than 0%.
+/// too short to have crossed a tick) or ran backwards (a CPU going offline can drop its
+/// accumulated time from the aggregate line). Both are "unknown", not 0%.
 pub fn utilization_percent(first: &CpuTimes, second: &CpuTimes) -> Option<f64> {
     let total = second.total.checked_sub(first.total)?;
     let idle = second.idle.checked_sub(first.idle)?;
@@ -149,9 +155,28 @@ pub fn parse_meminfo(text: &str) -> Option<Memory> {
         // MemAvailable, not MemTotal - MemFree: reclaimable page cache is available to
         // applications, and counting it as used makes every healthy host look full.
         available: field("MemAvailable")?,
+        // A kernel built without CONFIG_SWAP has no such lines at all, and 0 is the honest
+        // reading of "there is no swap" either way.
         swap_total: field("SwapTotal").unwrap_or(0),
         swap_free: field("SwapFree").unwrap_or(0),
     })
+}
+
+/// Third field of a zram device's `mm_stat`: RAM actually consumed, including zsmalloc metadata
+/// and fragmentation.
+///
+/// `SwapTotal`/`SwapFree` describe the *uncompressed* logical swap and say nothing about what it
+/// costs; this is the only file that does. The per-attribute `mem_used_total` file was removed
+/// from modern kernels, so `mm_stat` is the source.
+pub fn parse_zram_mem_used_total(mm_stat: &str) -> Option<u64> {
+    mm_stat.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// A named `/proc/vmstat` counter. Cumulative since boot, so a consumer reads it as a delta
+/// between two rows rather than as a level.
+pub fn parse_vmstat_counter(text: &str, name: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.trim().parse().ok())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -244,18 +269,6 @@ pub fn usage(path: &Path) -> std::io::Result<Usage> {
     })
 }
 
-/// `df`'s denominator, not `total`: the blocks reserved for root are counted as neither used
-/// nor available, so `used / total` reads a few percent lower than what every other tool on the
-/// host prints. The disk-space health check in `modules/monitoring.nix` alerts on `df`'s number,
-/// and one filesystem with two disagreeing percentages would be worse than either.
-pub fn used_percent(used: u64, available: u64) -> Option<f64> {
-    let denominator = used + available;
-    if denominator == 0 {
-        return None;
-    }
-    Some((used as f64 / denominator as f64) * 100.0)
-}
-
 // ---------------------------------------------------------------------------------------------
 // NixOS generation
 
@@ -271,6 +284,38 @@ pub fn parse_generation(link_target: &str) -> Option<u64> {
 /// First field of `/proc/uptime`, in seconds.
 pub fn parse_uptime_seconds(text: &str) -> Option<f64> {
     text.split_whitespace().next()?.parse().ok()
+}
+
+/// What a `flake.lock` records about one input.
+///
+/// Every field is independently optional because the lock format makes them so: a `path:` input
+/// has no `rev` at all, and `original.ref` exists only when the flake reference pins a branch --
+/// which the deployed stubs do not, so `ref` is absent on the hosts this runs on.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LockedInput {
+    pub rev: Option<String>,
+    pub last_modified: Option<i64>,
+    pub reference: Option<String>,
+}
+
+/// Reads one input's locked revision out of a `flake.lock`.
+///
+/// Reports what the lock file says, which is not necessarily what the running system was built
+/// from: a `nixos-rebuild --override-input common ...` leaves the lock untouched. That is the
+/// same property the Healthchecks report has had all along.
+pub fn parse_flake_lock(text: &str, input: &str) -> Option<LockedInput> {
+    let root: serde_json::Value = serde_json::from_str(text).ok()?;
+    let node = root.get("nodes")?.get(input)?;
+    let locked = node.get("locked");
+    Some(LockedInput {
+        rev: locked.and_then(|l| l.get("rev")).and_then(|v| v.as_str()).map(str::to_owned),
+        last_modified: locked.and_then(|l| l.get("lastModified")).and_then(|v| v.as_i64()),
+        reference: node
+            .get("original")
+            .and_then(|o| o.get("ref"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+    })
 }
 
 #[cfg(test)]
@@ -317,6 +362,15 @@ ctxt 67890
         assert_eq!(utilization_percent(&same, &same), None);
     }
 
+    /// Offlining a CPU can drop its accumulated time from the aggregate line, so the second
+    /// sample reads lower than the first. That is unknown, not a negative utilisation.
+    #[test]
+    fn utilization_is_unknown_when_the_counters_run_backwards() {
+        let first = CpuTimes { total: 1200, idle: 1050 };
+        let second = CpuTimes { total: 1000, idle: 900 };
+        assert_eq!(utilization_percent(&first, &second), None);
+    }
+
     #[test]
     fn meminfo_converts_kb_to_bytes_and_prefers_available() {
         let parsed = parse_meminfo(
@@ -333,6 +387,7 @@ SwapFree:        8388604 kB
         assert_eq!(parsed.total, 16311428 * 1024);
         assert_eq!(parsed.available, 12006884 * 1024);
         assert_eq!(parsed.swap_total, 8388604 * 1024);
+        assert_eq!(parsed.swap_free, 8388604 * 1024);
         assert_ne!(parsed.available, parsed.total - parsed.free);
     }
 
@@ -342,6 +397,29 @@ SwapFree:        8388604 kB
             .unwrap();
         assert_eq!(parsed.swap_total, 0);
         assert_eq!(parsed.swap_free, 0);
+    }
+
+    /// Fields are orig_data_size, compr_data_size, mem_used_total, mem_limit, mem_used_max, ...
+    /// -- the third is the one that answers "what does this swap cost in RAM".
+    #[test]
+    fn zram_takes_mem_used_total_not_the_compressed_size() {
+        let stat = "    4096       64    20480        0    20480        0        0        0     0\n";
+        assert_eq!(parse_zram_mem_used_total(stat), Some(20480));
+    }
+
+    #[test]
+    fn zram_mm_stat_that_is_truncated_is_unknown() {
+        assert_eq!(parse_zram_mem_used_total("4096 64\n"), None);
+    }
+
+    #[test]
+    fn vmstat_counter_matches_the_whole_name() {
+        let text = "nr_free_pages 1000\noom_kill 7\npgmajfault 29553\n";
+        assert_eq!(parse_vmstat_counter(text, "oom_kill"), Some(7));
+        assert_eq!(parse_vmstat_counter(text, "pgmajfault"), Some(29553));
+        // A prefix of another counter's name must not match it.
+        assert_eq!(parse_vmstat_counter(text, "oom"), None);
+        assert_eq!(parse_vmstat_counter(text, "nr_free"), None);
     }
 
     fn excludes() -> Vec<String> {
@@ -386,19 +464,6 @@ nixstore /nix/store 9p ro,trans=virtio 0 0
     }
 
     #[test]
-    fn used_percent_is_none_for_a_zero_sized_filesystem() {
-        assert_eq!(used_percent(0, 0), None);
-    }
-
-    /// 1000 total, 250 free of which 50 are root-reserved: `df` calls that 80% full
-    /// (750 / (750 + 200)), not 75% (750 / 1000).
-    #[test]
-    fn used_percent_matches_df_by_ignoring_root_reserved_blocks() {
-        assert_eq!(used_percent(750, 200), Some(78.94736842105263));
-        assert_eq!(used_percent(750, 250), Some(75.0));
-    }
-
-    #[test]
     fn generation_number_comes_from_the_profile_link_target() {
         assert_eq!(parse_generation("/nix/var/nix/profiles/system-42-link"), Some(42));
         assert_eq!(parse_generation("system-1-link"), Some(1));
@@ -411,8 +476,48 @@ nixstore /nix/store 9p ro,trans=virtio 0 0
     }
 
     #[test]
-    fn optional_field_omits_rather_than_nulls() {
-        let record = Record::new("system.generation").with_optional_field("current", None);
-        assert!(record.body.is_empty());
+    fn a_missing_value_becomes_null_rather_than_dropping_the_key() {
+        let record = Record::new("system.generation").with_field("current", None);
+        assert_eq!(record.body, vec![("current".to_owned(), Value::Null)]);
+    }
+
+    const FLAKE_LOCK: &str = r#"{
+      "nodes": {
+        "common": {
+          "locked": {
+            "lastModified": 1786191634,
+            "narHash": "sha256-uTC0M/3fcDjZwmS45mp+nvrR4ynziXEAealsLZKqz+U=",
+            "owner": "sashee", "repo": "nixos-test", "type": "github",
+            "rev": "8b3741955a446de07c0a9ae74c0a9c72421b6242"
+          },
+          "original": { "owner": "sashee", "repo": "nixos-test", "type": "github" }
+        }
+      },
+      "root": "root", "version": 7
+    }"#;
+
+    /// The shape the deployed stubs actually produce: a rev and a lastModified, but no `ref`,
+    /// because they name the input as `github:sashee/nixos-test` with no branch.
+    #[test]
+    fn flake_lock_reads_the_named_input_and_tolerates_a_missing_ref() {
+        let locked = parse_flake_lock(FLAKE_LOCK, "common").unwrap();
+        assert_eq!(locked.rev.as_deref(), Some("8b3741955a446de07c0a9ae74c0a9c72421b6242"));
+        assert_eq!(locked.last_modified, Some(1786191634));
+        assert_eq!(locked.reference, None);
+    }
+
+    #[test]
+    fn flake_lock_reports_the_branch_when_the_input_pins_one() {
+        let text = FLAKE_LOCK.replace(
+            r#""original": { "owner": "sashee", "repo": "nixos-test", "type": "github" }"#,
+            r#""original": { "owner": "sashee", "repo": "nixos-test", "type": "github", "ref": "main" }"#,
+        );
+        assert_eq!(parse_flake_lock(&text, "common").unwrap().reference.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn flake_lock_without_the_input_is_unknown_rather_than_empty() {
+        assert_eq!(parse_flake_lock(FLAKE_LOCK, "nixpkgs"), None);
+        assert_eq!(parse_flake_lock("not json", "common"), None);
     }
 }

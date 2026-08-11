@@ -22,16 +22,87 @@
 let
   cfg = config.common.systemMetrics;
 
+  # Units whose state is worth a record, derived from what this host actually enables rather
+  # than listed as constants. A hardcoded list rots in the worst possible way: a name that
+  # matches no unit reports nulls forever and reads exactly like a healthy unit that happens to
+  # be quiet. (The name to get wrong here is the upgrade one -- `nixos-upgrade.service`, not
+  # `auto-upgrade.service`, which does not exist.)
+  defaultUnits =
+    lib.optional config.services.chrony.enable "chronyd.service"
+    ++ lib.optional config.services.dnscrypt-proxy.enable "dnscrypt-proxy.service"
+    ++ lib.optionals config.common.irohSsh.enable [ "iroh-ssh.service" "iroh-ssh-failsafe.service" ]
+    ++ lib.optionals config.common.connectivityFallback.enable [
+      "connectivity-fallback-check.service"
+      "connectivity-fallback-setup.service"
+      "connectivity-fallback-dnsmasq.service"
+      "connectivity-fallback-portal.service"
+    ]
+    ++ lib.optional config.common.connectivityWatchdog.enable "connectivity-watchdog.service"
+    ++ lib.optional config.common.timeSync.enable "time-correction.service"
+    ++ map (name: "restic-backups-${name}.service") (lib.attrNames config.common.restic.backups)
+    ++ lib.optional config.nix.gc.automatic "nix-gc.service"
+    ++ lib.optional config.system.autoUpgrade.enable "nixos-upgrade.service"
+    # Both hops of the measurement path. The receiver earns its place: if it dies the collector
+    # buffers and these records arrive late, so its unit state is recoverable evidence. The
+    # producer does not -- see the `units` option description.
+    ++ lib.optional (config.services ? mp-collector && config.services.mp-collector.enable)
+      "mp-collector.service"
+    ++ lib.optional
+      (config.services ? monitoring-platform && config.services.monitoring-platform.enable)
+      "monitoring-platform.service";
+
+  # Timers where a stopped schedule is invisible until something else goes wrong. Deliberately
+  # not every timer on the host: 11 of them at this cadence would be more rows per year than the
+  # entire rest of the batch, and `logrotate`/`tmpfiles-clean`/`zpool-trim` failing is either
+  # harmless or (for zpool-trim on a host with no pools) meaningless.
+  defaultTimers =
+    lib.optional config.system.autoUpgrade.enable "nixos-upgrade.timer"
+    ++ lib.optional config.nix.gc.automatic "nix-gc.timer"
+    ++ lib.optional config.common.connectivityWatchdog.enable "connectivity-watchdog.timer"
+    ++ lib.optional config.common.timeSync.enable "time-correction.timer"
+    ++ lib.optional config.services.fstrim.enable "fstrim.timer";
+
   excludeArgs = lib.concatMap (t: [ "--exclude-fstype" t ]) cfg.excludeFsTypes;
   resourceArgs =
     lib.concatLists (lib.mapAttrsToList (k: v: [ "--resource-attr" "${k}=${v}" ]) cfg.resourceAttributes);
+  unitArgs = lib.concatMap (u: [ "--unit" u ]) cfg.units;
+  timerArgs = lib.concatMap (t: [ "--timer" t ]) cfg.timers;
 
   collectArgs = [
     "--socket"
     cfg.socketPath
     "--cpu-sample-seconds"
     (toString cfg.cpuSampleSeconds)
-  ] ++ excludeArgs ++ resourceArgs;
+    "--sysfs-root"
+    cfg.sysfsRoot
+    "--hwmon-root"
+    cfg.hwmonRoot
+    "--profiles-dir"
+    cfg.profilesDir
+    "--success-dir"
+    cfg.successDir
+    "--journal-window-seconds"
+    (toString cfg.journalWindowSeconds)
+    "--flake-input"
+    cfg.flakeLock.input
+    # systemd's own tools rather than a PATH lookup: the unit runs with no PATH worth trusting,
+    # and `systemctl` from a different systemd than PID 1 is a class of bug worth designing out.
+    "--systemctl"
+    "${config.systemd.package}/bin/systemctl"
+    "--journalctl"
+    "${config.systemd.package}/bin/journalctl"
+  ]
+  ++ lib.optionals (cfg.flakeLock.path != null) [ "--flake-lock" cfg.flakeLock.path ]
+  ++ lib.optionals cfg.smart.enable [ "--smartctl" (lib.getExe' cfg.smart.package "smartctl") ]
+  ++ lib.optionals cfg.irohFailsafe.enable [
+    "--iroh-failsafe-marker"
+    cfg.irohFailsafe.marker
+    "--failsafe-rule-tag"
+    cfg.irohFailsafe.ruleTag
+    "--nft"
+    (lib.getExe' cfg.tools.nftables "nft")
+  ]
+  ++ excludeArgs ++ resourceArgs ++ unitArgs ++ timerArgs;
 
   # The same invocation the timer runs, on the operator's PATH. `system-metrics --dry-run`
   # prints the batch the next run would send without sending it, which on a headless box
@@ -189,6 +260,173 @@ in
       '';
     };
 
+    sysfsRoot = lib.mkOption {
+      type = lib.types.path;
+      default = "/sys";
+      description = "Root of sysfs, under which the zram devices are found.";
+    };
+
+    hwmonRoot = lib.mkOption {
+      type = lib.types.path;
+      default = "${cfg.sysfsRoot}/class/hwmon";
+      defaultText = lib.literalExpression ''"''${config.common.systemMetrics.sysfsRoot}/class/hwmon"'';
+      description = ''
+        Directory of hwmon chips to sweep for `system.sensor`.
+
+        Separate from [](#opt-common.systemMetrics.sysfsRoot) so a VM test can point it at a
+        fixture tree without also redirecting the zram sweep, which has real devices to read in
+        a guest. A QEMU guest has essentially no hwmon at all, so without a fixture
+        `system.sensor` is a record no test could assert anything about -- and the sweep's real
+        subject is exactly the shapes a guest lacks: chips without a `_label`, two chips sharing
+        a `name`, and the `_alarm` spellings.
+      '';
+    };
+
+    profilesDir = lib.mkOption {
+      type = lib.types.path;
+      default = "/nix/var/nix/profiles";
+      description = "Directory whose `system-*-link` entries are counted as `generation.count`.";
+    };
+
+    successDir = lib.mkOption {
+      type = lib.types.path;
+      default = "/var/lib/common-monitoring";
+      description = ''
+        Directory of `<unit>.last-success` markers, reported as
+        `system.unit.last_success_seconds_ago`.
+
+        Written by `modules/monitoring.nix` from the monitored unit's own `OnSuccess=`, which is
+        what makes it different from `active_enter_seconds_ago`: a run that failed never touches
+        the marker, while a failing unit keeps refreshing its activation timestamp. "Last
+        succeeded" is therefore not derivable from unit state, and is the one field the health
+        report has that nothing else does.
+      '';
+    };
+
+    flakeLock = {
+      path = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = "/etc/nixos/flake.lock";
+        description = ''
+          Deployed `flake.lock`, read for the `common_*` fields of `system.host`. Null leaves
+          them null, which is what a VM test that has no `/etc/nixos` gets.
+
+          Reports what the lock says, not what the running system was built from: a
+          `--override-input common ...` build leaves the lock untouched. Same property the
+          Healthchecks report has always had.
+        '';
+      };
+
+      input = lib.mkOption {
+        type = lib.types.str;
+        default = "common";
+        description = ''
+          `flake.lock` node whose locked revision is reported. Matches
+          [](#opt-common.monitoring.flakeLock.input) so the two never disagree about which input
+          "common" means.
+        '';
+      };
+    };
+
+    units = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = defaultUnits;
+      defaultText = lib.literalMD "the units of whichever `common.*` features this host enables";
+      description = ''
+        Units reported as `system.unit`. Units that are failing or restart-looping are always
+        reported whether they are listed here or not, so this list is about units whose *health*
+        matters even while they look fine.
+
+        Derived from the host's own configuration rather than hardcoded: a name that matches no
+        unit produces a record of nulls, which is indistinguishable from a healthy unit that
+        happens to be idle.
+
+        `system-metrics.service` is deliberately absent. A `Type=oneshot` unit is `activating`
+        until its ExecStart exits, so the producer observing itself would report `activating` on
+        every single run -- and its real failure mode, not running at all, is already visible as
+        a gap in the timestamps.
+      '';
+    };
+
+    timers = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = defaultTimers;
+      defaultText = lib.literalMD "the timers of whichever `common.*` features this host enables";
+      description = ''
+        Timers reported as `system.timer`, carrying only `next_elapse_seconds_until` -- "is this
+        still scheduled". When it last ran is already `active_enter_seconds_ago` on the service
+        the timer triggers, so recording it here too would be one fact in two places.
+      '';
+    };
+
+    journalWindowSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 900;
+      description = ''
+        How far back the `system.journal` counts reach. Should match the collection interval:
+        the producer holds no state, so there is no journal cursor to resume from and the window
+        is simply `now - this`. A message landing on the boundary may be counted twice or missed,
+        which is tolerable for a count in a way it would never be for log text.
+      '';
+    };
+
+    smart = {
+      enable = lib.mkEnableOption ''
+        reporting SMART health as `system.drive`.
+
+        Off by default because it is the one collector that cannot run inside this unit's
+        sandbox as it stands: smartctl needs raw access to the block device, so enabling this
+        drops `PrivateDevices`, grants `CAP_SYS_RAWIO` and allows block devices through
+        `DeviceAllow`. Worth it on a laptop with an NVMe whose wear level is the only warning
+        you get; pointless on the Pi, whose SD card exposes no SMART at all
+      '';
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.smartmontools;
+        defaultText = lib.literalExpression "pkgs.smartmontools";
+        description = "Package providing `smartctl`.";
+      };
+    };
+
+    irohFailsafe = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = config.common.irohSsh.enable or false;
+        defaultText = lib.literalExpression "config.common.irohSsh.enable";
+        description = ''
+          Report `system.iroh_failsafe`: whether the failsafe has opened port 22, and when it
+          last engaged.
+
+          "Port 22 open" is the presence of the failsafe's tagged rule in the firewall -- there
+          is no static 22-accept, so that tag is the only thing that ever opens it. Reading the
+          rule set needs `CAP_NET_ADMIN`, which enabling this grants.
+        '';
+      };
+
+      marker = lib.mkOption {
+        type = lib.types.path;
+        default = "/var/lib/iroh-ssh-failsafe/last-engaged";
+        description = "Marker `modules/iroh-ssh.nix` refreshes while the failsafe holds port 22 open.";
+      };
+
+      ruleTag = lib.mkOption {
+        type = lib.types.str;
+        default = "iroh-ssh-failsafe";
+        description = "Comment the failsafe tags its runtime nftables rule with.";
+      };
+    };
+
+    tools = {
+      nftables = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.nftables;
+        defaultText = lib.literalExpression "pkgs.nftables";
+        description = "Package providing `nft`, used to read the firewall's input-allow chain.";
+      };
+
+    };
+
     timerConfig = lib.mkOption {
       type = lib.types.attrsOf lib.types.anything;
       default = {
@@ -201,8 +439,17 @@ in
 
         15 minutes rather than something finer because the receiver has no retention -- its
         SPEC lists retention and downsampling as non-goals -- so every sample is permanent, and
-        on the Pi permanent means on a 29 GB SD card. At ~5 records a run that is roughly 175k
-        rows a year; at 5 minutes it would be three times that.
+        on the Pi permanent means on a 29 GB SD card.
+
+        Measured cost, taken from the Pi's own store: 4382 rows over 8.18 days at ~610 bytes a
+        row on disk, i.e. the five-record batch this producer started with came to roughly 200k
+        rows a year. A batch is now closer to 40 records -- sensors, watched units, timers -- so
+        budget on the order of 1.3M rows and ~800 MB a year, against 16 GB free. Halving the
+        interval doubles both.
+
+        If that becomes the binding constraint, the cheapest saving is per-record cadence rather
+        than a slower timer: `system.drive` changes on the scale of days and is sampled 96 times
+        a day purely because it shares this schedule.
 
         Deliberately no `Persistent`: a measurement describes the moment it was taken, so
         catching up on samples missed while the host was off would record the present under
@@ -291,8 +538,12 @@ in
 
         # The collector needs no identity of its own and no state; the one privilege it does
         # need is membership of the receiver's group, which is what gates the socket.
+        #
+        # systemd-journal is the second: a DynamicUser unit sees only its own logs, so without
+        # it `system.journal` would count this unit's own messages and nothing else -- zero on
+        # every healthy run, which reads exactly like a quiet host.
         DynamicUser = true;
-        SupplementaryGroups = [ cfg.group ];
+        SupplementaryGroups = [ cfg.group "systemd-journal" ];
 
         # Generous next to a cpuSampleSeconds-long run: the point is to kill a run wedged on
         # an unresponsive socket before the next tick, not to police collection speed.
@@ -300,6 +551,15 @@ in
 
         NoNewPrivileges = true;
         ProtectSystem = "strict";
+        # Reading the firewall's rule set is a privileged operation even though it changes
+        # nothing; smartctl needs to issue device commands. Both are granted only when the
+        # record that needs them is switched on, so the default sandbox is unchanged.
+        CapabilityBoundingSet =
+          lib.optional cfg.irohFailsafe.enable "CAP_NET_ADMIN"
+          ++ lib.optional cfg.smart.enable "CAP_SYS_RAWIO";
+        AmbientCapabilities =
+          lib.optional cfg.irohFailsafe.enable "CAP_NET_ADMIN"
+          ++ lib.optional cfg.smart.enable "CAP_SYS_RAWIO";
         # NOT `true`: that replaces /home with an empty tmpfs, and this unit walks the mount
         # table -- a separate /home would then be reported as a tmpfs, i.e. dropped by
         # excludeFsTypes, and silently disappear from the results on a healthy host.
@@ -307,7 +567,11 @@ in
         # Safe only because tmpfs is in excludeFsTypes; otherwise the per-unit /tmp would be
         # reported as a filesystem that no other process on the host can see.
         PrivateTmp = true;
-        PrivateDevices = true;
+        # smartctl talks to the block device directly, and a private /dev has no block devices
+        # in it at all -- so with SMART on, the sweep would scan nothing and quietly report no
+        # drives on a host that has them.
+        PrivateDevices = !cfg.smart.enable;
+        DeviceAllow = lib.mkIf cfg.smart.enable [ "block-* r" ];
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
         ProtectControlGroups = true;
@@ -321,12 +585,13 @@ in
         RestrictSUIDSGID = true;
         LockPersonality = true;
         MemoryDenyWriteExecute = true;
-        CapabilityBoundingSet = [ "" ];
         SystemCallFilter = [ "@system-service" ];
         SystemCallArchitectures = "native";
         # Same kernel-enforced local-only guarantee the receiver gives itself: this producer
-        # talks to one unix socket and has no business opening a network connection.
-        RestrictAddressFamilies = [ "AF_UNIX" ];
+        # talks to unix sockets -- the receiver's, and the system bus that `systemctl show`
+        # goes through -- and has no business opening a network connection. AF_NETLINK is what
+        # nft needs to read the rule set, and is only allowed where that record is on.
+        RestrictAddressFamilies = [ "AF_UNIX" ] ++ lib.optional cfg.irohFailsafe.enable "AF_NETLINK";
       };
     };
 

@@ -96,6 +96,10 @@ let
         # reported by the next one.
         tmp="$(mktemp '${failsafeStateDir}/last-engaged.XXXXXX')"
         date +%s > "$tmp"
+        # 0644, not mktemp's 0600: the measurement producer reports this as
+        # `system.iroh_failsafe.last_engaged_seconds_ago` and runs as a DynamicUser. The file is
+        # one unix timestamp, so there is nothing here to keep from it.
+        chmod 0644 "$tmp"
         mv -f "$tmp" '${failsafeStateDir}/last-engaged'
       }
 
