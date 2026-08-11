@@ -22,6 +22,12 @@ let
       mkdir -p "$(dirname "$target")"
       tmp="$(mktemp "$target.XXXXXX")"
       date +%s > "$tmp"
+      # mktemp creates 0600, which would leave this unreadable by the measurement producer --
+      # a DynamicUser unit that reports the same age as `system.unit.last_success_seconds_ago`.
+      # The file holds one unix timestamp and nothing else, so it is world-readable, as the
+      # connectivity-watchdog marker already is. Set before the rename so the file is never
+      # briefly unreadable at its final path.
+      chmod 0644 "$tmp"
       mv -f "$tmp" "$target"
     '';
   };

@@ -11,8 +11,13 @@ description = "Collect basic host metrics and report them to a local monitoring-
 # `logs` is what unlocks the logs/collector modules (this receiver only takes logs).
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs"] }
 prost = "0.14"
-# Safe statvfs wrapper: AGENTS.md asks for no unsafe blocks, and std has no statvfs.
-rustix = { version = "1", features = ["fs"] }
+# Safe statvfs and clock_gettime wrappers: AGENTS.md asks for no unsafe blocks, and std has
+# neither statvfs nor a way to read CLOCK_MONOTONIC as an absolute value -- which systemd's
+# `*Monotonic` unit properties have to be compared against.
+rustix = { version = "1", features = ["fs", "time"] }
+# Reads flake.lock and smartctl --json. Both are documents this producer takes a handful of
+# scalars out of, and neither has a stable enough shape to justify a hand-rolled parser.
+serde_json = "1.0.151"
 
 [[bin]]
 name = "system-metrics"
