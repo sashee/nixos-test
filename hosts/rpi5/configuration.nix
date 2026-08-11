@@ -46,6 +46,7 @@ in
     ../../modules/auto-upgrade.nix
     ../../modules/monitoring.nix
     ../../modules/system-metrics.nix
+    ../../modules/inverter-monitoring.nix
     ../../modules/time-sync.nix
     ../../modules/connectivity-fallback.nix
     ../../modules/connectivity-watchdog.nix
@@ -160,6 +161,16 @@ in
   # socket path and group cannot drift apart -- and pointed at the collector rather than the
   # receiver so this block needs no edit when the receiver moves.
   common.systemMetrics = {
+    enable = true;
+    socketPath = config.services.mp-collector.socketPath;
+    group = config.services.mp-collector.group;
+  };
+
+  # Second producer: the solar inverter on the USB serial adapter, one record a minute. Same
+  # wiring rule as above -- socket and group come from the collector, not from restated
+  # defaults. Everything else (2400 8N1, the command set, the 15-minute restart) is protocol or
+  # spec and lives in the module.
+  common.inverterMonitoring = {
     enable = true;
     socketPath = config.services.mp-collector.socketPath;
     group = config.services.mp-collector.group;

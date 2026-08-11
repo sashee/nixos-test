@@ -416,6 +416,17 @@
         machineModule = rpiSystemModule;
         globalTimeout = 1800;
       };
+      # The inverter producer against emulated FTDI adapters. Slow here (TCG, and every subtest
+      # waits out at least one poll interval), which is why the same file also runs as an x86
+      # check -- but this is the run on the kernel the Pi actually boots, and therefore the one
+      # that says whether ftdi_sio and the by-id naming behave there.
+      inverterMonitoringTestRpi = import ./tests/inverter-monitoring.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+        globalTimeout = 2400;
+      };
       nixGcRetentionTestRpi = import ./tests/nix-gc-retention.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
@@ -666,6 +677,7 @@
         restic = resticTestRpi;
         boot-clock = bootClockTestRpi;
         system-metrics = systemMetricsTestRpi;
+        inverter-monitoring = inverterMonitoringTestRpi;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
         rpiNixUtilsTests)
@@ -856,6 +868,12 @@
           dirtyBackgroundBytes = 16777216;   # 16 MiB
         };
         rpi5-x86-system-metrics = rpi5X86Test ./tests/system-metrics.nix {
+          machineModule = rpi5X86SystemModule;
+        };
+        # The emulated-USB one. `usb-serial` is a QEMU device, not a guest kernel feature, so
+        # this runs the same on either arch -- but it is the set that runs under KVM, which
+        # matters for a test whose subtests each wait out a poll interval.
+        rpi5-x86-inverter-monitoring = rpi5X86Test ./tests/inverter-monitoring.nix {
           machineModule = rpi5X86SystemModule;
         };
         rpi5-x86-monitoring = rpi5X86Test ./tests/monitoring/rpi.nix {

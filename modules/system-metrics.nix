@@ -59,6 +59,12 @@ let
       (lib.attrNames (commonFeature [ "restic" "backups" ] { }))
     ++ lib.optional config.nix.gc.automatic "nix-gc.service"
     ++ lib.optional config.system.autoUpgrade.enable "nixos-upgrade.service"
+    # The other producer. Unlike this one it is long-running, so `active` is a fact about it
+    # rather than an artefact of being mid-run -- and its characteristic failure, exiting and
+    # being restarted every 15 minutes because the adapter is gone, is invisible anywhere else:
+    # its measurements simply stop, which reads the same as an inverter that is switched off.
+    ++ lib.optional (commonFeature [ "inverterMonitoring" "enable" ] false)
+      "inverter-monitoring.service"
     # Both hops of the measurement path. The receiver earns its place: if it dies the collector
     # buffers and these records arrive late, so its unit state is recoverable evidence. The
     # producer does not -- see the `units` option description.
