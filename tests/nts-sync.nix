@@ -78,23 +78,82 @@ let
   # the second server to the first gives the pair one clock, which is what a real host sees
   # from four servers that are all actually right. The falseticker subtest severs the chain
   # deliberately.
+  #
+  # Chaining alone is not enough, though, and the 2026-08-10 rpi5-x86 run is why the source line
+  # below is written by hand. On chrony's defaults the chained server polls its upstream every 64
+  # seconds and may step only three times ever, so it holds the pair together only as well as its
+  # frequency estimate -- and these guests run on `clocksource=acpi_pm` (nixpkgs
+  # test-instrumentation.nix), whose rate wanders with host load. That run put the pair 91ms apart
+  # while each still advertised +/-360us, so `minsources 2` again found no overlap and the machine
+  # never synchronised:
+  #
+  #   machine # chronyd: Can't synchronise: no majority (no agreement among 2 sources)
+  #   ^x time.cloudflare.com  10  6  77  13  -313ms[ -313ms] +/-  356us
+  #   ^x nts.netnod.se        10  6  77  14  -222ms[ -222ms] +/-  359us
+  #
+  # 91ms over the 160s since its last step is ~570ppm of uncorrected rate, and what the machine
+  # allows is the sum of those two error bars: ~0.7ms. So the residual has to be held under
+  # roughly a thousandth of what the defaults were holding, and only two things do that:
+  #
+  #   * `minpoll -2` (250ms), which bounds the residual at wander x poll interval -- ~143us at
+  #     the rate above, ~5x inside the budget -- and, just as importantly, gives chronyd ~240
+  #     samples a minute instead of one, which is what collapses the regression error it had
+  #     after three noisy samples on a fresh drift file. `maxpoll 0` because chrony enables a
+  #     sub-second interval only while the round trip stays under 10ms (chrony.conf(5)), so under
+  #     load this degrades to 1s polls -- ~570us, still inside -- rather than back to 64s.
+  #   * `makestep <threshold> -1`, an unlimited number of steps, for the state that produced the
+  #     91ms in the first place: once the default `limit 3` is spent a large excursion can only be
+  #     slewed, and chronyd sat on it for 150s across six polls. With no limit it is stepped away
+  #     at the next poll instead.
+  #
+  # Neither can be expressed through the nixpkgs module: `serverOption` is an enum of
+  # iburst/offline with nowhere to put a poll interval, and `makestep.limit` is
+  # `types.ints.positive`, so -1 is not a value it accepts. Hence `servers = [ ]`,
+  # `makestep.enable = false`, and both lines written out below.
+  #
+  # `local activate` is the third part, and it is about the DRIVER rather than about either
+  # clock: it is what makes the wait for `Leap status ... Normal` on the chained node mean
+  # anything. A bare `local` reference is eligible the moment chronyd starts (`activate` defaults
+  # to 0.0 and `waitunsynced` to 0), so that node reports Normal off its own clock without having
+  # exchanged a packet with anyone -- in the run above the wait returned in 0.19s, two seconds
+  # BEFORE the node first selected its upstream and before the 0.87s step that followed, so the
+  # driver moved on while the pair had never agreed about anything. With `activate` the local
+  # reference stays inert until the root distance has once dropped below the threshold, which
+  # cannot happen without a real exchange.
+  #
+  # Only on the chained node: the unchained one has no upstream, could never satisfy it, and
+  # would then never serve at all. It does not disturb the falseticker subtest either, because
+  # activation is a one-shot latch ("for the first time") -- after that subtest steps this node
+  # three hours forward, chronyd resets to unsynchronised and the local reference comes straight
+  # back.
+  #
+  # The gate this buys is real but loose: it catches "never reached its upstream", not "reached it
+  # and is 91ms out", because nothing chronyd reports about ITSELF can show the latter -- it
+  # believed it was holding the upstream to microseconds while it was 91ms off. The only competent
+  # observer of that is the machine, and its view is already in wait_synced's failure dump.
   mkNtsServer = upstream: { ... }: {
     virtualisation.memorySize = 512;
     networking.firewall.enable = false;
 
     services.chrony = {
       enable = true;
-      # Plain NTP for the intra-test chain: NTS is what the MACHINE must use, and making the
-      # servers authenticate to each other would only test the harness.
-      servers = lib.optional (upstream != null) upstream;
+      servers = [ ];
+      makestep.enable = false;
       extraConfig = ''
-        local stratum 10
+        local stratum 10${lib.optionalString (upstream != null) " activate 0.1"}
         allow all
         ntsserverkey ${ntsCert.keyFile}
         ntsservercert ${ntsCert.certFile}
         # No helper processes: one chronyd in a 512 MB VM has nothing to hand work to, and
         # the helpers only complicate what the journal shows when NTS-KE fails.
         ntsprocesses 0
+      ''
+      # Plain NTP for the intra-test chain: NTS is what the MACHINE must use, and making the
+      # servers authenticate to each other would only test the harness. See the header above for
+      # where the poll interval and the step limit come from.
+      + lib.optionalString (upstream != null) ''
+        server ${upstream} iburst minpoll -2 maxpoll 0
+        makestep 0.0001 -1
       '';
     };
     system.stateVersion = stateVersion;
