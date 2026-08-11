@@ -313,6 +313,17 @@ in
       # down is a transient the producer logs and rides out, not a reason to refuse to start.
       after = [ "mp-collector.service" "monitoring-platform.service" ];
 
+      # A [Unit] setting, NOT [Service] -- systemd parses the file per-section and silently
+      # ignores an unknown key, so putting it below logged
+      # "Unknown key 'StartLimitIntervalSec' in section [Service], ignoring" on the first real
+      # deploy and left the default rate limit in force.
+      #
+      # Without it, systemd's default (5 starts in 10s) parks the unit in `failed` permanently
+      # after a run of fast exits -- the exact scenario this service is designed to survive, and
+      # a silent one. With RestartSec at 15 minutes the limit could never legitimately be
+      # reached anyway, so this only matters when restartSec is turned down.
+      unitConfig.StartLimitIntervalSec = 0;
+
       serviceConfig = {
         ExecStart = lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ pollArgs);
 
@@ -320,11 +331,6 @@ in
         # ends the process is something restartSec should be waited out for.
         Restart = "always";
         RestartSec = cfg.restartSec;
-        # Without this, systemd's default rate limit (5 starts in 10s) parks the unit in
-        # `failed` permanently after a run of fast exits -- which is the exact scenario this
-        # service is designed to survive, and the failure mode would be silent. With
-        # RestartSec at 15 minutes the limit could never legitimately be reached anyway.
-        StartLimitIntervalSec = 0;
 
         StateDirectory = "inverter-monitoring";
         StateDirectoryMode = "0700";
