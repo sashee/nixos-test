@@ -1138,6 +1138,9 @@
         machineModule = anyaFeherLaptopSystemModule;
         dirtyBytes = 268435456;            # 256 MiB
         dirtyBackgroundBytes = 67108864;   #  64 MiB
+        # Spec: this host disables bluetooth, same as the desktop check below. The disabled
+        # state itself is asserted in tests/anya-feher-laptop.nix.
+        bluetooth = false;
       };
       anyaFeherLaptopMonitoringAutoUpgradeTest = import ./tests/monitoring/auto-upgrade.nix {
         inherit nixpkgs pkgs stateVersion;
