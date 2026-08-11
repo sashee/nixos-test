@@ -34,6 +34,10 @@ let
   # behaviour per cycle, not the cadence.
   intervalSeconds = 5;
 
+  # The identity re-read, which at the production hour no test could reach. Several poll cycles
+  # rather than one, so the refresh is visibly a separate event from the cycle it follows.
+  staticRefreshSeconds = 15;
+
   invSocket = "/tmp/inverter-monitoring-test-inverter.sock";
   bmsSocket = "/tmp/inverter-monitoring-test-bms.sock";
   idleSocket = "/tmp/inverter-monitoring-test-idle.sock";
@@ -78,9 +82,10 @@ nixpkgs.lib.nixos.runTest {
       bmsListenSeconds = lib.mkForce 2;
       # Nothing here runs at 2400 baud, so a frame arrives at once or not at all.
       responseTimeoutSeconds = lib.mkForce 2;
-      # The 15-minute production value would turn any hiccup into a test timeout. Short enough
-      # to observe, long enough that a restart is still clearly a restart.
-      restartSec = lib.mkForce 5;
+      staticRefreshSeconds = lib.mkForce staticRefreshSeconds;
+      # restartSec is deliberately NOT overridden: 15 minutes is a spec value, so the unit here
+      # carries the one the hosts deploy and the subtest below asserts it. The single subtest
+      # that waits out an automatic restart shortens it with a runtime drop-in instead.
     };
 
     # This node has no time source, so its clock is never set and the collector holds every
@@ -177,6 +182,9 @@ nixpkgs.lib.nixos.runTest {
         "qpigs": qpigs(),
         "qpiws": CLEAR,
         "mode": b"B",
+        # The identity is a switch too, because "read once at connect" and "re-read on the
+        # refresh" are indistinguishable while the answers never change.
+        "serial": b"92932210103714",
         "nak_qpigs2": False,
         "corrupt_next_qpigs": False,
         "mute": False,
@@ -193,7 +201,7 @@ nixpkgs.lib.nixos.runTest {
             if state["mute"]:
                 return None
             if command == b"QID":
-                return frame(b"92932210103714")
+                return frame(state["serial"])
             if command == b"QVFW":
                 return frame(b"VERFW:00072.04")
             if command == b"QVFW3":
@@ -413,6 +421,26 @@ nixpkgs.lib.nixos.runTest {
         # different device after a reboot.
         assert "ttyUSB" not in remembered, remembered
 
+    with subtest("the unit is a daemon systemd restarts a quarter of an hour after any exit"):
+        # Spec values, and the only place they are visible: the producer is a daemon started at
+        # boot, and every exit -- clean or not -- costs `RestartSec` before the next attempt.
+        # Read off the rendered unit rather than from the option, because the claim is that
+        # systemd was told, and asserted here rather than in a config-level check because this
+        # is the same unit every other subtest is exercising.
+        unit = machine.succeed("systemctl cat inverter-monitoring.service")
+        assert "Restart=always" in unit, unit
+        assert "RestartSec=900" in unit, unit
+        # A run of fast exits must not park the unit in `failed` forever, which systemd's default
+        # rate limit would do to precisely the failure this service is built to survive.
+        assert "StartLimitIntervalSec=0" in unit, unit
+        # Asked of systemd, not of the unit text: NixOS wires `wantedBy` as a symlink in
+        # multi-user.target.wants rather than as an [Install] section, so the text says nothing
+        # about what starts this at boot.
+        wanted = machine.succeed(
+            "systemctl show -p WantedBy --value inverter-monitoring.service"
+        )
+        assert "multi-user.target" in wanted, wanted
+
     with subtest("the by-id name is reported when there is one, and never a borrowed one"):
         # Two devices claim `shared_by_id` and only one owns the symlink, so whether the
         # inverter has a by-id name at all depends on which of them won. Both outcomes are
@@ -608,6 +636,40 @@ nixpkgs.lib.nixos.runTest {
         with lock:
             assert "QPIGS2" not in seen, "QPIGS2 was re-sent after a NAK"
 
+    # The identity is read at connect, but not ONLY at connect: protocol.md says these answers
+    # cannot change while the unit is powered, so the case this covers is the one where the
+    # premise is false -- a unit swapped behind the same adapter, which without the refresh keeps
+    # being reported under the old serial number until something restarts the service.
+    with subtest("the identity is re-read on the static refresh, not pinned at connect"):
+        assert latest()["attributes"][
+            "resource.attributes.inverter.serial_number"
+        ] == "92932210103714", "this subtest needs the original serial to still be reported"
+
+        with lock:
+            state["serial"] = b"92932210109999"
+            # Cleared so its reappearance is proof of a re-read rather than a memory of the
+            # read at connect.
+            seen.discard("QID")
+
+        def reidentified(_):
+            return latest()["attributes"].get(
+                "resource.attributes.inverter.serial_number"
+            ) == "92932210109999"
+
+        # No restart and no reconnect anywhere in here: the refresh happens inside the running
+        # session, between two ordinary poll cycles.
+        before_restarts = restarts()
+        retry(reidentified)
+        assert restarts() == before_restarts, "the identity changed by way of a restart"
+        with lock:
+            assert "QID" in seen, "the serial number changed without QID being re-sent"
+
+        # The whole set is re-read, not just the command that happened to change, and the rest
+        # of the identity survives it.
+        attributes = latest()["attributes"]
+        assert attributes["resource.attributes.inverter.model"] == "MKS2-8000", attributes
+        assert attributes["resource.attributes.inverter.firmware"] == "VERFW:00072.04", attributes
+
     with subtest("the producer is watched by the other producer"):
         # A long-running unit, so `active` means something -- which is why this one can be in
         # system-metrics' watch list where system-metrics itself cannot.
@@ -632,6 +694,20 @@ nixpkgs.lib.nixos.runTest {
     # the adapter wedged -- is the case that SHOULD cost a restart, because nothing this process
     # can do will fix it and all it would otherwise produce is all-null rows forever.
     with subtest("a unit that goes silent ends the run so systemd can start it over"):
+        # The wait is shortened here and only here. A runtime drop-in rather than a config
+        # override, so the unit every other subtest ran against -- and the one the assertion
+        # near the top is about -- is the one the hosts deploy, at the spec's 15 minutes.
+        machine.succeed(
+            "mkdir -p /run/systemd/system/inverter-monitoring.service.d",
+            "printf '[Service]\\nRestartSec=5\\n' > "
+            "/run/systemd/system/inverter-monitoring.service.d/fast-restart.conf",
+            # Applies to the next restart; it does not touch the running process.
+            "systemctl daemon-reload",
+        )
+        assert "RestartSec=5" in machine.succeed(
+            "systemctl cat inverter-monitoring.service"
+        ), "the drop-in did not take, and the wait below is 15 minutes long"
+
         before_restarts = restarts()
         with lock:
             state["mute"] = True
