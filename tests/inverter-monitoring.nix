@@ -425,14 +425,11 @@ nixpkgs.lib.nixos.runTest {
         # Spec values, and the only place they are visible: the producer is a daemon started at
         # boot, and every exit -- clean or not -- costs `RestartSec` before the next attempt.
         # Read off the rendered unit rather than from the option, because the claim is that
-        # systemd was told, and asserted here rather than in a config-level check because this
-        # is the same unit every other subtest is exercising.
+        # systemd was told. That is as far as the unit text can be trusted, though -- see the
+        # subtest below, where a key systemd printed in `systemctl cat` was one it had ignored.
         unit = machine.succeed("systemctl cat inverter-monitoring.service")
         assert "Restart=always" in unit, unit
         assert "RestartSec=900" in unit, unit
-        # A run of fast exits must not park the unit in `failed` forever, which systemd's default
-        # rate limit would do to precisely the failure this service is built to survive.
-        assert "StartLimitIntervalSec=0" in unit, unit
         # Asked of systemd, not of the unit text: NixOS wires `wantedBy` as a symlink in
         # multi-user.target.wants rather than as an [Install] section, so the text says nothing
         # about what starts this at boot.
@@ -440,6 +437,22 @@ nixpkgs.lib.nixos.runTest {
             "systemctl show -p WantedBy --value inverter-monitoring.service"
         )
         assert "multi-user.target" in wanted, wanted
+
+    with subtest("systemd accepted every key in the unit file"):
+        # This is here because the first real deploy logged
+        # "Unknown key 'StartLimitIntervalSec' in section [Service], ignoring" -- it is a [Unit]
+        # key, and systemd parses per-section and drops an unknown one with a log line and a
+        # zero exit. Nothing in the suite noticed, because the unit still started.
+        journal = machine.succeed("journalctl -u inverter-monitoring.service --no-pager -b")
+        assert "Unknown key" not in journal, journal
+
+        # And the setting is not merely accepted but in force. Without it the default (5 starts
+        # in 10s) parks the unit in `failed` after a run of fast exits, which is exactly the
+        # case this service is built to survive.
+        limit = machine.succeed(
+            "systemctl show -p StartLimitIntervalUSec --value inverter-monitoring.service"
+        ).strip()
+        assert limit == "0", f"the start rate limit is still in force: {limit}"
 
     with subtest("the by-id name is reported when there is one, and never a borrowed one"):
         # Two devices claim `shared_by_id` and only one owns the symlink, so whether the
