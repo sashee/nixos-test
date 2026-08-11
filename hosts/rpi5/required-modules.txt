@@ -115,3 +115,19 @@ macb
 # The rpi VM tests (connectivity-fallback) emulate WiFi with hwsim on the exact
 # Pi kernel; a kernel without it silently breaks that test setup.
 mac80211_hwsim
+# USB serial, for common.inverterMonitoring: without a driver the adapter never
+# becomes a /dev/ttyUSB* and discovery finds nothing to probe -- which looks
+# exactly like an inverter that is switched off. Nothing here is autoloaded by
+# this list; udev binds whichever one matches the adapter's modalias.
+#
+# Two of these are in the box today: ch341 for the inverter (a CH340, 1a86:7523)
+# and ftdi_sio for the BMS (an FT232R, 0403:6001). The other two are listed
+# because a replacement cable is whatever the shop had, and the cost of an extra
+# name is nothing against a silent feature loss on a host nobody is looking at.
+#
+# usbserial is CONFIG_USB_SERIAL=y on the Pi kernel; the check accepts builtins.
+usbserial
+ftdi_sio
+ch341
+cp210x
+pl2303

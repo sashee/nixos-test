@@ -12,7 +12,7 @@
 * it reads all devices in /dev/ttyUSB
 * evaluates the available USBs in random order
     * start with a device that it last connected to (written in a file)
-    * this uses the /dev/serial/by-id/ path for identification
+    * this uses the /dev/serial/by-path/ path for identification
 * for each device:
     * listens to it for 10 seconds => if there is data coming without asking then it's the BMS => skip
     * sets the serial parameters
@@ -44,7 +44,7 @@
     * inverter.model_code: `QGMN`
     * inverter.firmware: `QVFW`
     * inverter.firmware_panel: `QVFW3`
-    * inverter.device: the /dev/serial/by-id/ path
+    * inverter.device: the /dev/serial/by-path/ path
 * scope attributes:
     * name: "inverter-monitoring"
     * version: crate version
