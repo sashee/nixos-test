@@ -22,6 +22,18 @@
 let
   cfg = config.common.systemMetrics;
 
+  # A `common.*` option from a module this host may not import.
+  #
+  # Load-bearing: this module is imported by configurations that import none of the other
+  # `common.*` features -- qemu-graphical is the standing example -- and in Nix a missing option
+  # is an evaluation error, not a `false`. The same trap the `config.services ? mp-collector`
+  # guards below exist for.
+  #
+  # Deliberately NOT used for nixpkgs' own options (`services.chrony`, `nix.gc`,
+  # `system.autoUpgrade`, ...): those are always present, so a guard there would only turn a
+  # typo into a silently disabled feature.
+  commonFeature = path: default: lib.attrByPath path default config.common;
+
   # Units whose state is worth a record, derived from what this host actually enables rather
   # than listed as constants. A hardcoded list rots in the worst possible way: a name that
   # matches no unit reports nulls forever and reads exactly like a healthy unit that happens to
@@ -30,16 +42,21 @@ let
   defaultUnits =
     lib.optional config.services.chrony.enable "chronyd.service"
     ++ lib.optional config.services.dnscrypt-proxy.enable "dnscrypt-proxy.service"
-    ++ lib.optionals config.common.irohSsh.enable [ "iroh-ssh.service" "iroh-ssh-failsafe.service" ]
-    ++ lib.optionals config.common.connectivityFallback.enable [
+    ++ lib.optionals (commonFeature [ "irohSsh" "enable" ] false) [
+      "iroh-ssh.service"
+      "iroh-ssh-failsafe.service"
+    ]
+    ++ lib.optionals (commonFeature [ "connectivityFallback" "enable" ] false) [
       "connectivity-fallback-check.service"
       "connectivity-fallback-setup.service"
       "connectivity-fallback-dnsmasq.service"
       "connectivity-fallback-portal.service"
     ]
-    ++ lib.optional config.common.connectivityWatchdog.enable "connectivity-watchdog.service"
-    ++ lib.optional config.common.timeSync.enable "time-correction.service"
-    ++ map (name: "restic-backups-${name}.service") (lib.attrNames config.common.restic.backups)
+    ++ lib.optional (commonFeature [ "connectivityWatchdog" "enable" ] false)
+      "connectivity-watchdog.service"
+    ++ lib.optional (commonFeature [ "timeSync" "enable" ] false) "time-correction.service"
+    ++ map (name: "restic-backups-${name}.service")
+      (lib.attrNames (commonFeature [ "restic" "backups" ] { }))
     ++ lib.optional config.nix.gc.automatic "nix-gc.service"
     ++ lib.optional config.system.autoUpgrade.enable "nixos-upgrade.service"
     # Both hops of the measurement path. The receiver earns its place: if it dies the collector
@@ -58,8 +75,9 @@ let
   defaultTimers =
     lib.optional config.system.autoUpgrade.enable "nixos-upgrade.timer"
     ++ lib.optional config.nix.gc.automatic "nix-gc.timer"
-    ++ lib.optional config.common.connectivityWatchdog.enable "connectivity-watchdog.timer"
-    ++ lib.optional config.common.timeSync.enable "time-correction.timer"
+    ++ lib.optional (commonFeature [ "connectivityWatchdog" "enable" ] false)
+      "connectivity-watchdog.timer"
+    ++ lib.optional (commonFeature [ "timeSync" "enable" ] false) "time-correction.timer"
     ++ lib.optional config.services.fstrim.enable "fstrim.timer";
 
   excludeArgs = lib.concatMap (t: [ "--exclude-fstype" t ]) cfg.excludeFsTypes;
@@ -392,7 +410,7 @@ in
     irohFailsafe = {
       enable = lib.mkOption {
         type = lib.types.bool;
-        default = config.common.irohSsh.enable or false;
+        default = commonFeature [ "irohSsh" "enable" ] false;
         defaultText = lib.literalExpression "config.common.irohSsh.enable";
         description = ''
           Report `system.iroh_failsafe`: whether the failsafe has opened port 22, and when it
