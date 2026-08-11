@@ -107,6 +107,20 @@ in
     "vm.dirty_background_bytes" = 16777216;   # 16 MiB
   };
 
+  # Spec: bluetooth enabled (spec/rpi-features.md, System). Set here rather than in a shared
+  # module because the two hosts disagree -- modules/laptop-base.nix enables it for laptops and
+  # anya-feher-laptop forces it back off, so there is no common default to inherit.
+  #
+  # The Pi's kernel side is already in place: `bluetooth`, `btbcm`, `btqca`, `btsdio` and
+  # `hci_uart` are in hosts/rpi5/required-modules.txt (they came from the loaded-module
+  # snapshot, so the onboard CYW43 radio is bound whether or not bluetoothd runs). What these
+  # two options add is BlueZ, bluetoothd, its D-Bus policy and adapter management.
+  hardware.bluetooth.enable = true;
+  # Powers hci0 at boot (and turns LE on). Written by the nixpkgs module as
+  # `Policy.AutoEnable` in /etc/bluetooth/main.conf, which is the assertable half in a VM --
+  # a guest has no radio for hci0 to appear on.
+  hardware.bluetooth.powerOnBoot = true;
+
   # No interactive boot menu on the Pi + limited SD space: keep only the current
   # generation on GC (laptops keep 14 days to roll back from the boot menu).
   common.nixSettings.gcOptions = "--delete-old";
