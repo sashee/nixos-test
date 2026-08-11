@@ -15,6 +15,16 @@
 # nothing in this file may assert that a particular server NAME used a particular family --
 # upstream does not offer that. What is asserted is the family of the request that actually
 # arrived (check_request), which is the property the deployed host depends on.
+#
+# The first passing run scrambled the duals in BOTH directions, which is worth quoting as
+# the reason that rule is not merely defensive. On the v6-only leg:
+#
+#   [google-ipv6] ... dial tcp 8.8.8.8:443: connect: no route to host
+#   [mullvad-ipv4] OK (DoH) - rtt: 79ms
+#
+# -- a "-ipv6" entry dialling v4 and a "-ipv4" entry answering over v6, in one refresh. The
+# leg passed on wikimedia-ipv6 and digitalgesellschaft-ipv6, i.e. on the two entries whose
+# hostname nothing else claims.
 { nixpkgs, pkgs, commonDesktopModule, stateVersion, dohStamps }:
 
 let
