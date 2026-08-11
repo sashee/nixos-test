@@ -49,6 +49,10 @@
 
 * [system metrics](./features/monitoring/system-metrics.md)
 
+### Inverter monitoring
+
+* [](./features/inverter-monitoring/inverter-monitoring.md)
+
 ## Auto-reboot
 
 * every hour it tries to resolve a DNS address
