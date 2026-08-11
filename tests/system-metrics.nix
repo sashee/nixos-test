@@ -704,6 +704,24 @@ nixpkgs.lib.nixos.runTest {
         assert flapping[0]["body"]["n_restarts"] >= 2, flapping
         assert flapping[0]["body"]["active_state"] != "failed", flapping
 
+    with subtest("the watch list is derived from the features this host enables"):
+        # The default list is built by reading other modules' options, each of which has to be
+        # guarded because this module is also imported by configurations that enable none of
+        # them. A guard that swallowed too much would leave the list empty -- and every other
+        # assertion here would still pass, because they name units this test defines itself.
+        watched = {
+            m["attributes"]["record.attributes.unit"]
+            for m in measurements if m["type"] == "system.unit"
+        }
+        # From common.connectivityWatchdog and common.connectivityFallback -- `common.*`
+        # options reached through the guard. (Not common.timeSync: this node forces time
+        # synchronisation off, so its units correctly do not appear.)
+        assert "connectivity-watchdog.service" in watched, watched
+        assert "connectivity-fallback-check.service" in watched, watched
+        # From services.dnscrypt-proxy and nix.gc, nixpkgs options read directly.
+        assert "dnscrypt-proxy.service" in watched, watched
+        assert "nix-gc.service" in watched, watched
+
     with subtest("a watched unit reports its state and its last success separately"):
         collector = by_attr(measurements, "system.unit", "unit", "mp-collector.service")
         assert len(collector) == 1, collector
