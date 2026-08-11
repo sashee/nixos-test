@@ -49,6 +49,7 @@ struct Options {
     iroh_failsafe_marker: Option<PathBuf>,
     failsafe_rule_tag: String,
     systemctl: Option<PathBuf>,
+    busctl: Option<PathBuf>,
     journalctl: Option<PathBuf>,
     smartctl: Option<PathBuf>,
     nft: Option<PathBuf>,
@@ -77,7 +78,10 @@ usage: system-metrics [options]
   --iroh-failsafe-marker PATH  last-engaged marker; its presence enables the failsafe record
   --failsafe-rule-tag TAG   nft rule comment marking an engaged failsafe
                             (default: iroh-ssh-failsafe)
-  --systemctl PATH          systemctl binary; without it no unit or timer records
+  --systemctl PATH          systemctl binary; without it no unit records
+  --busctl PATH             busctl binary; without it no timer records. Separate from
+                            systemctl because timer elapse properties are only machine-readable
+                            over the bus
   --journalctl PATH         journalctl binary; without it no journal records
   --smartctl PATH           smartctl binary; without it no drive records
   --nft PATH                nft binary; without it port_22_open is null
@@ -104,6 +108,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
         iroh_failsafe_marker: None,
         failsafe_rule_tag: "iroh-ssh-failsafe".to_owned(),
         systemctl: None,
+        busctl: None,
         journalctl: None,
         smartctl: None,
         nft: None,
@@ -158,6 +163,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
             }
             "--failsafe-rule-tag" => options.failsafe_rule_tag = value("--failsafe-rule-tag")?,
             "--systemctl" => options.systemctl = Some(PathBuf::from(value("--systemctl")?)),
+            "--busctl" => options.busctl = Some(PathBuf::from(value("--busctl")?)),
             "--journalctl" => options.journalctl = Some(PathBuf::from(value("--journalctl")?)),
             "--smartctl" => options.smartctl = Some(PathBuf::from(value("--smartctl")?)),
             "--nft" => options.nft = Some(PathBuf::from(value("--nft")?)),
@@ -558,9 +564,10 @@ fn units_to_report(systemctl: &Path, watch: &[String]) -> Vec<String> {
 }
 
 fn show(systemctl: &Path, unit: &str, properties: &[&str]) -> BTreeMap<String, String> {
-    // --timestamp=unix so realtime properties come back as `@<seconds>` rather than as a
-    // localised date string; see systemd::parse_unix_timestamp_seconds.
-    let mut args = vec!["show", unit, "--no-pager", "--timestamp=unix"];
+    // Every property read here is rendered raw by `show` (states are plain strings, monotonic
+    // timestamps plain integers). Timespan-valued properties are NOT -- see timer_records --
+    // so anything added to this list wants checking against `busctl` first.
+    let mut args = vec!["show", unit, "--no-pager"];
     let property_args: Vec<String> = properties.iter().map(|p| format!("--property={p}")).collect();
     args.extend(property_args.iter().map(String::as_str));
     output(systemctl, &args).map(|text| systemd::parse_show_properties(&text)).unwrap_or_default()
@@ -591,7 +598,7 @@ fn unit_records(
 
             let active_enter = property("ActiveEnterTimestampMonotonic")
                 .as_deref()
-                .and_then(systemd::parse_timestamp_micros)
+                .and_then(systemd::parse_micros)
                 .and_then(|then| systemd::seconds_since(now_monotonic_micros, then));
 
             // The marker is written by the unit's own OnSuccess handler, so a run that failed
@@ -619,8 +626,14 @@ fn unit_records(
         .collect()
 }
 
+/// Read over D-Bus rather than through `systemctl show`.
+///
+/// `show` is systemd's human-facing renderer, and for these two properties that matters:
+/// it prints `NextElapseUSecMonotonic` as the timespan `1d 1h 9min 11.561569s`, where the
+/// property itself is a plain `t 90551561569`. Asking the bus for the value skips the
+/// formatting entirely instead of re-parsing prose back into a number.
 fn timer_records(
-    systemctl: &Path,
+    busctl: &Path,
     watch: &[String],
     now_monotonic_micros: u64,
     now_unix_micros: Option<u64>,
@@ -628,29 +641,34 @@ fn timer_records(
     watch
         .iter()
         .map(|timer| {
-            let properties = show(
-                systemctl,
-                timer,
-                &["NextElapseUSecRealtime", "NextElapseUSecMonotonic"],
-            );
+            let path = systemd::bus_unit_path(timer);
+            let elapse = output(
+                busctl,
+                &[
+                    "get-property",
+                    "org.freedesktop.systemd1",
+                    &path,
+                    "org.freedesktop.systemd1.Timer",
+                    "NextElapseUSecMonotonic",
+                    "NextElapseUSecRealtime",
+                ],
+            )
+            .map(|text| systemd::parse_busctl_micros(&text))
+            .unwrap_or_default();
+            let property = |index: usize| elapse.get(index).copied().flatten();
 
-            // A calendar timer schedules in realtime and reports `infinity` for the monotonic
+            // A calendar timer schedules in realtime and reports USEC_INFINITY on the monotonic
             // side; an OnBootSec timer does the opposite, and once it has elapsed it reports
-            // neither -- which is normal operation, not a fault, and lands as a null.
-            let realtime = properties
-                .get("NextElapseUSecRealtime")
-                .and_then(|raw| systemd::parse_unix_timestamp_seconds(raw))
-                .and_then(|seconds| seconds.checked_mul(1_000_000))
+            // neither -- normal operation, not a fault, and it lands as a null.
+            let monotonic =
+                property(0).and_then(|then| systemd::seconds_until(now_monotonic_micros, then));
+            let realtime = property(1)
                 .zip(now_unix_micros)
                 .and_then(|(then, now)| systemd::seconds_until(now, then));
-            let monotonic = properties
-                .get("NextElapseUSecMonotonic")
-                .and_then(|raw| systemd::parse_timestamp_micros(raw))
-                .and_then(|then| systemd::seconds_until(now_monotonic_micros, then));
 
             Record::new("system.timer")
                 .with_attr("unit", Value::str(timer))
-                .with_field("next_elapse_seconds_until", realtime.or(monotonic).map(Value::Double))
+                .with_field("next_elapse_seconds_until", monotonic.or(realtime).map(Value::Double))
         })
         .collect()
 }
@@ -751,8 +769,10 @@ fn run(options: Options) -> Result<(), String> {
             now_monotonic_micros,
             now_unix_micros,
         ));
+    }
+    if let Some(busctl) = &options.busctl {
         records.extend(timer_records(
-            systemctl,
+            busctl,
             &options.timers,
             now_monotonic_micros,
             now_unix_micros,

@@ -142,7 +142,7 @@ nixpkgs.lib.nixos.runTest {
       # Two timers of this test's own rather than the host's real ones: the point is the
       # difference between a timer that has a next run and one that never will, and pinning that
       # to whatever nix-gc happens to be scheduled for would make it a test of another feature.
-      timers = [ "test-scheduled.timer" "test-boot-only.timer" ];
+      timers = [ "test-scheduled.timer" "test-boot-only.timer" "test-monotonic.timer" ];
     };
     environment.etc."fixture-flake.lock".text = builtins.toJSON {
       nodes.common = {
@@ -200,6 +200,15 @@ nixpkgs.lib.nixos.runTest {
     systemd.timers.test-boot-only = {
       wantedBy = [ "timers.target" ];
       timerConfig = { OnBootSec = "1s"; AccuracySec = "1s"; Unit = "test-noop.service"; };
+    };
+
+    # A monotonic timer that has NOT yet elapsed. systemd reports its next elapse as a timespan
+    # (`59min 12.3s`) rather than as an integer, unlike the calendar timer below -- and most of
+    # the real timers on these hosts are this kind, so the two cases above between them missed
+    # the shape that matters most.
+    systemd.timers.test-monotonic = {
+      wantedBy = [ "timers.target" ];
+      timerConfig = { OnBootSec = "1h"; Unit = "test-noop.service"; };
     };
 
     # The ordinary case: a calendar timer always has a next elapse, so this is the value half of
@@ -747,6 +756,16 @@ nixpkgs.lib.nixos.runTest {
         assert len(scheduled) == 1, scheduled
         assert scheduled[0]["body"]["next_elapse_seconds_until"] is not None, scheduled
         assert scheduled[0]["body"]["next_elapse_seconds_until"] > 0, scheduled
+
+        # A monotonic timer still waiting to fire. systemd renders its next elapse as a timespan
+        # ("59min 12.3s"), not as an integer -- the shape that made every OnBootSec and
+        # OnUnitActiveSec timer on the Pi report no schedule at all while calendar timers looked
+        # fine. Set to an hour, so the bound below also catches a unit mix-up.
+        monotonic = by_attr(measurements, "system.timer", "unit", "test-monotonic.timer")
+        assert len(monotonic) == 1, monotonic
+        remaining = monotonic[0]["body"]["next_elapse_seconds_until"]
+        assert remaining is not None, monotonic
+        assert 0 < remaining <= 3600, monotonic
 
         # test-boot-only fires once per boot and never rearms -- systemd reports `infinity` for
         # the monotonic side and nothing for the realtime one. Normal operation on the Pi, where

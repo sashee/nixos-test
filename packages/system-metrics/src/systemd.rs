@@ -23,38 +23,51 @@ pub fn parse_show_properties(text: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// systemd renders "no such timestamp" as `0` and "never going to happen" as `infinity`. Both
-/// mean the value is unknown rather than zero seconds ago, which is why this is an `Option`.
+/// A microsecond-valued property, or `None` for every spelling of "there is no such moment".
 ///
-/// Monotonic properties (`*TimestampMonotonic`, `NextElapseUSecMonotonic`) are plain integers.
-pub fn parse_timestamp_micros(raw: &str) -> Option<u64> {
+/// systemd uses `0` for "never happened" and `USEC_INFINITY` (`u64::MAX`) for "never will".
+/// The latter is also what `busctl` returns for a unit that does not exist -- with exit status
+/// zero -- so treating it as a real timestamp would turn a typo in a watch list into a
+/// timer scheduled 584,000 years from now.
+pub fn parse_micros(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     if raw.is_empty() || raw == "infinity" {
         return None;
     }
     match raw.parse::<u64>().ok()? {
-        0 => None,
+        0 | u64::MAX => None,
         micros => Some(micros),
     }
 }
 
-/// A *realtime* timestamp property, in seconds since the epoch.
+/// The D-Bus object path of a unit.
 ///
-/// These do not come back as integers. Despite the `USec` in their names, `systemctl show`
-/// formats realtime timestamps for humans -- `LastTriggerUSec=Mon 2026-08-10 11:29:36 UTC` --
-/// so the caller asks for `--timestamp=unix`, which renders them as `@1786528827`. Parsing the
-/// human form instead would mean carrying a date parser and a timezone assumption.
-pub fn parse_unix_timestamp_seconds(raw: &str) -> Option<u64> {
-    let raw = raw.trim();
-    if raw.is_empty() || raw == "infinity" || raw == "n/a" {
-        return None;
+/// systemd escapes every byte outside `[A-Za-z0-9]` as `_` plus two lowercase hex digits, so
+/// `connectivity-watchdog.timer` becomes `connectivity_2dwatchdog_2etimer`. Computing it here
+/// rather than calling `GetUnit` first halves the number of processes this spawns per timer.
+pub fn bus_unit_path(unit: &str) -> String {
+    let mut path = String::from("/org/freedesktop/systemd1/unit/");
+    for byte in unit.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            path.push(byte as char);
+        } else {
+            path.push_str(&format!("_{byte:02x}"));
+        }
     }
-    // The `@` prefix is what `--timestamp=unix` produces; accepting a bare integer too costs
-    // nothing and keeps this working if a systemd version ever drops the sigil.
-    match raw.strip_prefix('@').unwrap_or(raw).parse::<u64>().ok()? {
-        0 => None,
-        seconds => Some(seconds),
-    }
+    path
+}
+
+/// Values from `busctl get-property`, which prints one `<type> <value>` line per property in
+/// the order they were asked for.
+///
+/// This is the machine-readable half of systemd's interface, and the reason it is worth a
+/// second tool: `systemctl show` renders `NextElapseUSecMonotonic` as the timespan
+/// `1d 1h 9min 11.561569s`, while the property behind it is a plain `t 90551561569`.
+pub fn parse_busctl_micros(text: &str) -> Vec<Option<u64>> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| parse_micros(line.trim().strip_prefix("t ")?))
+        .collect()
 }
 
 /// Seconds between an earlier monotonic timestamp and now, both in microseconds.
@@ -155,28 +168,52 @@ mod tests {
         assert_eq!(properties["Empty"], "");
     }
 
-    /// The three spellings of "there is no such timestamp" that were observed on the Pi: an
-    /// already-elapsed `OnBootSec` timer reports an empty realtime and a monotonic of `infinity`.
+    /// Every spelling of "there is no such moment" that these hosts produce. `u64::MAX` is
+    /// systemd's USEC_INFINITY, and is what a *nonexistent* unit reports -- with exit status
+    /// zero, so it is the only signal that a watch-list entry names nothing.
     #[test]
-    fn absent_timestamps_are_unknown_rather_than_zero() {
-        assert_eq!(parse_timestamp_micros(""), None);
-        assert_eq!(parse_timestamp_micros("infinity"), None);
-        assert_eq!(parse_timestamp_micros("0"), None);
-        assert_eq!(parse_timestamp_micros("1786397627467839"), Some(1786397627467839));
+    fn absent_timestamps_are_unknown_rather_than_a_number() {
+        assert_eq!(parse_micros(""), None);
+        assert_eq!(parse_micros("infinity"), None);
+        assert_eq!(parse_micros("0"), None);
+        assert_eq!(parse_micros("18446744073709551615"), None);
+        assert_eq!(parse_micros("1786397627467839"), Some(1786397627467839));
     }
 
-    /// `--timestamp=unix` renders a realtime timestamp as `@<seconds>`; without it the same
-    /// property comes back as `Mon 2026-08-10 11:29:36 UTC`, which is not a number and must not
-    /// be mistaken for one.
+    /// Verbatim off the Pi, including the value `busctl` returns for a unit that does not
+    /// exist -- which it reports with exit status zero, so nothing else would catch it.
     #[test]
-    fn realtime_timestamps_are_read_from_their_unix_rendering() {
-        assert_eq!(parse_unix_timestamp_seconds("@1786528827"), Some(1786528827));
-        assert_eq!(parse_unix_timestamp_seconds("1786528827"), Some(1786528827));
-        assert_eq!(parse_unix_timestamp_seconds(""), None);
-        assert_eq!(parse_unix_timestamp_seconds("infinity"), None);
-        assert_eq!(parse_unix_timestamp_seconds("n/a"), None);
-        assert_eq!(parse_unix_timestamp_seconds("@0"), None);
-        assert_eq!(parse_unix_timestamp_seconds("Mon 2026-08-10 11:29:36 UTC"), None);
+    fn busctl_property_lines_are_read_in_order() {
+        assert_eq!(
+            parse_busctl_micros("t 90551561569\nt 0\n"),
+            vec![Some(90551561569), None]
+        );
+        assert_eq!(parse_busctl_micros("t 18446744073709551615\n"), vec![None]);
+        // A string-valued property is not a number and must not be read as one.
+        assert_eq!(parse_busctl_micros("s \"active\"\n"), vec![None]);
+    }
+
+    /// `connectivity-watchdog.timer` really does live at this path; the escaping is systemd's
+    /// own and has to match byte for byte or the property read finds nothing.
+    #[test]
+    fn a_unit_name_escapes_to_its_bus_path() {
+        assert_eq!(
+            bus_unit_path("connectivity-watchdog.timer"),
+            "/org/freedesktop/systemd1/unit/connectivity_2dwatchdog_2etimer"
+        );
+        assert_eq!(
+            bus_unit_path("systemd-tmpfiles-clean.timer"),
+            "/org/freedesktop/systemd1/unit/systemd_2dtmpfiles_2dclean_2etimer"
+        );
+        assert_eq!(
+            bus_unit_path("fstrim.timer"),
+            "/org/freedesktop/systemd1/unit/fstrim_2etimer"
+        );
+        // Digits survive; the `@` and `\` of a template instance do not.
+        assert_eq!(
+            bus_unit_path("user@1000.service"),
+            "/org/freedesktop/systemd1/unit/user_401000_2eservice"
+        );
     }
 
     #[test]

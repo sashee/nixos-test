@@ -107,6 +107,10 @@ let
     # and `systemctl` from a different systemd than PID 1 is a class of bug worth designing out.
     "--systemctl"
     "${config.systemd.package}/bin/systemctl"
+    # Timer elapse times are read over the bus rather than from `systemctl show`, which renders
+    # them as prose ("1d 1h 9min 11.561569s") where the property is a plain integer.
+    "--busctl"
+    "${config.systemd.package}/bin/busctl"
     "--journalctl"
     "${config.systemd.package}/bin/journalctl"
   ]
