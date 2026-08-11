@@ -410,6 +410,17 @@ nixpkgs.lib.nixos.runTest {
         assert "mp-collector.service" in machine.succeed(
             "systemctl show -p After --value system-metrics.service"
         ), "the producer must be ordered after the collector it posts to"
+
+        # The spec's cadence, "every 15 minutes and 5 minutes after boot". Nothing else here
+        # sees it: every other assertion in this file drives the producer by hand, so a timer
+        # that had drifted to daily would pass the whole suite and simply stop measuring the
+        # hosts. Read off the rendered timer, because the claim is that systemd was told.
+        timer = machine.succeed("systemctl cat system-metrics.timer")
+        assert "OnBootSec=5m" in timer, timer
+        assert "OnUnitActiveSec=15m" in timer, timer
+        # A measurement describes the moment it was taken, so a run missed while the host was
+        # off must not be caught up later under a past timestamp.
+        assert "Persistent=" not in timer, timer
         # From here the driver owns every run: left armed, a timer tick landing mid-test would
         # break the batch counting at the end.
         machine.succeed("systemctl stop system-metrics.timer")
