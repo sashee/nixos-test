@@ -719,8 +719,24 @@ nixpkgs.lib.nixos.runTest {
 
         # A crash loop never reaches `failed`; it sits in activating/auto-restart, so the count
         # of restarts is the only thing that distinguishes it from a healthy unit.
-        flapping = by_attr(measurements, "system.unit", "unit", "test-flapping.service")
-        assert len(flapping) == 1, f"a restart-looping unit went unreported: {flapping}"
+        #
+        # Read over several batches rather than one, because the module finds these units with a
+        # single `list-units --state=failed,auto-restart` and a crash loop is not in either state
+        # for all of its cycle: it spends the ~1s of RestartSec in auto-restart, but the 40-75ms
+        # it takes to run ExecStart and die matches neither. One batch can therefore miss it
+        # honestly. What is promised is that a unit that keeps crashing gets reported -- not that
+        # any single sample catches it mid-cycle -- and dropping `auto-restart` from that state
+        # filter still fails here, because then no batch would ever carry it.
+        #
+        # A local batch, not a reassignment: the subtests below are written against the one
+        # `measurements` holds.
+        batch = measurements
+        for _ in range(5):
+            flapping = by_attr(batch, "system.unit", "unit", "test-flapping.service")
+            if flapping:
+                break
+            batch = collect_batch()
+        assert len(flapping) == 1, f"a restart-looping unit went unreported in 5 batches: {flapping}"
         assert flapping[0]["body"]["n_restarts"] >= 2, flapping
         assert flapping[0]["body"]["active_state"] != "failed", flapping
 

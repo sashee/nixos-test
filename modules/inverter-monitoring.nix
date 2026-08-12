@@ -158,6 +158,11 @@ in
         Reported, never matched on -- see [](#opt-common.inverterMonitoring.devDir) for why it
         cannot be an identity. It is here because it is the name a human reading a query
         recognises (`usb-FTDI_FT232R_USB_UART_BG00Q7OM-if00-port0`) where a bus path is not.
+
+        Re-read every cycle rather than resolved once at startup. Where two adapters collide on
+        one name, udev re-picks the owner on any event touching either of them -- the coldplug
+        backlog at boot, or the `udevadm trigger` a rebuild runs -- and a name remembered from
+        before such a move would go on naming the adapter next door for the life of the process.
       '';
     };
 

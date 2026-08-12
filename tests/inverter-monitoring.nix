@@ -373,6 +373,14 @@ nixpkgs.lib.nixos.runTest {
     machine.start()
     machine.wait_for_unit("multi-user.target")
 
+    # The two serial-less adapters CONTEST one by-id link, and udev re-picks the winner on every
+    # event touching either of them. multi-user is not the end of that: the coldplug trigger only
+    # enqueues, and on an emulated aarch64 node its backlog is still being worked tens of seconds
+    # after the target is up -- long enough that the producer, started at boot, reads the
+    # directory mid-flight. Settling here is what makes "who owns the shared name" a fixed fact
+    # for the rest of the file rather than one that moves between two reads of it.
+    machine.succeed("udevadm settle --timeout=180")
+
     with subtest("two of the three adapters collide on one by-id name"):
         machine.wait_until_succeeds(
             "test -e /dev/ttyUSB0 && test -e /dev/ttyUSB1 && test -e /dev/ttyUSB2"
@@ -458,6 +466,11 @@ nixpkgs.lib.nixos.runTest {
         # Two devices claim `shared_by_id` and only one owns the symlink, so whether the
         # inverter has a by-id name at all depends on which of them won. Both outcomes are
         # correct; reporting the OTHER device's name would not be.
+        #
+        # A fresh cycle first, so the name being compared was resolved after the settle above
+        # rather than at whatever the link said when the producer connected. The producer re-reads
+        # it every cycle precisely because that value does not keep.
+        next_status()
         owner = machine.succeed(
             f"basename $(readlink -f /dev/serial/by-id/{shared_by_id})"
         ).strip()
