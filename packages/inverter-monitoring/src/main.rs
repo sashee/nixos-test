@@ -192,8 +192,9 @@ struct Session {
     /// The by-path key: what the remembered-device file holds and what `inverter.device`
     /// reports. Unique per physical port whatever the chip says about itself.
     device: String,
-    /// The by-id name, when udev could make one. Reported for recognisability only.
-    device_name: Option<String>,
+    /// What was opened. Kept so the by-id name can be re-resolved from it every cycle -- see
+    /// [`discover::by_id_of`] for why that name is not safe to remember.
+    tty: PathBuf,
     connected_at: Instant,
     discarded_frames: u64,
     unsupported_commands: u64,
@@ -433,9 +434,13 @@ fn resource_attributes(options: &Options, session: &Session) -> Vec<(String, Val
     if let Some(boot_id) = read_trimmed("/proc/sys/kernel/random/boot_id") {
         attributes.push(("boot_id".to_owned(), Value::Str(boot_id)));
     }
+    // Resolved here rather than carried on the session: the link this reads can change owner
+    // under a running producer, and the point of reporting it is recognisability -- a name that
+    // now resolves to the adapter next to it is worse than none.
+    let device_name = discover::by_id_of(&options.by_id_dir, &session.tty);
     attributes.extend(record::identity_attributes(
         &session.device,
-        session.device_name.as_deref(),
+        device_name.as_deref(),
         &session.identity,
     ));
     attributes.extend(options.resource_attributes.iter().cloned());
@@ -500,8 +505,8 @@ fn run(options: Options) -> Result<(), String> {
     write_remembered(&options.state_dir, &candidate.path_id);
 
     let mut session = Session {
-        device: candidate.path_id.clone(),
-        device_name: candidate.by_id.clone(),
+        device: candidate.path_id,
+        tty: candidate.tty,
         connected_at: Instant::now(),
         discarded_frames: 0,
         unsupported_commands: 0,
@@ -595,7 +600,7 @@ mod tests {
     fn session() -> Session {
         Session {
             device: "platform-xhci-hcd.0-usb-0:1:1.0-port0".to_owned(),
-            device_name: Some("usb-1a86_USB2.0-Ser_-if00-port0".to_owned()),
+            tty: PathBuf::from("/dev/ttyUSB0"),
             connected_at: Instant::now(),
             discarded_frames: 0,
             unsupported_commands: 0,

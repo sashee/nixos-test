@@ -108,6 +108,17 @@ fn links_by_target(dir: &Path) -> std::collections::BTreeMap<PathBuf, String> {
     links
 }
 
+/// The by-id name udev currently has for `tty`, if any.
+///
+/// Re-read on every use rather than remembered from discovery: two adapters with the same
+/// descriptors contest one by-id name, and udev re-arbitrates the winner on every event touching
+/// either of them -- the coldplug backlog at boot, or a `udevadm trigger` from a rebuild, is
+/// enough to move it. A name captured once at connect can therefore end up naming the OTHER
+/// device, which is worse than reporting no name at all.
+pub fn by_id_of(by_id_dir: &Path, tty: &Path) -> Option<String> {
+    links_by_target(by_id_dir).remove(&target_key(tty))
+}
+
 /// What identifies a device across the three directories. The final path component, so a link
 /// resolved to `/dev/ttyUSB0` matches the `/dev` entry of the same name.
 fn target_key(path: &Path) -> PathBuf {
@@ -393,6 +404,32 @@ mod tests {
         // Only one of them could keep the shared by-id link, and that is fine: it is reported,
         // never matched on.
         assert_eq!(found.iter().filter(|c| c.by_id.is_some()).count(), 1);
+    }
+
+    /// The contested link moves, and the reported name has to move with it.
+    ///
+    /// udev re-arbitrates a symlink that two devices claim on every event touching either of
+    /// them, so the winner at discovery is not the winner forever. A producer that remembered
+    /// the name from discovery would keep publishing a name that now resolves to the adapter
+    /// next to its own -- which is what a CI run caught, in both directions on two attempts.
+    #[test]
+    fn a_by_id_name_that_changes_owner_is_reported_against_the_new_one() {
+        const SHARED: &str = "usb-1a86_USB2.0-Ser_-if00-port0";
+        let tree = Tree::new("moving-link");
+        tree.device("ttyUSB0", &["pci-usb-0:1:1.0-port0"], Some(SHARED))
+            .device("ttyUSB1", &["pci-usb-0:2:1.0-port0"], Some(SHARED));
+
+        let by_id_dir = tree.root.join("dev/serial/by-id");
+        let tty = |name: &str| tree.root.join("dev").join(name);
+        // ttyUSB0 was written first, so it holds the link; ttyUSB1's `symlink` lost the race.
+        assert_eq!(by_id_of(&by_id_dir, &tty("ttyUSB0")), Some(SHARED.to_owned()));
+        assert_eq!(by_id_of(&by_id_dir, &tty("ttyUSB1")), None);
+
+        // What udev does when it picks the other claimant.
+        std::fs::remove_file(by_id_dir.join(SHARED)).expect("fixture unlink");
+        std::os::unix::fs::symlink(tty("ttyUSB1"), by_id_dir.join(SHARED)).expect("fixture relink");
+        assert_eq!(by_id_of(&by_id_dir, &tty("ttyUSB0")), None);
+        assert_eq!(by_id_of(&by_id_dir, &tty("ttyUSB1")), Some(SHARED.to_owned()));
     }
 
     /// The real Pi publishes both `...-usb-...` and `...-usbv2-...` for one port.
