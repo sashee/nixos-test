@@ -333,7 +333,15 @@ nixpkgs.lib.nixos.runTest {
 
 
     def next_status():
-        """Wait for a status record newer than the one in the store right now."""
+        """Wait for one more status record to land.
+
+        NOT a way to wait for the effect of something the test just did. The row that lands next
+        may have been read off the wire before it: the producer posts at the end of a cycle and
+        the collector forwards on its own flush schedule, so at any moment there is a record in
+        flight that predates whatever the test has just changed. Waiting for an effect means
+        retrying on the value it changes -- `changed`, `cleared`, `corrupted` and `naked` below
+        are all that shape.
+        """
         before = len(statuses())
         retry(lambda _: len(statuses()) > before)
         return latest()
@@ -467,10 +475,9 @@ nixpkgs.lib.nixos.runTest {
         # inverter has a by-id name at all depends on which of them won. Both outcomes are
         # correct; reporting the OTHER device's name would not be.
         #
-        # A fresh cycle first, so the name being compared was resolved after the settle above
-        # rather than at whatever the link said when the producer connected. The producer re-reads
-        # it every cycle precisely because that value does not keep.
-        next_status()
+        # Both sides of the comparison are reads of a link that settled before the first subtest
+        # ran, and the producer resolves the name afresh on every cycle rather than remembering
+        # it from connect -- so there is no window here for the two to have seen different owners.
         owner = machine.succeed(
             f"basename $(readlink -f /dev/serial/by-id/{shared_by_id})"
         ).strip()
@@ -499,7 +506,18 @@ nixpkgs.lib.nixos.runTest {
         ).strip())
         machine.succeed("systemctl restart inverter-monitoring.service")
         machine.wait_for_unit("inverter-monitoring.service")
-        next_status()
+
+        # Waited for by what the restarted process itself says and does. A status record landing
+        # after the restart proves nothing about which process produced it -- a cycle read off the
+        # wire beforehand can still be in the collector's buffer, and on a slow node it routinely
+        # is, which had this reading the journal before the new process had probed anything.
+        machine.wait_until_succeeds(
+            "journalctl -u inverter-monitoring.service --no-pager "
+            f"| tail -n +{seen_lines + 1} | grep -q unsolicited"
+        )
+        machine.wait_until_succeeds(
+            f"grep -qxF {inverter_port} /var/lib/inverter-monitoring/last-device"
+        )
 
         fresh = machine.succeed(
             "journalctl -u inverter-monitoring.service --no-pager "
@@ -558,7 +576,16 @@ nixpkgs.lib.nixos.runTest {
     with subtest("a changing reading changes the record"):
         with lock:
             state["qpigs"] = qpigs(battery="49.80", load="077")
-        body = next_status()["body"]
+
+        # By value, not by "one more record". The cycle in flight when this line runs read QPIGS
+        # under the OLD fixture, and it is that record which lands next -- CI caught exactly
+        # that, a row carrying 54.2 from the cycle whose wire read fell in the same instant as
+        # this assignment. Which record carries the new value is not the claim; that it lands is.
+        def changed(_):
+            return latest()["body"]["battery_voltage_volts"] == 49.8
+
+        retry(changed)
+        body = latest()["body"]
         assert body["battery_voltage_volts"] == 49.8, body
         assert body["output_load_percent"] == 77, body
 
@@ -568,7 +595,11 @@ nixpkgs.lib.nixos.runTest {
         bits[17] = ord("1")  # eeprom_fault
         with lock:
             state["qpiws"] = bytes(bits)
-        next_status()
+
+        def asserted(_):
+            return latest()["body"]["warnings_asserted_count"] == 2
+
+        retry(asserted)
 
         body = latest()["body"]
         assert body["warnings_asserted_count"] == 2, body
@@ -751,6 +782,12 @@ nixpkgs.lib.nixos.runTest {
         with lock:
             state["mute"] = False
         machine.wait_until_succeeds("systemctl is-active --quiet inverter-monitoring.service")
-        next_status()
+        # A cycle that read something, not merely one more record: every cycle of the silence
+        # above published too, with its fields null, so "one more record" would be satisfied by
+        # the mute rather than by the recovery from it.
+        def answering(_):
+            return latest()["body"]["battery_voltage_volts"] is not None
+
+        retry(answering)
   '';
 }
