@@ -101,6 +101,8 @@ let
     cfg.sysfsRoot
     "--hwmon-root"
     cfg.hwmonRoot
+    "--usb-devices-root"
+    cfg.usbDevicesRoot
     "--profiles-dir"
     cfg.profilesDir
     "--success-dir"
@@ -307,6 +309,21 @@ in
         `system.sensor` is a record no test could assert anything about -- and the sweep's real
         subject is exactly the shapes a guest lacks: chips without a `_label`, two chips sharing
         a `name`, and the `_alarm` spellings.
+      '';
+    };
+
+    usbDevicesRoot = lib.mkOption {
+      type = lib.types.path;
+      default = "${cfg.sysfsRoot}/bus/usb/devices";
+      defaultText = lib.literalExpression ''"''${config.common.systemMetrics.sysfsRoot}/bus/usb/devices"'';
+      description = ''
+        Directory of USB devices to sweep for `system.usb` and `system.usb_port`.
+
+        Separate from [](#opt-common.systemMetrics.sysfsRoot) for the same reason as
+        [](#opt-common.systemMetrics.hwmonRoot): a QEMU guest's USB tree is a root hub and nothing
+        else, so the shapes worth asserting on are exactly the ones a guest lacks -- a nested hub,
+        an interface whose driver is unbound, and a port holding a device that never enumerated
+        (which has a port directory but no device directory at all).
       '';
     };
 

@@ -127,6 +127,10 @@ nixpkgs.lib.nixos.runTest {
       # the shapes that matter and that no single real machine has all of: a chip with no
       # `_label`, two chips sharing a `name`, and both `_alarm` spellings.
       hwmonRoot = "/run/fixture-hwmon";
+      # Same reasoning for USB: a guest has a root hub and nothing else, so the shapes that
+      # matter -- a nested hub, an unconfigured device, and a port whose device never enumerated
+      # -- have to be built rather than found.
+      usbDevicesRoot = "/run/fixture-usb";
       # There is no /etc/nixos in a VM, so the deployed default would leave the three common_*
       # fields null and untested. This fixture is the shape the real stubs produce -- note it
       # pins no branch, so `common_ref` is null on the hosts too.
@@ -330,6 +334,95 @@ nixpkgs.lib.nixos.runTest {
         ]
 
 
+    def build_usb_fixture():
+        # A guest's USB tree is a root hub and nothing else. This reproduces the shapes measured
+        # on the two real machines plus the one that matters most and that neither has on demand:
+        # a port holding a device that never enumerated, which has a port directory and no device
+        # directory at all. That is the case a device-list-only metric reports as "nothing here".
+        root = "/run/fixture-usb"
+        machine.succeed(
+            f"mkdir -p {root}/usb3/3-0:1.0/usb3-port1 {root}/usb3/3-0:1.0/usb3-port2 "
+            f"{root}/3-1/3-1:1.0/tty/ttyUSB0 {root}/3-2/3-2:1.0 {root}/3-2/3-2:1.0/3-2-port1 "
+            f"{root}/drivers/ftdi_sio {root}/drivers/hub",
+            # The flat directory the collector actually reads: real sysfs symlinks every device
+            # and interface into it, and the nesting above is what the port walk needs.
+            f"ln -sfn usb3 {root}/usb3-link",
+        )
+        for name, target in [
+            ("3-0:1.0", "usb3/3-0:1.0"),
+            ("3-1", "3-1"),
+            ("3-1:1.0", "3-1/3-1:1.0"),
+            ("3-2", "3-2"),
+            ("3-2:1.0", "3-2/3-2:1.0"),
+        ]:
+            machine.succeed(f"ln -sfn {target} {root}/{name}")
+
+        # Root hub: reachable as `usb3` while its interface implies `3-0`. A record that carried
+        # the implied name would join to no device, which is what `canonical_device_path` is for.
+        machine.succeed(
+            f"echo 3 > {root}/usb3/busnum",
+            f"echo 1d6b > {root}/usb3/idVendor",
+            f"echo 0002 > {root}/usb3/idProduct",
+            f"echo 1 > {root}/usb3/devnum",
+            f"echo 480 > {root}/usb3/speed",
+            f"printf ' 2.00\\n' > {root}/usb3/version",
+            f"echo 2 > {root}/usb3/maxchild",
+            f"echo 1 > {root}/usb3/authorized",
+            f"echo 0mA > {root}/usb3/bMaxPower",
+            f"echo 1 > {root}/usb3/bConfigurationValue",
+            f"echo 1 > {root}/usb3/bNumConfigurations",
+            f"echo 42 > {root}/usb3/urbnum",
+            f"mkdir -p {root}/usb3/power && echo active > {root}/usb3/power/runtime_status",
+            f"echo 09 > {root}/usb3/3-0:1.0/bInterfaceClass",
+            f"echo 00 > {root}/usb3/3-0:1.0/bInterfaceNumber",
+            f"ln -sfn ../../drivers/hub {root}/usb3/3-0:1.0/driver",
+        )
+        # 3-1: a low-speed serial converter. `1.5` is the value that a whole-number speed field
+        # would silently reject, and the tty is at `tty/ttyUSB0` -- one level down, which is where
+        # the node search has to reach.
+        machine.succeed(
+            f"echo 3 > {root}/3-1/busnum",
+            f"echo 0403 > {root}/3-1/idVendor",
+            f"echo 6001 > {root}/3-1/idProduct",
+            f"echo BG00Q7OM > {root}/3-1/serial",
+            f"echo FTDI > {root}/3-1/manufacturer",
+            f"echo 14 > {root}/3-1/devnum",
+            f"echo 1.5 > {root}/3-1/speed",
+            f"echo 100mA > {root}/3-1/bMaxPower",
+            # Enumerated but never configured: exactly `can't set config #1`.
+            f"echo 0 > {root}/3-1/bConfigurationValue",
+            f"echo 1 > {root}/3-1/bNumConfigurations",
+            f"echo ff > {root}/3-1/3-1:1.0/bInterfaceClass",
+            f"echo 00 > {root}/3-1/3-1:1.0/bInterfaceNumber",
+            f"echo 2 > {root}/3-1/3-1:1.0/bNumEndpoints",
+            f"ln -sfn ../../drivers/ftdi_sio {root}/3-1/3-1:1.0/driver",
+            f"echo 188:0 > {root}/3-1/3-1:1.0/tty/ttyUSB0/dev",
+        )
+        # 3-2: a nested hub, so its port name takes the `.`-joined form (3-2-port1 -> 3-2.1) that
+        # differs from a root hub's (usb3-port1 -> 3-1).
+        machine.succeed(
+            f"echo 3 > {root}/3-2/busnum",
+            f"echo 05e3 > {root}/3-2/idVendor",
+            f"echo 4 > {root}/3-2/maxchild",
+            f"echo 09 > {root}/3-2/3-2:1.0/bInterfaceClass",
+            f"echo 00 > {root}/3-2/3-2:1.0/bInterfaceNumber",
+            f"echo not attached > {root}/3-2/3-2:1.0/3-2-port1/state",
+            f"echo 0 > {root}/3-2/3-2:1.0/3-2-port1/over_current_count",
+        )
+        # port1 holds 3-1; port2 holds a device that never enumerated -- `powered` with no device
+        # directory anywhere, plus the kernel's own give-up flag set.
+        machine.succeed(
+            f"echo configured > {root}/usb3/3-0:1.0/usb3-port1/state",
+            f"echo 0 > {root}/usb3/3-0:1.0/usb3-port1/over_current_count",
+            f"echo hotplug > {root}/usb3/3-0:1.0/usb3-port1/connect_type",
+            f"echo 0 > {root}/usb3/3-0:1.0/usb3-port1/disable",
+            f"echo no > {root}/usb3/3-0:1.0/usb3-port1/early_stop",
+            f"echo powered > {root}/usb3/3-0:1.0/usb3-port2/state",
+            f"echo 3 > {root}/usb3/3-0:1.0/usb3-port2/over_current_count",
+            f"echo yes > {root}/usb3/3-0:1.0/usb3-port2/early_stop",
+        )
+
+
     def build_hwmon_fixture():
         # Reproduces the shapes measured on the two real machines, which no single one of them
         # has all of. Two chips are deliberately both named "nvme": their records are otherwise
@@ -370,6 +463,7 @@ nixpkgs.lib.nixos.runTest {
     start_all()
     machine.wait_for_unit("multi-user.target")
     build_hwmon_fixture()
+    build_usb_fixture()
     # Type=notify on both, so `active` means each socket is bound and accepting.
     machine.wait_for_unit("mp-collector.service")
     machine.wait_for_unit("monitoring-platform.service")
@@ -545,6 +639,9 @@ nixpkgs.lib.nixos.runTest {
             "system.unit",
             "system.timer",
             "system.journal",
+            "system.usb",
+            "system.usb.interface",
+            "system.usb_port",
         }, f"unexpected measurement types: {sorted(types)}"
         # Sets, not sorted lists: the record COUNT is no longer fixed, because how many units are
         # failing and how many units logged in the window both vary between two runs seconds
@@ -804,13 +901,95 @@ nixpkgs.lib.nixos.runTest {
     with subtest("journal counts are per unit and per severity"):
         noisy = by_attr(measurements, "system.journal", "unit", "test-noisy.service")
         assert len(noisy) == 1, f"a unit that logged errors was not counted: {noisy}"
-        assert noisy[0]["body"] == {"warning": 1, "err": 2, "crit": 1}, noisy
+        assert noisy[0]["body"] == {
+            "warning": 1, "err": 2, "crit": 1, "window_seconds": 900,
+        }, noisy
 
         # Quiet units produce no record at all, which is what keeps this from being 300 rows of
         # zeroes every fifteen minutes.
         assert not by_attr(measurements, "system.journal", "unit", "mp-collector.service"), (
             "a unit that logged nothing should not produce a journal record"
         )
+
+
+    with subtest("a root hub is reported under the directory name that can be joined to"):
+        # Its interface implies a device at `3-0`, but the directory is `usb3`. If either record
+        # carried the implied name the join would find nothing and every field read from it would
+        # be null -- so both the device and its interface must say `usb3`.
+        hub = by_attr(measurements, "system.usb", "path", "usb3")
+        assert len(hub) == 1, f"the root hub was not reported: {hub}"
+        assert hub[0]["body"]["ports"] == 2, hub
+        assert hub[0]["body"]["max_power_ma"] == 0, hub
+        # The kernel pads `version` to a fixed width; the leading space must not reach the value.
+        assert hub[0]["body"]["usb_version"] == "2.00", hub
+
+        assert not by_attr(measurements, "system.usb", "path", "3-0"), (
+            "the root hub's implied path must not be reported as a device of its own"
+        )
+        hub_if = by_attr(measurements, "system.usb.interface", "path", "usb3")
+        assert len(hub_if) == 1, f"the root hub's interface did not join to it: {hub_if}"
+        assert hub_if[0]["body"]["driver"] == "hub", hub_if
+
+    with subtest("an interface is a sub measurement, never a device"):
+        for interface in ["3-0:1.0", "3-1:1.0", "3-2:1.0"]:
+            assert not by_attr(measurements, "system.usb", "path", interface), (
+                f"{interface} is an interface and must not be reported as a device"
+            )
+
+    with subtest("a low-speed device keeps its fractional speed"):
+        # 1.5 Mbit/s is what a whole-number field would reject or truncate to 1, which would make
+        # every mouse and keyboard either missing or wrong.
+        converter = by_attr(measurements, "system.usb", "path", "3-1")
+        assert len(converter) == 1, f"the converter was not reported: {converter}"
+        assert converter[0]["body"]["speed_mbps"] == 1.5, converter
+        assert converter[0]["body"]["max_power_ma"] == 100, converter
+        assert converter[0]["attributes"]["record.attributes.serial"] == "BG00Q7OM", converter
+
+    with subtest("a device that enumerated but was never configured says so"):
+        # `can't set config #1` leaves a device present, addressed and unusable. Without this
+        # field the record is indistinguishable from a healthy one.
+        converter = by_attr(measurements, "system.usb", "path", "3-1")
+        assert converter[0]["body"]["configuration"] == 0, converter
+        assert converter[0]["body"]["configurations"] == 1, converter
+
+    with subtest("the node a serial converter owns is reported as a value"):
+        # Two converters swap ttyUSB numbers across re-enumeration, so this is the field that
+        # makes the swap visible. It lives one level down, under `tty/`.
+        converter_if = by_attr(measurements, "system.usb.interface", "path", "3-1")
+        assert len(converter_if) == 1, converter_if
+        assert converter_if[0]["body"]["nodes"] == "ttyUSB0", converter_if
+        assert converter_if[0]["body"]["driver"] == "ftdi_sio", converter_if
+        assert converter_if[0]["body"]["class"] == "ff", converter_if
+
+    with subtest("a port is reported whether or not a device enumerated on it"):
+        # The whole point of the type: port2 holds something that never enumerated, so there is
+        # no device directory for it anywhere. The port record is the only evidence it exists.
+        port2 = by_attr(measurements, "system.usb_port", "port", "usb3-port2")
+        assert len(port2) == 1, f"a port with no device was not reported: {port2}"
+        assert port2[0]["body"]["state"] == "powered", port2
+        assert port2[0]["body"]["over_current_count"] == 3, port2
+        assert port2[0]["body"]["early_stop"] is True, port2
+        # Nothing enumerated on it, so there is deliberately no device record to find.
+        assert not by_attr(measurements, "system.usb", "path", "3-2.1"), (
+            "a port with no enumerated device must not produce a device record"
+        )
+
+        port1 = by_attr(measurements, "system.usb_port", "port", "usb3-port1")
+        assert port1[0]["body"]["state"] == "configured", port1
+        assert port1[0]["body"]["early_stop"] is False, port1
+        assert port1[0]["attributes"]["record.attributes.connect_type"] == "hotplug", port1
+
+    with subtest("a port carries the device path it hosts, in both naming forms"):
+        # A root hub's port and a nested hub's port map onto device paths by different rules --
+        # `usb3-port1` -> `3-1` but `3-2-port1` -> `3-2.1`. Emitting the resolved path is what
+        # lets a consumer join a faulting port to whatever last enumerated on it.
+        port1 = by_attr(measurements, "system.usb_port", "port", "usb3-port1")
+        assert port1[0]["attributes"]["record.attributes.path"] == "3-1", port1
+        assert port1[0]["attributes"]["record.attributes.bus"] == "3", port1
+
+        nested = by_attr(measurements, "system.usb_port", "port", "3-2-port1")
+        assert len(nested) == 1, f"a nested hub's port was not reported: {nested}"
+        assert nested[0]["attributes"]["record.attributes.path"] == "3-2.1", nested
 
     with subtest("SMART is split by drive family, and the shared record carries only what both have"):
         nvme = by_attr(measurements, "system.drive", "sn", "NVME-SERIAL-1")
