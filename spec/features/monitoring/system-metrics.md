@@ -162,7 +162,7 @@ journal for every systemd unit that logged >= warning since (now - interval)
     * warning: number of 4 priority messages in the last period
     * err: number of 3 priority messages in the last period
     * crit: number of <=2 priority messages in the last period
-    * interval: the interval of the monitoring runs
+    * window_seconds: the interval of the monitoring runs
 
 #### usb
 
@@ -201,7 +201,11 @@ one per USB device currently attached, root hubs included
             * protocol: bInterfaceProtocol (with class 03: 01 = keyboard, 02 = mouse)
             * driver: basename of the bound driver symlink (usbhid | ftdi_sio | ch341 | hub)
             * endpoints: bNumEndpoints
-            * node: device node the interface currently owns, e.g. "ttyUSB0" -- a value, never an identifier: two converters swap nodes across re-enumeration
+            * nodes: device nodes the interface owns, comma-separated, e.g. "ttyUSB0" -- a value,
+              never an identifier: two converters swap nodes across re-enumeration. Empty when the
+              interface exposes none. Found by looking for a `dev` file on the interface's children
+              and one level below (a converter's is at `tty/ttyUSB0`), so network interfaces (no
+              `dev` file) and HID nodes (deeper) are not listed
 
 #### usb_port
 
