@@ -109,6 +109,10 @@ pub fn parse_btmon(text: &str) -> Scan {
     let mut pending_kind: Option<AddressKind> = None;
     let mut current: Option<String> = None;
     let mut in_mgmt = false;
+    // Only an advertising report describes something the host detected. Commands the host *sends*
+    // carry an `Address:` too -- `LE Set Random Address` announces the controller's own address --
+    // and reading those recorded the Pi itself as a nearby device, with no PDU type and no RSSI.
+    let mut in_report = false;
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -119,6 +123,7 @@ pub fn parse_btmon(text: &str) -> Scan {
         // block is not skipped and its duplicate RSSI is attributed to the previous device.
         if trimmed.starts_with('@') {
             in_mgmt = true;
+            in_report = false;
             current = None;
             pending_kind = None;
             pending_pdu = None;
@@ -126,10 +131,23 @@ pub fn parse_btmon(text: &str) -> Scan {
         }
         if trimmed.starts_with('<') || trimmed.starts_with('>') {
             in_mgmt = false;
+            in_report = false;
             current = None;
+            pending_kind = None;
+            pending_pdu = None;
             continue;
         }
         if in_mgmt {
+            continue;
+        }
+        // Both the legacy and the extended report carry advertisements.
+        if trimmed.starts_with("LE Advertising Report")
+            || trimmed.starts_with("LE Extended Advertising Report")
+        {
+            in_report = true;
+            continue;
+        }
+        if !in_report {
             continue;
         }
 
@@ -396,6 +414,35 @@ mod tests {
         let device = by_address(&scan, "AA:BB:CC:DD:EE:FF");
         assert_eq!(device.rssi_max, Some(-61), "the mgmt block's -42 leaked in");
         assert_eq!(device.report_count, 1, "the mgmt copy was counted as a second report");
+        assert_eq!(scan.reports_total, 1);
+    }
+
+    #[test]
+    fn the_hosts_own_address_is_not_a_detected_device() {
+        // Real capture from the Pi: bluetoothctl sets a random address for scanning, and that
+        // command carries an `Address:` line. Reading it recorded the host itself as a device with
+        // no PDU type and no RSSI, and counted it in devices_public.
+        let with_command = "\
+< HCI Command: LE Set Random Address (0x08|0x0005) plen 6    #1 [hci0] 1.996318
+        Address: 11:F3:CC:E1:91:02 (Non-Resolvable)
+> HCI Event: Command Complete (0x0e) plen 4                  #2 [hci0] 1.996626
+      LE Set Random Address (0x08|0x0005) ncmd 1
+        Status: Success (0x00)
+> HCI Event: LE Meta Event (0x3e) plen 43                    #7 [hci0] 3.139560
+      LE Advertising Report (0x02)
+        Event type: Connectable undirected - ADV_IND (0x00)
+        Address type: Public (0x00)
+        Address: C8:47:80:29:5E:3B (OUI C8-47-80)
+        RSSI: -46 dBm (0xd2)
+";
+        let scan = parse_btmon(with_command);
+        assert_eq!(
+            scan.advertisers.len(),
+            1,
+            "the host's own address was recorded as a device: {:?}",
+            scan.advertisers
+        );
+        assert_eq!(scan.advertisers[0].address, "C8:47:80:29:5E:3B");
         assert_eq!(scan.reports_total, 1);
     }
 
