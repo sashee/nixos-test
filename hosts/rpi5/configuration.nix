@@ -46,6 +46,7 @@ in
     ../../modules/auto-upgrade.nix
     ../../modules/monitoring.nix
     ../../modules/system-metrics.nix
+    ../../modules/detected-devices.nix
     ../../modules/inverter-monitoring.nix
     ../../modules/time-sync.nix
     ../../modules/connectivity-fallback.nix
@@ -180,7 +181,25 @@ in
     group = config.services.mp-collector.group;
   };
 
-  # Second producer: the solar inverter on the USB serial adapter, one record a minute. Same
+  # Second producer: the devices this host can see. USB is a passive sysfs read, so it runs on the
+  # metrics cadence. The radio collectors are on because this host's whole USB fault story this
+  # summer was invisible without them -- but note both scans take the radio off-channel, and wlan0
+  # is how this host is reached, so the interval is deliberately longer than the metrics one.
+  common.detectedDevices = {
+    enable = true;
+    socketPath = config.services.mp-collector.socketPath;
+    group = config.services.mp-collector.group;
+    usb.enable = true;
+    wifi.enable = true;
+    wifi.interface = "wlan0";
+    bluetooth.enable = true;
+    timerConfig = {
+      OnBootSec = "10min";
+      OnUnitActiveSec = "1h";
+    };
+  };
+
+  # Third producer: the solar inverter on the USB serial adapter, one record a minute. Same
   # wiring rule as above -- socket and group come from the collector, not from restated
   # defaults. Everything else (2400 8N1, the command set, the 15-minute restart) is protocol or
   # spec and lives in the module.

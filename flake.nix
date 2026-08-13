@@ -870,6 +870,12 @@
         rpi5-x86-system-metrics = rpi5X86Test ./tests/system-metrics.nix {
           machineModule = rpi5X86SystemModule;
         };
+        # The devices producer. `iw` and the BlueZ pair are faked -- a guest has no wireless phy
+        # and no Bluetooth controller at all -- so this runs the same on either arch, and runs
+        # here because this is the set that gets KVM.
+        rpi5-x86-detected-devices = rpi5X86Test ./tests/detected-devices.nix {
+          machineModule = rpi5X86SystemModule;
+        };
         # The emulated-USB one. `usb-serial` is a QEMU device, not a guest kernel feature, so
         # this runs the same on either arch -- but it is the set that runs under KVM, which
         # matters for a test whose subtests each wait out a poll interval.

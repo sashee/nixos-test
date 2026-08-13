@@ -1,0 +1,17 @@
+[package]
+name = "detected-devices"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Report USB, WiFi and Bluetooth devices this host can see to a local monitoring-platform receiver"
+
+[dependencies]
+# The same crate the receiver decodes with, so the message definitions cannot drift. Identical
+# reasoning (and identical features) to packages/system-metrics and packages/inverter-monitoring --
+# the producers speak the same wire format to the same socket.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs"] }
+prost = "0.14"
+
+[[bin]]
+name = "detected-devices"
+path = "src/main.rs"
