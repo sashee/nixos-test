@@ -145,7 +145,7 @@ pub fn parse_scan(text: &str) -> Vec<Bss> {
         }
         if let Some(rest) = trimmed.strip_prefix("* Authentication suites: ") {
             let suites: Vec<&str> = rest.split_whitespace().collect();
-            if suites.iter().any(|s| *s == "SAE") {
+            if suites.contains(&"SAE") {
                 bss.security = Some("wpa3".to_owned());
             }
             bss.auth_suites = Some(suites.join(","));
