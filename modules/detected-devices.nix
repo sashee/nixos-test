@@ -238,8 +238,15 @@ in
         ProtectSystem = "strict";
         # A scan is a privileged nl80211 operation even though it changes nothing, and it is
         # granted only when that collector is on, so the default sandbox is unchanged.
-        CapabilityBoundingSet = lib.optional cfg.wifi.enable "CAP_NET_ADMIN";
-        AmbientCapabilities = lib.optional cfg.wifi.enable "CAP_NET_ADMIN";
+        # A scan is a privileged nl80211 operation even though it changes nothing, and btmon needs
+        # CAP_NET_RAW to bind the HCI monitor channel -- without it it fails with "Failed to bind
+        # channel: Operation not permitted" and the capture comes back empty, which is
+        # indistinguishable from a quiet neighbourhood. Each is granted only where its collector is
+        # on, so the default sandbox is unchanged.
+        CapabilityBoundingSet = lib.optional cfg.wifi.enable "CAP_NET_ADMIN"
+          ++ lib.optional cfg.bluetooth.enable "CAP_NET_RAW";
+        AmbientCapabilities = lib.optional cfg.wifi.enable "CAP_NET_ADMIN"
+          ++ lib.optional cfg.bluetooth.enable "CAP_NET_RAW";
         ProtectHome = true;
         PrivateTmp = true;
         # NOT PrivateDevices: btmon opens the HCI monitor channel, and a private /dev would leave
