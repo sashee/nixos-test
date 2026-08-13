@@ -17,6 +17,7 @@ mod sensors;
 mod smart;
 mod systemd;
 mod uds;
+mod usb;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -39,6 +40,7 @@ struct Options {
     dry_run: bool,
     sysfs_root: PathBuf,
     hwmon_root: Option<PathBuf>,
+    usb_devices_root: Option<PathBuf>,
     profiles_dir: PathBuf,
     flake_lock: Option<PathBuf>,
     flake_input: String,
@@ -66,6 +68,8 @@ usage: system-metrics [options]
   --cpu-sample-seconds N    seconds between the two /proc/stat samples (default: 1)
   --sysfs-root PATH         root of sysfs, for the zram sweep (default: /sys)
   --hwmon-root PATH         hwmon class directory (default: <sysfs-root>/class/hwmon)
+  --usb-devices-root PATH   usb devices directory
+                            (default: <sysfs-root>/bus/usb/devices)
   --profiles-dir PATH       nix profiles directory (default: /nix/var/nix/profiles)
   --flake-lock PATH         deployed flake.lock; without it the common_* fields are null
   --flake-input NAME        flake.lock node to report (default: common)
@@ -98,6 +102,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
         dry_run: false,
         sysfs_root: PathBuf::from("/sys"),
         hwmon_root: None,
+        usb_devices_root: None,
         profiles_dir: PathBuf::from("/nix/var/nix/profiles"),
         flake_lock: None,
         flake_input: "common".to_owned(),
@@ -142,6 +147,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
             }
             "--sysfs-root" => options.sysfs_root = PathBuf::from(value("--sysfs-root")?),
             "--hwmon-root" => options.hwmon_root = Some(PathBuf::from(value("--hwmon-root")?)),
+            "--usb-devices-root" => {
+                options.usb_devices_root = Some(PathBuf::from(value("--usb-devices-root")?))
+            }
             "--profiles-dir" => options.profiles_dir = PathBuf::from(value("--profiles-dir")?),
             "--flake-lock" => options.flake_lock = Some(PathBuf::from(value("--flake-lock")?)),
             "--flake-input" => options.flake_input = value("--flake-input")?,
@@ -387,6 +395,284 @@ fn sensor_records(hwmon_root: &Path) -> Vec<Record> {
                     .with_attr("threshold", threshold.map(Value::Str))
                     .with_attr("device", device.clone().map(Value::Str))
                     .with_field(body_key, value),
+            );
+        }
+    }
+    records
+}
+
+/// Device nodes an interface owns.
+///
+/// The motivating case is a serial converter: `ttyUSB0` is a directory under the interface, and
+/// which converter owns which number changes across re-enumeration -- so recording it is how a
+/// consumer detects that two adapters have swapped nodes.
+///
+/// "Every subdirectory" was tried first and rejected: an interface's children also include the
+/// hub's `*-port*` entries, `physical_location`, `power`, `driver` and the `ep_*` endpoint
+/// descriptors, none of which is a node. What is used instead is the kernel's own marker -- a
+/// character or block device directory carries a `dev` file holding `major:minor`. That is checked
+/// on the interface's own children and one level below them, because subsystems vary in where they
+/// put the node (`ttyUSB0` sits directly under the interface, `video4linux/video0` one level down).
+///
+/// Two consequences of stopping at one level, both accepted: a network interface has no `dev` file
+/// at all, so a USB NIC contributes nothing, and HID nodes sit deeper still (under the interface's
+/// `0003:VVVV:PPPP.NNNN` child), so a mouse reports none either. Serial converters -- the case this
+/// field exists for -- put theirs at `tty/ttyUSB0`, one level down, and are covered.
+fn interface_nodes(interface_dir: &Path) -> Option<String> {
+    fn is_node(path: &Path) -> bool {
+        path.join("dev").is_file()
+    }
+
+    let entries = fs::read_dir(interface_dir).ok()?;
+    let mut nodes = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_node(&path) {
+            nodes.push(name);
+            continue;
+        }
+        // A subsystem directory: the node is inside it.
+        if let Ok(children) = fs::read_dir(&path) {
+            for child in children.filter_map(Result::ok) {
+                if child.file_type().is_ok_and(|t| t.is_dir()) && is_node(&child.path()) {
+                    nodes.push(child.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    // read_dir order is filesystem order; sorting keeps the value stable between runs so a
+    // consumer diffing two samples sees a real change rather than a reordering.
+    nodes.sort();
+    Some(nodes.join(","))
+}
+
+/// One `system.usb` per device in `/sys/bus/usb/devices`, plus one `system.usb.interface` per
+/// interface of each.
+///
+/// Root hubs are included: they are ordinary USB devices with descriptors and a `maxchild`, and
+/// leaving them out would orphan every `system.usb_port` record whose parent they are.
+///
+/// The identity is the topology path -- `3-1` names a physical socket. `devnum` deliberately stays
+/// in the body: it changes on every re-enumeration, so as an attribute a flapping device would mint
+/// a new series per cycle instead of showing up as churn on one.
+fn usb_records(usb_devices_root: &Path) -> Vec<Record> {
+    let Ok(entries) = fs::read_dir(usb_devices_root) else {
+        return Vec::new();
+    };
+
+    let mut names: Vec<String> =
+        entries.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+
+    let mut records = Vec::new();
+    for name in &names {
+        let path = usb_devices_root.join(name);
+        match usb::classify(name) {
+            Some(usb::Entry::Device) => {
+                records.push(
+                    Record::new("system.usb")
+                        .with_attr("path", Value::str(name))
+                        .with_attr("bus", read_trimmed(path.join("busnum")).map(Value::Str))
+                        .with_attr("vendor_id", read_trimmed(path.join("idVendor")).map(Value::Str))
+                        .with_attr("product_id", read_trimmed(path.join("idProduct")).map(Value::Str))
+                        .with_attr("serial", read_trimmed(path.join("serial")).map(Value::Str))
+                        .with_attr(
+                            "manufacturer",
+                            read_trimmed(path.join("manufacturer")).map(Value::Str),
+                        )
+                        .with_attr("product", read_trimmed(path.join("product")).map(Value::Str))
+                        .with_field(
+                            "devnum",
+                            read_trimmed(path.join("devnum"))
+                                .and_then(|v| v.parse::<i64>().ok())
+                                .map(Value::Int),
+                        )
+                        .with_field(
+                            "speed_mbps",
+                            read_trimmed(path.join("speed"))
+                                .and_then(|v| usb::parse_speed_mbps(&v))
+                                .map(Value::Double),
+                        )
+                        .with_field(
+                            "usb_version",
+                            read(path.join("version"))
+                                .and_then(|v| usb::parse_usb_version(&v))
+                                .map(Value::Str),
+                        )
+                        .with_field(
+                            "bcd_device",
+                            read_trimmed(path.join("bcdDevice")).map(Value::Str),
+                        )
+                        .with_field(
+                            "ports",
+                            read_trimmed(path.join("maxchild"))
+                                .and_then(|v| v.parse::<i64>().ok())
+                                .map(Value::Int),
+                        )
+                        .with_field(
+                            "authorized",
+                            read_trimmed(path.join("authorized"))
+                                .and_then(|v| usb::parse_zero_one(&v))
+                                .map(Value::Bool),
+                        )
+                        .with_field(
+                            "configuration",
+                            read_trimmed(path.join("bConfigurationValue"))
+                                .and_then(|v| v.parse::<i64>().ok())
+                                .map(Value::Int),
+                        )
+                        .with_field(
+                            "configurations",
+                            read_trimmed(path.join("bNumConfigurations"))
+                                .and_then(|v| v.parse::<i64>().ok())
+                                .map(Value::Int),
+                        )
+                        .with_field(
+                            "max_power_ma",
+                            read_trimmed(path.join("bMaxPower"))
+                                .and_then(|v| usb::parse_max_power_ma(&v))
+                                .map(Value::Int),
+                        )
+                        .with_field(
+                            "urbnum",
+                            read_trimmed(path.join("urbnum"))
+                                .and_then(|v| v.parse::<i64>().ok())
+                                .map(Value::Int),
+                        )
+                        .with_field(
+                            "runtime_status",
+                            read_trimmed(path.join("power/runtime_status")).map(Value::Str),
+                        ),
+                );
+            }
+            Some(usb::Entry::Interface { device_path }) => {
+                records.push(
+                    Record::new("system.usb.interface")
+                        .with_attr("path", Value::Str(usb::canonical_device_path(&device_path)))
+                        .with_attr(
+                            "interface",
+                            read_trimmed(path.join("bInterfaceNumber")).map(Value::Str),
+                        )
+                        .with_field(
+                            "class",
+                            read_trimmed(path.join("bInterfaceClass"))
+                                .and_then(|v| usb::parse_hex_byte(&v))
+                                .map(Value::Str),
+                        )
+                        .with_field(
+                            "subclass",
+                            read_trimmed(path.join("bInterfaceSubClass"))
+                                .and_then(|v| usb::parse_hex_byte(&v))
+                                .map(Value::Str),
+                        )
+                        .with_field(
+                            "protocol",
+                            read_trimmed(path.join("bInterfaceProtocol"))
+                                .and_then(|v| usb::parse_hex_byte(&v))
+                                .map(Value::Str),
+                        )
+                        .with_field(
+                            "driver",
+                            fs::canonicalize(path.join("driver")).ok().and_then(|target| {
+                                Some(Value::str(target.file_name()?.to_string_lossy()))
+                            }),
+                        )
+                        .with_field(
+                            "endpoints",
+                            read_trimmed(path.join("bNumEndpoints"))
+                                .and_then(|v| v.parse::<i64>().ok())
+                                .map(Value::Int),
+                        )
+                        .with_field("nodes", interface_nodes(&path).map(Value::Str)),
+                );
+            }
+            None => continue,
+        }
+    }
+    records
+}
+
+/// One `system.usb_port` per port of every hub, attached or not.
+///
+/// Ports are not children of `/sys/bus/usb/devices` -- they live under a hub's *interface*
+/// directory (`usb3/3-0:1.0/usb3-port1`), so they are found by walking the interfaces rather than
+/// the devices. Reporting them unconditionally is the point of the type: a device that cannot
+/// enumerate has no device directory at all, and the port row is then the only evidence that
+/// something is plugged in and failing.
+fn usb_port_records(usb_devices_root: &Path) -> Vec<Record> {
+    let Ok(entries) = fs::read_dir(usb_devices_root) else {
+        return Vec::new();
+    };
+
+    let mut interfaces: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| matches!(usb::classify(name), Some(usb::Entry::Interface { .. })))
+        .collect();
+    interfaces.sort();
+
+    let mut records = Vec::new();
+    for interface in &interfaces {
+        let interface_dir = usb_devices_root.join(interface);
+        let Ok(children) = fs::read_dir(&interface_dir) else {
+            continue;
+        };
+        let mut ports: Vec<String> = children
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| usb::port_device_path(name).is_some())
+            .collect();
+        ports.sort();
+
+        for port in &ports {
+            let path = interface_dir.join(port);
+            // The hub's own path is the interface name up to the colon; its bus number is the
+            // first component of that. Read from the hub's directory rather than reparsed, so a
+            // host that numbers buses unusually is still reported as it is.
+            let hub = usb::canonical_device_path(
+                interface.split(':').next().unwrap_or(interface),
+            );
+            records.push(
+                Record::new("system.usb_port")
+                    .with_attr("port", Value::str(port))
+                    .with_attr("path", usb::port_device_path(port).map(Value::Str))
+                    .with_attr(
+                        "bus",
+                        read_trimmed(usb_devices_root.join(hub).join("busnum")).map(Value::Str),
+                    )
+                    .with_attr(
+                        "connect_type",
+                        read_trimmed(path.join("connect_type")).map(Value::Str),
+                    )
+                    .with_attr(
+                        "peer",
+                        fs::canonicalize(path.join("peer")).ok().and_then(|target| {
+                            Some(Value::str(target.file_name()?.to_string_lossy()))
+                        }),
+                    )
+                    .with_field("state", read_trimmed(path.join("state")).map(Value::Str))
+                    .with_field(
+                        "over_current_count",
+                        read_trimmed(path.join("over_current_count"))
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .map(Value::Int),
+                    )
+                    .with_field(
+                        "disabled",
+                        read_trimmed(path.join("disable"))
+                            .and_then(|v| usb::parse_zero_one(&v))
+                            .map(Value::Bool),
+                    )
+                    .with_field(
+                        "early_stop",
+                        read_trimmed(path.join("early_stop"))
+                            .and_then(|v| usb::parse_yes_no(&v))
+                            .map(Value::Bool),
+                    ),
             );
         }
     }
@@ -702,6 +988,10 @@ fn journal_records(journalctl: &Path, window: Duration) -> Vec<Record> {
                 .with_field("warning", Value::Int(counts.warning as i64))
                 .with_field("err", Value::Int(counts.err as i64))
                 .with_field("crit", Value::Int(counts.crit as i64))
+                // Emitted so a consumer can turn the counts into a rate without knowing the
+                // timer's cadence, and in the body rather than the attributes: changing the
+                // window would otherwise re-key every unit's series.
+                .with_field("window_seconds", Value::Int(window.as_secs() as i64))
         })
         .collect()
 }
@@ -761,6 +1051,12 @@ fn run(options: Options) -> Result<(), String> {
         .clone()
         .unwrap_or_else(|| options.sysfs_root.join("class/hwmon"));
     records.extend(sensor_records(&hwmon_root));
+    let usb_devices_root = options
+        .usb_devices_root
+        .clone()
+        .unwrap_or_else(|| options.sysfs_root.join("bus/usb/devices"));
+    records.extend(usb_records(&usb_devices_root));
+    records.extend(usb_port_records(&usb_devices_root));
     if let Some(systemctl) = &options.systemctl {
         records.extend(unit_records(
             systemctl,
