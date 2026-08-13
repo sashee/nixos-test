@@ -49,6 +49,7 @@
 ### Monitoring-platform monitoring
 
 * [system metrics](./features/monitoring/system-metrics.md)
+* [detected devices](./features/monitoring/detected-devices.md)
 
 ### Inverter monitoring
 
