@@ -36,6 +36,24 @@ pub struct Bss {
     pub country: Option<String>,
 }
 
+/// Whether a token is a MAC address, i.e. an actual BSSID.
+///
+/// The check exists because `BSS ` is not a unique prefix in `iw` output: a block's own information
+/// elements include `BSS Load:` and, on an HE AP, `BSS Color:`. Treating those as delimiters starts
+/// a bogus block whose "bssid" is `Load:` -- and, worse, steals the remaining elements from the real
+/// BSS they belong to, so the record before it loses its security and capability fields. Matching on
+/// the shape of the value rather than on indentation keeps that independent of `iw`'s layout.
+fn looks_like_bssid(token: &str) -> bool {
+    let mut octets = 0;
+    for part in token.split(':') {
+        if part.len() != 2 || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        octets += 1;
+    }
+    octets == 6
+}
+
 /// Splits a scan into BSS blocks and parses each.
 ///
 /// Blocks are delimited by a line starting `BSS `, and everything until the next such line belongs
@@ -50,7 +68,7 @@ pub fn parse_scan(text: &str) -> Vec<Bss> {
         if let Some(rest) = trimmed.strip_prefix("BSS ") {
             // `BSS aa:bb:cc:dd:ee:ff(on wlan0) -- associated`
             let bssid = rest.split(['(', ' ']).next().unwrap_or("").to_owned();
-            if bssid.is_empty() {
+            if !looks_like_bssid(&bssid) {
                 continue;
             }
             out.push(Bss {
@@ -311,6 +329,31 @@ BSS 94:04:e3:80:42:30(on wlan0)
         let hidden = parse_scan("BSS aa:bb:cc:dd:ee:ff(on wlan0)\n\tSSID: \n\tfreq: 2412.0\n");
         assert_eq!(hidden[0].ssid, None);
         assert_eq!(hidden[0].frequency_mhz, Some(2412.0));
+    }
+
+    #[test]
+    fn bss_information_elements_are_not_bss_delimiters() {
+        // `BSS Load:` and `BSS Color:` are elements inside a block. Real output from the Pi: taking
+        // them as delimiters produced records whose bssid was "Load:" and left the real BSS without
+        // the fields that followed.
+        let with_elements = "\
+BSS 08:3f:bc:ea:39:41(on wlan0) -- associated
+\tsignal: -51.00 dBm
+\tBSS Load:
+\t\t * station count: 3
+\tRSN:\t * Version: 1
+\t\t * Authentication suites: PSK
+\tHE capabilities:
+\t\t * BSS Color: 12
+\tWPS:\t * Version: 1.0
+";
+        let bsses = parse_scan(with_elements);
+        assert_eq!(bsses.len(), 1, "an element started a bogus block: {bsses:?}");
+        // The fields after the element still belong to the real BSS.
+        assert_eq!(bsses[0].security.as_deref(), Some("wpa2"));
+        assert_eq!(bsses[0].auth_suites.as_deref(), Some("PSK"));
+        assert_eq!(bsses[0].wps, Some(true));
+        assert_eq!(bsses[0].standards.as_deref(), Some("he"));
     }
 
     #[test]
