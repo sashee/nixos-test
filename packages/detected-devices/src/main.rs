@@ -24,8 +24,11 @@ mod usb;
 mod wifi;
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use collect::{Record, Value};
@@ -33,6 +36,9 @@ use collect::{Record, Value};
 const DEFAULT_SOCKET: &str = "/run/monitoring-platform/monitoring-platform.sock";
 const INGEST_PATH: &str = "/v1/logs";
 const PROTOBUF: &str = "application/x-protobuf";
+
+/// How long the capture reader gets after the scan window closes. See [`drain`].
+const CAPTURE_GRACE: Duration = Duration::from_secs(2);
 
 struct Options {
     socket: PathBuf,
@@ -529,6 +535,25 @@ fn ble_skipped(adapter: &str, reason: &str, options: &Options) -> Vec<Record> {
         .with_field("far_count", Value::Null)]
 }
 
+/// Everything the reader has produced, waiting no longer than `grace` for a straggler.
+///
+/// The reader thread drops its sender at EOF, so a btmon that died with the pipe to itself ends this
+/// immediately; the grace is what a still-open pipe costs, a bounded delay instead of the unit's
+/// whole start timeout. Whatever arrived before the deadline is kept -- a truncated capture parses
+/// into the reports it does contain, which beats reporting none of them.
+fn drain(rx: &mpsc::Receiver<Vec<u8>>, grace: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + grace;
+    let mut capture = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(left) {
+            Ok(chunk) => capture.extend_from_slice(&chunk),
+            // Disconnected (the reader saw EOF) or the grace ran out.
+            Err(_) => break,
+        }
+    }
+    capture
+}
+
 /// One `ble_scan`, plus one `ble_device.public` or `ble_device.random` per address heard.
 ///
 /// The two device types are separate rather than one type with an `address_type` attribute because
@@ -561,6 +586,20 @@ fn ble_records(options: &Options) -> Vec<Record> {
         Err(_) => return ble_skipped(adapter, "adapter-down", options),
     };
 
+    // Drained as btmon writes rather than collected at the end: a pipe nobody is reading fills at
+    // 64 KiB and blocks the writer, which in a busy neighbourhood means advertisements are dropped
+    // for the rest of the window and the capture looks like a quiet one.
+    let mut stdout = monitor.stdout.take().expect("stdout is piped");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        while let Ok(read) = stdout.read(&mut buffer) {
+            if read == 0 || tx.send(buffer[..read].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+
     let started = Instant::now();
     // The duty cycle is pinned rather than inherited. BlueZ's own default is window == interval,
     // i.e. the radio listens continuously, which starves any active connection on the same
@@ -573,12 +612,13 @@ fn ble_records(options: &Options) -> Vec<Record> {
         .status();
     let duration_ms = started.elapsed().as_millis() as i64;
 
+    // kill then wait, not wait_with_output: the latter reads to EOF, and EOF needs every holder of
+    // the write end to close it, not just the process signalled here. Anything else sharing that
+    // descriptor -- a wrapper's surviving child -- would otherwise hold the run open until systemd's
+    // start timeout kills it.
     let _ = monitor.kill();
-    let capture = monitor
-        .wait_with_output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .unwrap_or_default();
+    let _ = monitor.wait();
+    let capture = String::from_utf8(drain(&rx, CAPTURE_GRACE)).unwrap_or_default();
 
     if scanned.map(|s| !s.success()).unwrap_or(true) {
         // A userspace host stack holding the controller on an HCI user channel makes scanning
@@ -738,5 +778,37 @@ fn main() -> ExitCode {
             eprint!("\n{USAGE}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reader_that_reached_eof_ends_the_drain_without_waiting_out_the_grace() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(b"one".to_vec()).unwrap();
+        tx.send(b"two".to_vec()).unwrap();
+        drop(tx);
+
+        let started = Instant::now();
+        assert_eq!(drain(&rx, Duration::from_secs(30)), b"onetwo".to_vec());
+        assert!(started.elapsed() < Duration::from_secs(1), "waited on a dropped sender");
+    }
+
+    /// The regression: btmon's pipe outlives the process that was killed -- a wrapper's surviving
+    /// child still holds the write end -- so the reader never sees EOF. That has to cost the grace
+    /// and nothing more, or the run hangs until systemd's start timeout kills it.
+    #[test]
+    fn a_pipe_that_never_closes_costs_the_grace_and_keeps_what_arrived() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(b"captured".to_vec()).unwrap();
+
+        let grace = Duration::from_millis(200);
+        let started = Instant::now();
+        assert_eq!(drain(&rx, grace), b"captured".to_vec());
+        assert!(started.elapsed() >= grace);
+        assert!(started.elapsed() < grace * 10, "the grace did not bound the wait");
     }
 }
