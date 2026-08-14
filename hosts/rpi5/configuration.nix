@@ -171,6 +171,27 @@ in
   # that same option, so there is no second switch to remember.)
   services.mp-collector.enable = true;
 
+  # The API key the collector presents to the receiver (SPEC.md §13). Set on the unit rather than
+  # through services.mp-collector.apiKeyFile, which wires LoadCredential= and so wants the key in
+  # plaintext on disk; every other secret here is a systemd-creds blob under /etc/credentials, and
+  # the collector looks for `mp-api-key` in $CREDENTIALS_DIRECTORY on its own, so the encrypted form
+  # costs nothing but this line. The credential id and the file name must both be `mp-api-key`: the
+  # name is authenticated into the blob, and decryption compares it.
+  #
+  # Provision out-of-band, ON THIS HOST -- there is no TPM on a Pi 5, so systemd-creds falls back to
+  # the host key alone (/var/lib/systemd/credential.secret) and a reimaged SD needs a fresh key.
+  # Issue it as the receiver's own user, or the WAL files it leaves in the 0700 state directory
+  # belong to root and the receiver cannot write again:
+  #   sudo -u monitoring-platform monitoring-platform create-api-key --label rpi5-collector \
+  #     --db /var/lib/monitoring-platform/measurements.db \
+  #   | systemd-creds encrypt --name=mp-api-key - /etc/credentials/mp-collector/mp-api-key
+  #
+  # Note this makes the blob load-bearing: the receiver only verifies-and-logs for now (§13 is
+  # rolling out in two steps), so a missing key would cost a warn line per batch rather than data --
+  # but an unreadable one fails this unit at start, and every producer on the host posts through it.
+  systemd.services.mp-collector.serviceConfig.LoadCredentialEncrypted =
+    [ "mp-api-key:/etc/credentials/mp-collector/mp-api-key" ];
+
   # First producer: CPU, memory, filesystem usage and the current NixOS generation, every 15
   # minutes. Wired from the collector's own options rather than restating its defaults, so the
   # socket path and group cannot drift apart -- and pointed at the collector rather than the
