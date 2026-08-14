@@ -112,6 +112,63 @@
       testNodeCollectorHealthOff = { lib, ... }: {
         services.mp-collector.healthIntervalSecs = lib.mkOverride 90 0;
       };
+      # The collector's API key, which hosts/rpi5 loads with LoadCredentialEncrypted= from
+      # /etc/credentials/mp-collector/mp-api-key. That blob is provisioned out-of-band on the Pi
+      # and a guest has none, and a named-but-missing LoadCredential* is FATAL: the unit dies at
+      # step CREDENTIALS with 243, Restart=on-failure brings it back every 5s, and any test that
+      # waits for it (tests/detected-devices.nix, tests/system-metrics.nix) waits out the global
+      # timeout instead. Every rpi node inherits the deployed config, so without this every rpi
+      # check runs with no collector -- silently, for the ones that only produce measurements.
+      #
+      # Provisioned rather than switched off, so the credential wiring itself is under test on
+      # both arches: the id, the file name and the --name= the blob is authenticated with all have
+      # to agree, and only a real decryption proves they do. The alternative (mkForce [ ]) would
+      # make the tests pass while leaving that untested.
+      #
+      # Encrypted at boot rather than at build time or during activation, and this is not a
+      # preference: the blob is bound to the host key in /var/lib/systemd/credential.secret, which
+      # does not exist in the store and is not yet set up while activation runs. systemd-creds
+      # creates it on first use, which is here. (Same reason tests/monitoring/*.nix and
+      # tests/restic.nix all provision their blobs from a boot-time oneshot.)
+      #
+      # The ordering is the fiddly part. mp-collector runs with DefaultDependencies=false because
+      # it must precede the time daemons, so it starts long before multi-user.target and a
+      # provisioning unit with ordinary dependencies cannot precede it -- worse, it would close an
+      # ordering cycle (mp-collector -> us -> sysinit.target -> systemd-timesyncd -> mp-collector)
+      # that systemd resolves by dropping a job of its choosing. Hence the same three lines the
+      # collector itself carries: no default dependencies, ordered after local-fs.target for a
+      # writable /etc and /var, and requiredBy= rather than a bare before= so the collector waits
+      # for the key to exist instead of merely being ordered after an attempt to write it.
+      #
+      # The token is well-formed but was never issued (SPEC.md §13 is `mpk_` + 16 hex + `.` + 64
+      # hex), so the receiver takes the batch and logs one "id was never issued" warning per
+      # request -- deliberate: it exercises the authenticated path the Pi will run, and the
+      # warning lands on monitoring-platform.service, which no test asserts is quiet.
+      # tests/system-metrics.nix does assert that of mp-collector.service, and the collector logs
+      # nothing about a key the receiver did not recognise.
+      testNodeCollectorApiKey = { pkgs, ... }: {
+        systemd.services.test-mp-api-key = {
+          description = "Provision the collector's API key credential (test nodes only)";
+          requiredBy = [ "mp-collector.service" ];
+          before = [ "mp-collector.service" ];
+          unitConfig = {
+            DefaultDependencies = false;
+            After = [ "local-fs.target" ];
+            RequiresMountsFor = [ "/etc" "/var/lib" ];
+          };
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+          script = ''
+            install -d -m 0700 /etc/credentials/mp-collector
+            printf '%s' 'mpk_dededededededede.abababababababababababababababababababababababababababababababab' \
+              | ${pkgs.systemd}/bin/systemd-creds encrypt --name=mp-api-key - \
+                  /etc/credentials/mp-collector/mp-api-key
+            chmod 0600 /etc/credentials/mp-collector/mp-api-key
+          '';
+        };
+      };
       # VM-test guest clock: tomorrow at 10:00 UTC. See lib/test-rtc-base.nix for why, and
       # for why it is a file rather than a binding here (a test file needs it for a helper
       # node that must share the clock of the node under test).
@@ -351,6 +408,7 @@
           testNodeTimeSyncOff
           testNodeClockGateOff
           testNodeCollectorHealthOff
+          testNodeCollectorApiKey
         ];
         _module.args = rpiSystemArgs;
       };
@@ -751,7 +809,7 @@
         # it is a no-op on x86 and forcing it back on would be a config the Pi never runs.
       };
       # The x86 counterpart of rpiNodeBase: same rpi5HostModules, same specialArgs
-      # re-supplied as _module.args, same two test-node overrides -- only the kernel
+      # re-supplied as _module.args, same test-node overrides -- only the kernel
       # differs. Note the top-level `nixpkgs`/`pkgs` here, not nixrpi/pkgsRpi.
       rpi5X86NodeBase = { ... }: {
         imports = rpi5HostModules ++ [
@@ -759,6 +817,7 @@
           testNodeTimeSyncOff
           testNodeClockGateOff
           testNodeCollectorHealthOff
+          testNodeCollectorApiKey
         ];
         # rpiSystemArgs verbatim: nixpkgs-stable is already the top-level `nixpkgs`, and
         # hosts/rpi5 derives its `system` from pkgs.stdenv.hostPlatform, so the nix-utils
