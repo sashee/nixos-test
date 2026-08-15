@@ -119,7 +119,9 @@ nixpkgs.lib.nixos.runTest {
     system.stateVersion = stateVersion;
   };
 
-  testScript = ''
+  # Concatenated rather than interpolated: `''` strips each literal's own indentation, so a
+  # `${...}` inside this one would dedent the helper's function bodies out of their own `def`s.
+  testScript = (import ../lib/test-mp-auth.nix) + ''
     import json
 
     doh_ipv4 = json.loads('${dohIpv4Json}')
@@ -134,8 +136,14 @@ nixpkgs.lib.nixos.runTest {
     def measurements(params="limit=5000"):
         # root is not in the monitoring-platform group but bypasses the 0750
         # runtime directory anyway, so no extra client user is needed.
+        #
+        # --fail-with-body, so an unauthenticated read is a failed command naming
+        # its status rather than a KeyError on the missing "measurements" field:
+        # curl exits 0 on a 401 without it. The header itself is empty until
+        # authenticate() has run, which is what makes forgetting it fail loudly.
         raw = machine.succeed(
-            f"curl -sS --unix-socket {RECEIVER} 'http://localhost/v1/measurements?{params}'"
+            f"curl -sS --fail-with-body {auth_header()}--unix-socket {RECEIVER} "
+            f"'http://localhost/v1/measurements?{params}'"
         )
         return json.loads(raw)["measurements"]
 
@@ -192,6 +200,14 @@ nixpkgs.lib.nixos.runTest {
     # Type=notify on both, so `active` means each socket is bound and accepting.
     machine.wait_for_unit("mp-collector.service")
     machine.wait_for_unit("monitoring-platform.service")
+
+    # Before the first subtest, because the first one to read the receiver is the
+    # unprovisioned-tunnel case below and every endpoint but /healthz refuses an
+    # unauthenticated request. Safe this early even though the tunnel is deliberately
+    # down: this talks to the receiver's database and the collector's own socket, not
+    # through the hop. It restarts the collector -- which discards the outbox, and must
+    # therefore precede every produce() in this file.
+    authenticate(machine)
 
     with subtest("the collector posts to the tunnel, not to the receiver"):
         # The claim the whole change rests on: nothing on this host names the
@@ -308,7 +324,7 @@ nixpkgs.lib.nixos.runTest {
         produce()
         machine.wait_until_succeeds(
             "test \"$(curl -sS --unix-socket"
-            f" {RECEIVER} 'http://localhost/v1/measurements?limit=1'"
+            f" {RECEIVER} {auth_header()}'http://localhost/v1/measurements?limit=1'"
             " | ${pkgs.jq}/bin/jq '.measurements | length')\" -ge 1",
             timeout=300,
         )
@@ -340,7 +356,7 @@ nixpkgs.lib.nixos.runTest {
         machine.wait_for_unit("mp-tunnel-server.service")
         machine.wait_until_succeeds(
             "test \"$(curl -sS --unix-socket"
-            f" {RECEIVER} 'http://localhost/v1/measurements?limit=5000'"
+            f" {RECEIVER} {auth_header()}'http://localhost/v1/measurements?limit=5000'"
             f" | ${pkgs.jq}/bin/jq '.measurements | length')\" -gt {before}",
             timeout=300,
         )
