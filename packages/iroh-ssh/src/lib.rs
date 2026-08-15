@@ -1,4 +1,7 @@
-//! Shared machinery for the iroh-ssh binaries: a minimal SSH-over-iroh pipe.
+//! Shared machinery for the iroh-ssh binaries: a minimal pipe over iroh. The
+//! `iroh-ssh-*` pair carries a TCP connection (the local sshd); the `iroh-uds-*`
+//! pair carries a unix socket. Nothing below is specific to either -- the
+//! forwarding is generic over any reader/writer pair.
 //!
 //! Wire-compatible with dumbpipe (same ALPN and handshake), so a stock
 //! `dumbpipe connect <ticket>` also works against the listener. Adapted from
@@ -29,6 +32,9 @@ pub const ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The credential filename the listener reads under `$CREDENTIALS_DIRECTORY`.
 const SECRET_FILE: &str = "iroh-secret";
 
+/// The credential filename the dialing side reads under `$CREDENTIALS_DIRECTORY`.
+const TICKET_FILE: &str = "iroh-ticket";
+
 fn parse_secret(hex: &str) -> Result<SecretKey> {
     SecretKey::from_str(hex.trim()).std_context("invalid secret key")
 }
@@ -52,6 +58,37 @@ pub fn load_secret(explicit: Option<PathBuf>) -> Result<SecretKey> {
         Ok(hex) => parse_secret(&hex),
         Err(_) => bail_any!("no secret key: set $CREDENTIALS_DIRECTORY, pass a key file, or set IROH_SECRET"),
     }
+}
+
+/// Load the ticket naming the endpoint to dial, trying in order: an explicit
+/// ticket, the systemd-exported `$CREDENTIALS_DIRECTORY/iroh-ticket` (how the
+/// service gets it), then the `IROH_TICKET` environment variable (manual runs).
+///
+/// The explicit form is the ticket itself rather than a path to one, unlike
+/// [`load_secret`]: a ticket is public, so it is the sort of thing that belongs
+/// on a command line, and passing one is how an operator dials by hand.
+///
+/// As with the secret there is no fallback: a credential that is present but
+/// unreadable or malformed fails the service rather than leaving it dialing
+/// somewhere else.
+pub fn load_ticket(explicit: Option<String>) -> Result<EndpointTicket> {
+    if let Some(ticket) = explicit {
+        return parse_ticket(&ticket);
+    }
+    if let Ok(dir) = std::env::var("CREDENTIALS_DIRECTORY") {
+        let path = PathBuf::from(dir).join(TICKET_FILE);
+        let ticket = std::fs::read_to_string(&path)
+            .with_std_context(|_| format!("failed to read credential {}", path.display()))?;
+        return parse_ticket(&ticket);
+    }
+    match std::env::var("IROH_TICKET") {
+        Ok(ticket) => parse_ticket(&ticket),
+        Err(_) => bail_any!("no ticket: set $CREDENTIALS_DIRECTORY, pass a ticket, or set IROH_TICKET"),
+    }
+}
+
+fn parse_ticket(ticket: &str) -> Result<EndpointTicket> {
+    EndpointTicket::from_str(ticket.trim()).std_context("invalid ticket")
 }
 
 /// Create an iroh endpoint that verifies relay TLS against the OS trust store
