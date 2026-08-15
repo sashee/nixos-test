@@ -47,10 +47,11 @@ let
       RESTIC_CACHE_DIR = "/var/cache/restic-backups-${backup.name}";
     };
 
+  # Only the backup phase itself comes from services.restic.backups; prune and check are
+  # emitted below, so the stopServices restart can sit between the backup and the prune.
   backupToResticConfig = name: rawBackup:
     let
       backup = rawBackup // { inherit name; };
-      requiredPrune = !backup.prune.ignoreErrors;
     in
     {
       inherit (backup) paths;
@@ -60,23 +61,70 @@ let
       package = wrapperFor name backup;
       passwordFile = "$CREDENTIALS_DIRECTORY/repository-password";
       repository = backup.repository;
-      pruneOpts = lib.optionals requiredPrune ([ "--group-by=" ] ++ backup.prune.opts);
-      runCheck = true;
-      checkOpts = [ ];
+      pruneOpts = [ ];
+      runCheck = false;
       timerConfig = backup.timerConfig;
       user = backup.user;
     };
 
-  ignoredPruneCommand = name: backup:
+  resticFor = name: backup: lib.getExe (wrapperFor name backup);
+
+  # prune.ignoreErrors becomes a "-" prefix (useful for append-only repositories): the
+  # commands still run, their failure does not fail the unit.
+  pruneCommands = name: backup:
     let
-      restic = lib.getExe (wrapperFor name backup);
+      restic = resticFor name backup;
+      prefix = lib.optionalString backup.prune.ignoreErrors "-";
+      opts = lib.concatStringsSep " " ([ "--group-by=" ] ++ backup.prune.opts);
     in
-    "-${restic} forget --prune --group-by= ${lib.concatStringsSep " " backup.prune.opts}";
+    [
+      "${prefix}${restic} unlock"
+      "${prefix}${restic} forget --prune ${opts}"
+    ];
+
+  # The units that were running when the backup started, so a unit someone stopped for
+  # maintenance is not started again. RuntimeDirectory exists before the first Exec* runs
+  # and is removed with the unit, so this cannot outlive a run.
+  stoppedUnitsFile = name: "/run/restic-backups-${name}/stopped-units";
+
+  stopScript = name: backup:
+    pkgs.writeShellApplication {
+      name = "restic-${name}-stop-services";
+      runtimeInputs = [ pkgs.coreutils pkgs.findutils config.systemd.package ];
+      text = ''
+        : > ${stoppedUnitsFile name}
+        for unit in ${lib.escapeShellArgs backup.stopServices}; do
+          if systemctl is-active --quiet "$unit"; then
+            printf '%s\n' "$unit" >> ${stoppedUnitsFile name}
+          fi
+        done
+        xargs -r systemctl stop -- < ${stoppedUnitsFile name}
+      '';
+    };
+
+  # Idempotent: the file is removed once the units are back, so the ExecStopPost safety net
+  # is a no-op after the ExecStart run succeeded, and retries it when it did not.
+  startScript = name: _backup:
+    pkgs.writeShellApplication {
+      name = "restic-${name}-start-services";
+      runtimeInputs = [ pkgs.coreutils pkgs.findutils config.systemd.package ];
+      text = ''
+        if [ -e ${stoppedUnitsFile name} ]; then
+          xargs -r systemctl start -- < ${stoppedUnitsFile name}
+          rm -f ${stoppedUnitsFile name}
+        fi
+      '';
+    };
 
   serviceConfigFor = name: rawBackup:
     let
       backup = rawBackup // { inherit name; };
       credentials = [ "repository-password" ] ++ backup.backend.credentials;
+      quiesce = backup.stopServices != [ ];
+      # "+" runs the command fully privileged: systemd then skips User=, the capability and
+      # namespacing options and the seccomp filters for it, which is what lets systemctl
+      # (root, AF_UNIX to PID 1) work from inside this otherwise sandboxed unit.
+      startServices = "+${lib.getExe (startScript name backup)}";
     in
     {
       environment = backendEnvironment backup;
@@ -110,8 +158,19 @@ let
         ProtectHome = "tmpfs";
         BindReadOnlyPaths = backup.paths;
         CacheDirectory = "restic-backups-${name}";
-      } // lib.optionalAttrs backup.prune.ignoreErrors {
-        ExecStartPost = ignoredPruneCommand name backup;
+
+        # Appended to what services.restic.backups generated (its preStart and its backup
+        # command come first): restart the stopped units, then prune, then check.
+        ExecStart = lib.mkAfter (
+          lib.optional quiesce startServices
+          ++ pruneCommands name backup
+          ++ [ "${resticFor name backup} check" ]
+        );
+      } // lib.optionalAttrs quiesce {
+        ExecStartPre = lib.mkAfter [ "+${lib.getExe (stopScript name backup)}" ];
+        # An ExecStart list aborts at the first failing command, so without this a failed
+        # backup would leave the units stopped.
+        ExecStopPost = lib.mkAfter [ startServices ];
       };
     };
 in
@@ -167,6 +226,22 @@ in
           description = "Patterns to exclude from backups.";
         };
 
+        stopServices = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          example = [ "monitoring-platform.service" ];
+          description = ''
+            Units to stop before the backup phase and start again as soon as the backup
+            finishes, before prune and check. Use this for services whose on-disk state is
+            only consistent while they are down, such as a database with a write-ahead log.
+
+            Only units that were running when the backup started are started again, so a
+            unit stopped for maintenance stays stopped. They are also started again when
+            the backup fails. Names are passed to systemctl verbatim, so "foo" means
+            "foo.service".
+          '';
+        };
+
         prune = {
           ignoreErrors = lib.mkOption {
             type = lib.types.bool;
@@ -199,6 +274,13 @@ in
   };
 
   config = lib.mkIf (cfg.backups != { }) {
+    assertions = lib.mapAttrsToList
+      (name: backup: {
+        assertion = !lib.any (unit: unit == "restic-backups-${name}" || unit == "restic-backups-${name}.service") backup.stopServices;
+        message = "common.restic.backups.${name}.stopServices must not contain its own unit, restic-backups-${name}.service.";
+      })
+      cfg.backups;
+
     services.restic.backups = lib.mapAttrs backupToResticConfig cfg.backups;
     systemd.services = lib.mapAttrs'
       (name: backup: lib.nameValuePair "restic-backups-${name}" (serviceConfigFor name backup))

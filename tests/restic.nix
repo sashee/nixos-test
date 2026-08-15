@@ -15,6 +15,27 @@ let
     "-cpu"
     "host,kvmclock=off"
   ];
+
+  # Stand-in for a service whose on-disk state is only consistent while it is down (the
+  # real case being the monitoring platform's WAL-mode SQLite DB). It records its own state
+  # into the directory that gets backed up, so the snapshot content proves whether it was
+  # running while restic read the files. StartLimitIntervalSec=0: the test stops and starts
+  # these back to back, which otherwise trips start-limit-hit.
+  quiescedService = unit:
+    let
+      record = state: ''
+        install -d -m 0755 -o backup-user -g users /home/backup-user/quiesce
+        printf '%s\n' '${state}' > /home/backup-user/quiesce/${unit}
+        chown backup-user:users /home/backup-user/quiesce/${unit}
+      '';
+    in
+    {
+      wantedBy = [ "multi-user.target" ];
+      unitConfig.StartLimitIntervalSec = 0;
+      serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+      script = record "running";
+      postStop = record "stopped";
+    };
 in
 nixpkgs.lib.nixos.runTest {
   name = "restic";
@@ -59,6 +80,9 @@ nixpkgs.lib.nixos.runTest {
         chown backup-user:users /home/backup-user/timer-rest/payload.txt
       '';
     };
+
+    systemd.services.quiesced-one = quiescedService "quiesced-one";
+    systemd.services.quiesced-two = quiescedService "quiesced-two";
 
     virtualisation.qemu.options = [
       "-rtc"
@@ -126,6 +150,17 @@ nixpkgs.lib.nixos.runTest {
         Persistent = true;
         RandomizedDelaySec = "1h";
       };
+    };
+
+    common.restic.backups.quiesce = resticLib.rest {
+      user = "backup-user";
+      credentialDirectory = "/etc/credentials/restic/quiesce";
+      url = "http://restic-backend:8002";
+      repository = "quiesce";
+      paths = [ "/home/backup-user/quiesce" ];
+      stopServices = [ "quiesced-one.service" "quiesced-two.service" ];
+      prune.opts = [ "--keep-last 99" ];
+      timerConfig = null;
     };
 
     common.restic.backups.s3 = resticLib.s3 {
@@ -294,7 +329,7 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("systemctl cat restic-backups-append-ignored.service | grep -F 'BindReadOnlyPaths=/home/backup-user/append-ignored'")
     client.succeed("systemctl cat restic-backups-append-ignored.service | grep -F 'backup --group-by='")
     client.succeed("systemctl cat restic-backups-append-ignored.service | grep -F 'forget --prune --group-by='")
-    client.succeed("systemctl cat restic-backups-append-ignored.service | grep -F ' check '")
+    client.succeed("systemctl cat restic-backups-append-ignored.service | grep -F ' check'")
     client.succeed("grep -F '${pkgs.restic}/bin/restic unlock' /nix/store/*-restic-append-ignored/bin/restic-append-ignored")
     client.succeed("systemctl cat restic-backups-normal-strict.service | grep -F 'forget --prune --group-by='")
     client.succeed("systemctl cat restic-backups-s3.service | grep -F 'LoadCredentialEncrypted=aws-access-key-id:/etc/credentials/restic/s3/aws-access-key-id'")
@@ -308,6 +343,25 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("test -f /etc/credentials/restic/timer-rest/backend-username")
     client.succeed("test -f /etc/credentials/restic/timer-rest/backend-password")
     client.succeed("test -f /home/backup-user/timer-rest/payload.txt")
+
+    # --- stopServices: hook shape and, above all, where the restart sits in the sequence ---
+    client.succeed("systemctl cat restic-backups-quiesce.service | grep -E '^ExecStartPre=\\+.*-stop-services'")
+    client.succeed("systemctl cat restic-backups-quiesce.service | grep -E '^ExecStopPost=\\+.*-start-services'")
+    client.succeed("systemctl cat restic-backups-quiesce.service | grep -F 'User=backup-user'")
+    client.fail("systemctl cat restic-backups-quiesce.service | grep -F 'RestrictAddressFamilies=' | grep -F 'AF_UNIX'")
+    # A backup without stopServices gets no hooks at all.
+    client.fail("systemctl cat restic-backups-normal-strict.service | grep -F '-services'")
+
+    # systemctl show prints one line per ExecStart command, in order: the restart must come
+    # after the backup and before the check, so the check does not run with the units down.
+    quiesce_cmds = client.succeed("systemctl show restic-backups-quiesce.service -p ExecStart --value").splitlines()
+
+    def only_index(cmds, needle):
+        matches = [i for i, cmd in enumerate(cmds) if needle in cmd]
+        assert len(matches) == 1, f"expected exactly one {needle!r} in {cmds}"
+        return matches[0]
+
+    assert only_index(quiesce_cmds, " backup ") < only_index(quiesce_cmds, "-start-services") < only_index(quiesce_cmds, " check"), quiesce_cmds
 
     client.succeed("systemctl start restic-backups-append-ignored.service || true")
     client.fail("systemctl is-failed --quiet restic-backups-append-ignored.service")
@@ -363,6 +417,51 @@ nixpkgs.lib.nixos.runTest {
     backend.succeed("set -- /var/lib/restic-normal/normal-strict/locks/*; test ! -e \"$1\"")
     client.succeed("systemctl start restic-backups-s3.service")
     assert service_result("s3") == "success"
+
+    # --- stopServices: the units are down for the backup phase and up again afterwards ---
+    write_rest_credentials("quiesce")
+    client.succeed("systemctl start quiesced-one.service quiesced-two.service")
+    client.succeed("grep -F running /home/backup-user/quiesce/quiesced-one")
+
+    client.succeed("systemctl start restic-backups-quiesce.service")
+    assert service_result("quiesce") == "success"
+    client.succeed("systemctl is-active --quiet quiesced-one.service")
+    client.succeed("systemctl is-active --quiet quiesced-two.service")
+    # RuntimeDirectory goes away with the unit, so the recorded set cannot leak into the next run.
+    client.fail("test -e /run/restic-backups-quiesce/stopped-units")
+
+    # The snapshot is what proves it: both units wrote "stopped" before restic read the files.
+    client.succeed("mkdir -p /tmp/restic-quiesce-restore")
+    client.succeed("RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY=rest:http://restic-backend:8002/quiesce ${pkgs.restic}/bin/restic restore latest --target /tmp/restic-quiesce-restore")
+    client.succeed("grep -F stopped /tmp/restic-quiesce-restore/home/backup-user/quiesce/quiesced-one")
+    client.succeed("grep -F stopped /tmp/restic-quiesce-restore/home/backup-user/quiesce/quiesced-two")
+
+    # A backup that fails after the units were stopped still brings them back (ExecStopPost).
+    # An unreadable source file makes restic exit non-zero from the backup command itself,
+    # i.e. after the ExecStartPre that stopped them; a bad credential would instead fail in
+    # the upstream preStart, before anything was stopped.
+    client.succeed("install -m 0000 -o root -g root /dev/null /home/backup-user/quiesce/unreadable")
+    client.fail("systemctl start restic-backups-quiesce.service")
+    assert service_result("quiesce") == "exit-code"
+    client.succeed("systemctl is-active --quiet quiesced-one.service")
+    client.succeed("systemctl is-active --quiet quiesced-two.service")
+    client.succeed("rm /home/backup-user/quiesce/unreadable")
+    client.succeed("systemctl reset-failed restic-backups-quiesce.service")
+
+    # A unit that was already stopped stays stopped.
+    client.succeed("systemctl stop quiesced-two.service")
+    client.succeed("systemctl start restic-backups-quiesce.service")
+    assert service_result("quiesce") == "success"
+    client.succeed("systemctl is-active --quiet quiesced-one.service")
+    client.fail("systemctl is-active --quiet quiesced-two.service")
+    client.succeed("systemctl start quiesced-two.service")
+
+    # Runtime confirmation of the ExecStart ordering asserted above: the last restart of
+    # quiesced-one precedes the check output of the run it belongs to.
+    quiesce_log = client.succeed("journalctl -b --no-pager -u restic-backups-quiesce.service -u quiesced-one.service").splitlines()
+    restarted = max(i for i, line in enumerate(quiesce_log) if "Finished" in line and "quiesced-one" in line)
+    checked = max(i for i, line in enumerate(quiesce_log) if "no errors were found" in line)
+    assert restarted < checked, quiesce_log[min(restarted, checked):]
 
     backend.succeed("set -- /var/lib/restic-normal/check-damaged/data/*/*; rm \"$1\"")
     client.fail("systemctl start restic-backups-check-damaged.service")
