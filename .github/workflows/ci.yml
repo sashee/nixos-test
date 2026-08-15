@@ -14,66 +14,72 @@ permissions:
   contents: read
 
 jobs:
-  rpi-kernel:
-    # The patched rpi kernel is in no binary cache, so it compiles from source
-    # (~1.5h measured). Its own job because the aarch64 checks are sharded and
-    # every shard boots this exact kernel: built once here and handed to the
-    # shards as an artifact, it costs 1.5h total instead of 1.5h per shard.
-    # The artifact is small (14 MB) -- a kernel output has almost no runtime
-    # references, so its closure is the single store path.
-    #
-    # Deliberately NOT a dependency of the x86 legs: `eval` reports a data drift
-    # in about a minute and must not queue behind a kernel compile.
-    name: rpi kernel
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          # This job builds incoming flake code; don't leave a token in .git.
-          persist-credentials: false
-
-      - uses: ./.github/actions/nix-runner
-
-      - name: Build + export rpi kernel
-        run: make export-rpi-kernel
-
-      - name: Upload rpi kernel cache
-        # file:// binary cache of the patched rpi kernel closure. Consumed by the
-        # checks-rpi5 shards below, and downloadable for a dev machine: import it
-        # with `make import-rpi-kernel CACHE=...` to run the rpi checks locally
-        # without the emulated kernel compile.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: rpi-kernel-cache
-          path: rpi-kernel-cache
-
   checks:
-    # One leg per x86 lib.checkSets entry (see the header there for what each
-    # covers). Each is an independently reported suite whose failures point
-    # straight at one config: `eval` at the pure-data and deployed-config
-    # assertions, the host sets at that host. rpi5-x86 finishes in minutes while
-    # the aarch64 shards are still going, so a config regression surfaces early;
-    # it does NOT replace them (see the header on rpi5X86Checks in flake.nix for
-    # what only aarch64 catches). The aarch64 rpi5 set is checks-rpi5 below --
-    # it needs the kernel artifact and is sharded, which the x86 legs are not.
-    name: checks (${{ matrix.name }})
+    # One leg per lib.checkSets entry (see the header there for what each covers),
+    # except rpi5, which gets one leg per shard. Each is an independently reported
+    # suite whose failures point straight at one config: `eval` at the pure-data
+    # and deployed-config assertions, the host sets at that host, `rpi5` at the
+    # Pi's real kernel on aarch64. The architecture and the shard split are just
+    # more matrix fields -- runs-on takes an expression -- so neither needs its own
+    # job. rpi5-x86 finishes in minutes while the rpi5 shards are still compiling
+    # the kernel, so a config regression surfaces early; it does NOT replace them
+    # (see the header on rpi5X86Checks in flake.nix for what only aarch64 catches).
+    #
+    # The rpi5 set is sharded because GitHub-hosted arm64 runners (free for public
+    # repos) expose no /dev/kvm: its guests run under TCG, 36 checks took 4.5h
+    # serially, and the single job hit the 6h limit on its last check. The shards
+    # run the same checks at the same CPU share -- nothing runs concurrently within
+    # a runner, which would eat into the TCG timing margin the ATTEMPTS retry
+    # already covers. Each shard compiles the patched rpi kernel itself (~1.5h; it
+    # is in no binary cache); building it once in a preceding job and passing it
+    # along as an artifact was measured to save nothing, because the compile is on
+    # the critical path either way -- serialized in front of the shards, or in
+    # parallel inside them.
+    #
+    # WHICH checks a shard runs is derived, never listed here: run-checks reads
+    # lib.checkSets.rpi5 and takes every n'th name (see the Makefile header), so a
+    # check added to the flake lands in a shard with no change to this file. HOW
+    # MANY shards there are is the one thing this file states, and `i/n` states it
+    # on every line: when resharding, the last number must match the number of
+    # rpi5 entries. Getting it too high is the one mistake nothing catches --
+    # run-checks rejects i > n, but four entries reading 1/5..4/5 would just drop
+    # the fifth shard's checks.
+    #
+    # The leg label is derived rather than spelled out, so it cannot drift from
+    # the fields it describes: `set`, plus the shard when there is one.
+    name: checks (${{ matrix.set }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
     strategy:
-      # Independent legs, as the separate jobs they replace were: one failing
+      # Independent legs, as the four separate jobs they replace were: one failing
       # suite must not cancel the others.
       fail-fast: false
       matrix:
         include:
-          - name: eval
-            system: x86_64-linux
+          - system: x86_64-linux
             set: eval
-          - name: anya-feher-laptop
-            system: x86_64-linux
+            runner: ubuntu-latest
+          - system: x86_64-linux
             set: anya-feher-laptop
-          - name: rpi5-x86
-            system: x86_64-linux
+            runner: ubuntu-latest
+          - system: x86_64-linux
             set: rpi5-x86
-    runs-on: ubuntu-latest
+            runner: ubuntu-latest
+          - system: aarch64-linux
+            set: rpi5
+            runner: ubuntu-24.04-arm
+            shard: 1/4
+          - system: aarch64-linux
+            set: rpi5
+            runner: ubuntu-24.04-arm
+            shard: 2/4
+          - system: aarch64-linux
+            set: rpi5
+            runner: ubuntu-24.04-arm
+            shard: 3/4
+          - system: aarch64-linux
+            set: rpi5
+            runner: ubuntu-24.04-arm
+            shard: 4/4
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout
@@ -88,11 +94,14 @@ jobs:
         # A single whole-flake eval peaks at ~15 GiB and OOMed the runner; the
         # make target instead evaluates and runs each check strictly one by
         # one, each in its own short-lived nix process.
-        run: make run-checks SYSTEM=${{ matrix.system }} SET=${{ matrix.set }}
+        #
+        # `|| '1/1'` so an unsharded set needs no shard field at all: the whole set
+        # is just shard 1 of 1, which is also what a local `make run-*-tests` does.
+        run: make run-checks SYSTEM=${{ matrix.system }} SET=${{ matrix.set }} SHARD=${{ matrix.shard || '1/1' }}
 
       - name: Upload VM artifacts
         # The desktop screenshots, from the host that deploys the desktop.
-        if: always() && matrix.name == 'anya-feher-laptop'
+        if: always() && matrix.set == 'anya-feher-laptop'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: plasma-screenshots
@@ -100,55 +109,6 @@ jobs:
             results/x86_64-linux/anya-feher-laptop-plasma-firefox/plasma-desktop.png
             results/x86_64-linux/anya-feher-laptop-plasma-firefox/firefox-page.png
           if-no-files-found: warn
-
-  checks-rpi5:
-    # lib.checkSets.rpi5 on the Pi's real kernel on aarch64, split across shards.
-    # GitHub-hosted arm64 runners (free for public repos) expose no /dev/kvm, so
-    # these guests run under TCG: 36 checks took 4.5h serially and the job hit the
-    # 6h limit on the last one. The shards are the same checks at the same CPU
-    # share, just on more runners -- nothing runs concurrently within a runner,
-    # which would eat into the TCG timing margin the ATTEMPTS retry already covers.
-    #
-    # Which checks a shard runs is derived, not listed: run-checks reads
-    # lib.checkSets.rpi5 and takes every SHARDS'th name (see the Makefile header),
-    # so a check added to the flake lands in a shard with no change here.
-    name: checks (rpi5 ${{ matrix.shard }}/4)
-    needs: [rpi-kernel]
-    strategy:
-      fail-fast: false
-      matrix:
-        # The only knob: add or remove entries to reshard. SHARDS below reads
-        # strategy.job-total, so the count is never written down twice.
-        shard: [1, 2, 3, 4]
-    runs-on: ubuntu-24.04-arm
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          # This job builds incoming flake code; don't leave a token in .git.
-          persist-credentials: false
-
-      - uses: ./.github/actions/nix-runner
-
-      - name: Download rpi kernel cache
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: rpi-kernel-cache
-          path: rpi-kernel-cache
-
-      - name: Import rpi kernel
-        # Puts the kernel store path in this runner's store so the checks find it
-        # built. Evaluates the expected outPath first, so if the kernel drifted
-        # from what rpi-kernel built this fails loudly instead of quietly
-        # recompiling for 1.5h (or, worse, testing a stale kernel).
-        #
-        # SUDO= because the runner is already a trusted nix user here (see the
-        # target's header); plain `sudo nix` would not resolve on this image.
-        run: make import-rpi-kernel CACHE=rpi-kernel-cache SUDO=
-
-      - name: Run checks (eval+run one check at a time)
-        run: make run-checks SYSTEM=aarch64-linux SET=rpi5 SHARD=${{ matrix.shard }} SHARDS=${{ strategy.job-total }}
 
   automerge:
     # DIY auto-merge: main has no branch protection (so update-flake.yml can
@@ -158,11 +118,8 @@ jobs:
     # below only skips runs that *started* draft, so the merge step re-reads it
     # live (see the frozen-payload note on the triggers above). Owner-only so
     # fork PRs (read-only token anyway) are never merged unreviewed.
-    # Each entry waits for every matrix leg of that job. rpi-kernel is listed
-    # even though checks-rpi5 already depends on it: a skipped `needs` skips the
-    # dependent, so a kernel failure would stop the merge either way, but naming
-    # it keeps "every leg passed" literally true of this list.
-    needs: [rpi-kernel, checks, checks-rpi5]
+    # One entry, but it waits for every matrix leg of that job.
+    needs: [checks]
     if: >
       github.event_name == 'pull_request' &&
       !github.event.pull_request.draft &&

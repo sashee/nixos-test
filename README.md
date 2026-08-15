@@ -842,22 +842,31 @@ For an arch-independent change, try `make run-rpi-x86-tests` above first — it 
 none of the setup below. The rest of this section is for the run that decides.
 
 The aarch64 checks boot the exact patched rpi kernel, which is in no binary
-cache — built from scratch it takes hours under emulation. CI builds it on the
-native arm64 runner and uploads its closure as the `rpi-kernel-cache` artifact,
-so a laptop can import it instead of compiling:
+cache — built from scratch it takes hours under emulation. CI does not publish
+it: every rpi shard compiles it natively on its own arm64 runner, because
+hoisting the build into a shared job and passing the result along was measured
+to save no wall clock (see "CI sharding" below).
+
+If you have access to any aarch64 machine that can build it (a Pi, an arm64
+cloud box, a CI runner you control), you can move the kernel to your laptop
+instead of compiling it under emulation:
 
 ```bash
-# once per flake.lock / kernel-config change:
-gh run download --name rpi-kernel-cache --dir rpi-kernel-cache
-make import-rpi-kernel CACHE=rpi-kernel-cache
+# on the aarch64 machine:
+make export-rpi-kernel                      # -> ./rpi-kernel-cache
 
+# on the laptop, once per flake.lock / kernel-config change:
+make import-rpi-kernel CACHE=rpi-kernel-cache
 make run-rpi-tests
 ```
 
-`import-rpi-kernel` first evaluates the kernel path locally, so it fails
-loudly if the artifact was produced from a different flake.lock or kernel
-config instead of importing a stale kernel. The host also needs to be able to
-build the remaining (cheap) aarch64 derivations, e.g. on NixOS:
+`import-rpi-kernel` first evaluates the kernel paths locally, so it fails
+loudly if the cache was produced from a different flake.lock or kernel
+config instead of importing a stale kernel. Both targets handle every output of
+the kernel derivation (`out`, `dev`, `modules`); moving only `out` leaves the
+derivation unbuilt as far as nix is concerned, and the next `run-rpi-tests`
+recompiles the kernel to produce the missing outputs. The host also needs to be
+able to build the remaining (cheap) aarch64 derivations, e.g. on NixOS:
 
 ```nix
 boot.binfmt.emulatedSystems = [ "aarch64-linux" ];
@@ -900,24 +909,35 @@ host-independent but still need a KVM leg: see the header on `rpi5X86Checks` in
 GitHub's hosted arm64 runners expose no `/dev/kvm`, so the aarch64 guests run
 under TCG. The `rpi5` set takes about 4.5 hours that way, and with the kernel
 build in front of it the single job hit GitHub's 6-hour limit on its last check.
-CI therefore builds the kernel in its own `rpi-kernel` job, uploads it as the
-`rpi-kernel-cache` artifact, and runs the set across four `checks (rpi5 N/4)`
-legs that import that kernel instead of rebuilding it.
+CI therefore runs the set across four `checks (rpi5 N/4)` legs, each compiling
+the kernel on its own runner. They are entries in the same matrix as the
+unsharded legs: a leg declares `shard: i/n` only if it wants splitting, and
+everything else defaults to `1/1`.
+
+Building the kernel once in a preceding job and handing it to the shards was
+measured to save nothing: the ~1.5-hour compile is on the critical path either
+way — serialized in front of the shards, or in parallel inside them — so the
+artifact bought about two minutes of upload/download in exchange for a job
+dependency and three extra kernel compiles' worth of runner time. The only thing
+that would lower that floor is a cache that survives *between* runs.
 
 The shards run the same checks at the same CPU share as before — nothing runs
 concurrently *within* a runner, which would eat into the TCG timing margin that
 `ATTEMPTS` already covers. Which checks a shard runs is derived, never listed:
 
 ```bash
-make run-checks SYSTEM=aarch64-linux SET=rpi5 SHARD=3 SHARDS=4
+make run-checks SYSTEM=aarch64-linux SET=rpi5 SHARD=3/4
 ```
 
 takes every 4th name of `lib.checkSets.rpi5`, so a check added to the flake lands
-in a shard with no CI change. The split is round-robin over the alphabetical
-names rather than balanced by runtime, which would mean checking in a table of
-measured durations that silently goes stale; raising `SHARDS` is the cheaper
-knob. Omitting both (the default, and what `make run-rpi-tests` does) runs the
-whole set. A shard that would run nothing is an error, not a green leg.
+in a shard with no CI change. `SHARD` is one `i/n` field rather than an index and
+a total, so the two cannot drift apart: a matrix listing `1/4 2/4 3/4 4/4` states
+the total on every line. The split is round-robin over the alphabetical names
+rather than balanced by runtime, which would mean checking in a table of measured
+durations that silently goes stale; raising `n` is the cheaper knob. Omitting
+`SHARD` (the default, `1/1`, and what `make run-rpi-tests` does) runs the whole
+set. A malformed `SHARD`, an `i` outside `1..n`, or a shard that would run nothing
+is an error, not a green leg.
 
 Each check's output lands under `results/<system>/<check-name>`, e.g.:
 
