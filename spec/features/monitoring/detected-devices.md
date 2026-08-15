@@ -1,7 +1,7 @@
 ## Device detection monitoring
 
 * depends on the [local collector](./local-collector.md) and sends the measurements to it
-* collects every 60 minutes and 10 minutes after boot
+* collects every 15 minutes
 * the metrics are in the `detected-devices` namespace, so each measurement is `detected-devices.<name>` and when there are sub measurement then `detected-devices.<name>.<sub>` (can be more
   levels)
 * all fields can be missing if the value can not be collected

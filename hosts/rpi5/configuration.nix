@@ -243,10 +243,10 @@ in
     group = config.services.mp-collector.group;
   };
 
-  # Second producer: the devices this host can see. USB is a passive sysfs read, so it runs on the
-  # metrics cadence. The radio collectors are on because this host's whole USB fault story this
-  # summer was invisible without them -- but note both scans take the radio off-channel, and wlan0
-  # is how this host is reached, so the interval is deliberately longer than the metrics one.
+  # Second producer: the devices this host can see, on the module's default 15-minute cadence the
+  # spec asks for -- the same one the metrics producer runs. The radio collectors are on because
+  # this host's whole USB fault story this summer was invisible without them; the price is that
+  # every tick takes the radio off-channel for a few seconds, and wlan0 is how this host is reached.
   common.detectedDevices = {
     enable = true;
     socketPath = config.services.mp-collector.socketPath;
@@ -255,10 +255,6 @@ in
     wifi.enable = true;
     wifi.interface = "wlan0";
     bluetooth.enable = true;
-    timerConfig = {
-      OnBootSec = "10min";
-      OnUnitActiveSec = "1h";
-    };
   };
 
   # Third producer: the solar inverter on the USB serial adapter, one record a minute. Same
