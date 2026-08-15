@@ -21,6 +21,18 @@ MAX_JOBS := auto
 # ATTEMPTS=2 still overrides it, to retry an x86 set by hand.
 ATTEMPTS = $(if $(filter aarch64-linux,$(SYSTEM)),2,1)
 
+# Shard SHARD of SHARDS: run every SHARDS'th check of the set. The check list is
+# still lib.checkSets.$(SET) read exactly as an unsharded run reads it, so the flake
+# stays the single source of truth -- a check added there lands in some shard on its
+# own, and CI never names a test. Round-robin over the (alphabetical) attrNames
+# rather than a duration-balanced split: balancing would mean checking in a table of
+# measured runtimes that silently goes stale, for a worst-shard difference measured
+# at ~20 minutes. Raising SHARDS is the cheaper knob.
+#
+# The default runs the whole set, so `make run-rpi-tests` on a laptop is unchanged.
+SHARDS := 1
+SHARD := 1
+
 .PHONY: host-vm update-flake run-eval-tests run-rpi-tests run-rpi-x86-tests run-host-tests run-checks export-rpi-kernel import-rpi-kernel
 
 # QEMU runner for a laptop host config; run it with ./result/bin/run-<host>-vm
@@ -62,18 +74,27 @@ export-rpi-kernel:
 	rm -rf rpi-kernel-cache
 	$(NIX) copy --to "file://$(CURDIR)/rpi-kernel-cache?compression=zstd" "$(FLAKE)#packages.aarch64-linux.rpi-test-kernel"
 
-# Laptop: import a CI-built rpi kernel (the downloaded+unzipped rpi-kernel-cache
-# artifact) into the local store so run-rpi-tests skips the kernel compile.
+# Import a CI-built rpi kernel (the downloaded+unzipped rpi-kernel-cache artifact)
+# into the local store so the rpi checks skip the kernel compile. Used by the
+# checks-rpi5 shards, which all boot the one kernel the rpi-kernel job built, and
+# on a laptop before run-rpi-tests.
 # Evaluates the kernel path locally first: if flake.lock or the kernel config
 # drifted from the CI run that produced the artifact, the copy fails with "path
-# not available" instead of silently importing a stale kernel. The artifact is
-# unsigned (CI has no signing key), hence --no-check-sigs via sudo.
+# not available" instead of silently importing a stale kernel.
+#
+# The artifact is unsigned (CI has no signing key), so the copy needs
+# --no-check-sigs, which in turn needs a trusted user -- hence sudo by default,
+# since a laptop's login user usually is not one. CI overrides it with SUDO=:
+# install-nix-action sets the runner as a trusted user (set_as_trusted_user
+# defaults to true), so sudo is unnecessary there, and it would likely not even
+# resolve `nix` -- Ubuntu's sudoers secure_path excludes the nix profile bin dir.
+SUDO := sudo
 import-rpi-kernel:
-	@test -n "$(CACHE)" || { echo "usage: make import-rpi-kernel CACHE=path/to/rpi-kernel-cache" >&2; exit 1; }
+	@test -n "$(CACHE)" || { echo "usage: make import-rpi-kernel CACHE=path/to/rpi-kernel-cache [SUDO=]" >&2; exit 1; }
 	set -euo pipefail; \
 	path=$$($(NIX) eval --raw "$(FLAKE)#packages.aarch64-linux.rpi-test-kernel.outPath"); \
 	echo "importing $$path"; \
-	sudo $(NIX) copy --no-check-sigs --from "file://$(abspath $(CACHE))" "$$path"
+	$(SUDO) $(NIX) copy --no-check-sigs --from "file://$(abspath $(CACHE))" "$$path"
 
 # Evaluating all tests in one nix process peaks at ~15 GiB (each NixOS machine
 # eval costs 1-2 GiB and the Boehm-GC evaluator never returns heap to the OS),
@@ -87,7 +108,9 @@ import-rpi-kernel:
 # SET names the lib.checkSets.<SET> to run; the checks are still addressed as
 # checks.$(SYSTEM).<name> (names are globally unique). Every check belongs to
 # exactly one set, so iterating the set - not checks.$(SYSTEM) - is what CI does,
-# and a check outside every set is never built by anyone.
+# and a check outside every set is never built by anyone. SHARD/SHARDS (see above)
+# narrow that iteration to one CI leg's slice of the set; they change which checks
+# this invocation runs, never how one runs.
 #
 # Each check gets up to ATTEMPTS runs (see above). A pass that needed a retry is
 # announced as "=== FLAKY: <name> ...", so grepping the CI log still shows which
@@ -95,11 +118,14 @@ import-rpi-kernel:
 # at the first check that exhausts its attempts, so a genuinely broken suite
 # costs one extra check run, not double.
 run-checks:
-	@test -n "$(SYSTEM)" -a -n "$(SET)" || { echo "usage: make run-checks SYSTEM=<system> SET=<set>; or one of run-eval-tests, run-rpi-tests, run-rpi-x86-tests, run-host-tests HOST=..." >&2; exit 1; }
+	@test -n "$(SYSTEM)" -a -n "$(SET)" || { echo "usage: make run-checks SYSTEM=<system> SET=<set> [SHARD=i SHARDS=n]; or one of run-eval-tests, run-rpi-tests, run-rpi-x86-tests, run-host-tests HOST=..." >&2; exit 1; }
+	@test "$(SHARDS)" -ge 1 -a "$(SHARD)" -ge 1 -a "$(SHARD)" -le "$(SHARDS)" 2>/dev/null || { echo "invalid SHARD=$(SHARD) SHARDS=$(SHARDS): expected 1 <= SHARD <= SHARDS" >&2; exit 1; }
 	set -euo pipefail; \
 	names_attr="lib.checkSets.$(SET)"; \
-	attrs=$$($(NIX) eval --raw "$(FLAKE)#$$names_attr" --apply 'cs: builtins.concatStringsSep "\n" (builtins.attrNames cs)'); \
-	echo "$$names_attr:" $$attrs; \
+	all=$$($(NIX) eval --raw "$(FLAKE)#$$names_attr" --apply 'cs: builtins.concatStringsSep "\n" (builtins.attrNames cs)'); \
+	attrs=$$(printf '%s\n' "$$all" | awk 'NR % $(SHARDS) == $(SHARD) % $(SHARDS)'); \
+	test -n "$$attrs" || { echo "shard $(SHARD)/$(SHARDS) of $$names_attr is empty (more shards than checks); a leg that runs nothing must not report green" >&2; exit 1; }; \
+	echo "$$names_attr shard $(SHARD)/$(SHARDS):" $$attrs; \
 	mkdir -p results/$(SYSTEM); \
 	for name in $$attrs; do \
 		attempt=1; \
@@ -114,4 +140,4 @@ run-checks:
 			attempt=$$((attempt + 1)); \
 		done; \
 	done; \
-	echo "=== all of lib.checkSets.$(SET) passed on $(SYSTEM)"
+	echo "=== all of lib.checkSets.$(SET) shard $(SHARD)/$(SHARDS) passed on $(SYSTEM)"

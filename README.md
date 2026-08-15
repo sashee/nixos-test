@@ -88,8 +88,8 @@ common.autoUpgrade.enable = false;
 ```
 
 `.github/workflows/update-flake.yml` updates `flake.lock` daily, runs every check
-set one check at a time (the same matrix and `make run-checks` invocation CI uses),
-and commits the lock file only when they all pass.
+set one check at a time (the same legs, sharding and `make run-checks` invocation
+CI uses), and commits the lock file only when they all pass.
 Hosts that point a local input at this repository can advance to those validated
 commits when their local upgrade timer updates `/etc/nixos/flake.lock`.
 
@@ -869,9 +869,9 @@ runtimes than CI's native arm64 runner.
 
 ## Running the tests
 
-The checks are partitioned into named sets (`lib.checkSets`), one per CI leg.
-Every check belongs to exactly one set — a check outside every set is never built
-by CI. Each suite runs with live logs, one check at a time (this is what CI runs;
+The checks are partitioned into named sets (`lib.checkSets`), one per CI leg —
+except `rpi5`, which CI splits across four legs (see "CI sharding" below). Every
+check belongs to exactly one set — a check outside every set is never built by CI. Each suite runs with live logs, one check at a time (this is what CI runs;
 evaluating every check in a single nix process peaks at ~15 GiB, so each check
 gets its own short-lived eval+build process):
 
@@ -894,6 +894,30 @@ desktop payload, for instance, is asserted by `anya-feher-laptop-common-desktop`
 The two exceptions ride the `rpi5-x86` leg under unprefixed names because they are
 host-independent but still need a KVM leg: see the header on `rpi5X86Checks` in
 `flake.nix`.
+
+### CI sharding
+
+GitHub's hosted arm64 runners expose no `/dev/kvm`, so the aarch64 guests run
+under TCG. The `rpi5` set takes about 4.5 hours that way, and with the kernel
+build in front of it the single job hit GitHub's 6-hour limit on its last check.
+CI therefore builds the kernel in its own `rpi-kernel` job, uploads it as the
+`rpi-kernel-cache` artifact, and runs the set across four `checks (rpi5 N/4)`
+legs that import that kernel instead of rebuilding it.
+
+The shards run the same checks at the same CPU share as before — nothing runs
+concurrently *within* a runner, which would eat into the TCG timing margin that
+`ATTEMPTS` already covers. Which checks a shard runs is derived, never listed:
+
+```bash
+make run-checks SYSTEM=aarch64-linux SET=rpi5 SHARD=3 SHARDS=4
+```
+
+takes every 4th name of `lib.checkSets.rpi5`, so a check added to the flake lands
+in a shard with no CI change. The split is round-robin over the alphabetical
+names rather than balanced by runtime, which would mean checking in a table of
+measured durations that silently goes stale; raising `SHARDS` is the cheaper
+knob. Omitting both (the default, and what `make run-rpi-tests` does) runs the
+whole set. A shard that would run nothing is an error, not a green leg.
 
 Each check's output lands under `results/<system>/<check-name>`, e.g.:
 

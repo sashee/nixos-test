@@ -1,0 +1,47 @@
+name: Nix CI runner
+description: >
+  Disk, Nix and swap setup shared by every job that builds this flake. Extracted
+  because three jobs (rpi-kernel, checks, checks-rpi5) need it identically and
+  GitHub Actions has no YAML anchors - inlining it would be three copies free to
+  drift, and a runner whose swap or free disk silently differs per leg is exactly
+  the kind of difference that reads as a flaky test.
+
+runs:
+  using: composite
+  steps:
+    - name: Reclaim disk space
+      shell: bash
+      run: |
+        # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
+        # || true so a path missing on the arm64 image is not fatal.
+        sudo rm -rf \
+          /usr/local/lib/android \
+          /usr/share/dotnet \
+          /opt/ghc \
+          /usr/local/.ghcup \
+          /usr/share/swift \
+          /usr/local/share/boost \
+          /opt/hostedtoolcache \
+          || true
+        sudo docker image prune --all --force || true
+        df -h
+
+    - name: Install Nix
+      uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
+      with:
+        enable_kvm: true
+        extra_nix_config: |
+          experimental-features = nix-command flakes
+          accept-flake-config = true
+
+    - name: Add swap
+      shell: bash
+      run: |
+        swapon --show || true
+        sudo fallocate -l 8G /mnt/ci-swapfile
+        sudo chmod 600 /mnt/ci-swapfile
+        sudo mkswap /mnt/ci-swapfile
+        sudo swapon /mnt/ci-swapfile
+        swapon --show
+        free -h
+        df -h
