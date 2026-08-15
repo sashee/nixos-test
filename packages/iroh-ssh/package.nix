@@ -12,7 +12,7 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
 
   meta = {
-    description = "Expose the local sshd over an iroh endpoint; wire-compatible with dumbpipe";
+    description = "Expose a local sshd or unix socket over an iroh endpoint; wire-compatible with dumbpipe";
     license = with lib.licenses; [ mit asl20 ];
     mainProgram = "iroh-ssh-connect";
   };

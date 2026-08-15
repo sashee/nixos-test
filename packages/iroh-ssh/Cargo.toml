@@ -3,7 +3,7 @@ name = "iroh-ssh"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Expose the local sshd over an iroh endpoint; wire-compatible with dumbpipe"
+description = "Expose a local sshd or unix socket over an iroh endpoint; wire-compatible with dumbpipe"
 
 [dependencies]
 iroh = { version = "1.0.0", default-features = false, features = ["tls-ring", "platform-verifier"] }
@@ -32,3 +32,11 @@ path = "src/bin/iroh-ssh-generate-secret.rs"
 [[bin]]
 name = "iroh-ssh-ticket"
 path = "src/bin/iroh-ssh-ticket.rs"
+
+[[bin]]
+name = "iroh-uds-listen"
+path = "src/bin/iroh-uds-listen.rs"
+
+[[bin]]
+name = "iroh-uds-connect"
+path = "src/bin/iroh-uds-connect.rs"

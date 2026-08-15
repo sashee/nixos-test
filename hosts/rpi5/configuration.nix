@@ -52,6 +52,7 @@ in
     ../../modules/connectivity-fallback.nix
     ../../modules/connectivity-watchdog.nix
     ../../modules/iroh-ssh.nix
+    ../../modules/monitoring-platform-tunnel.nix
     ../../modules/required-kernel-modules.nix
     # Same default-deny inbound firewall as the laptops (nftables backend,
     # allowPing=false + ICMP echo-drop pre-table). The iroh tunnel is unaffected;
@@ -151,11 +152,9 @@ in
   # test nodes build on -- not imported here.
   #
   # It listens on a unix socket only (RestrictAddressFamilies=AF_UNIX, enforced by the
-  # kernel), so there is no port for the default-deny firewall to open and no
-  # credential to provision: access is gated by the 0750 group-owned runtime directory,
-  # i.e. by membership of the `monitoring-platform` group. Remote devices still cannot
-  # reach it -- upstream's iroh transport has not landed -- so everything it stores today
-  # arrives from this host, through the collector below.
+  # kernel), so there is no port for the default-deny firewall to open: local access is
+  # gated by the 0750 group-owned runtime directory, i.e. by membership of the
+  # `monitoring-platform` group. Reaching it from off-box is the tunnel's job, below.
   services.monitoring-platform.enable = true;
 
   # The on-host collector every producer posts to, and the reason none of them names the
@@ -163,13 +162,15 @@ in
   # the timestamps once the true time is known -- which is what this RTC-less box needs, since
   # its clock reads near the epoch from boot until chrony first syncs.
   #
-  # Both of its defaults are already right for today's layout and are left unstated
-  # deliberately: forwardTo is the receiver's socket above, and forwardToGroup the group that
-  # opens it. When the receiver moves off this box, those two options are the ONLY change --
-  # every producer keeps posting to the same local socket. (Set forwardToGroup = null when
-  # forwardTo becomes an http:// URL; the module widens RestrictAddressFamilies itself, off
-  # that same option, so there is no second switch to remember.)
+  # It no longer posts to the receiver's socket: it posts to the tunnel's, which carries the
+  # bytes over iroh to the receiver. Both ends are on this host today, so this hop is a
+  # loopback that could have been a connect(2) -- which is the point. Running the split
+  # transport now, while a mistake is one `systemctl status` away, means moving the receiver
+  # off-box later changes no Nix at all: re-encrypt the client's iroh-ticket blob with the
+  # new host's ticket and restart. Nothing below, and no producer, has to know.
   services.mp-collector.enable = true;
+  services.mp-collector.forwardTo = config.common.mpTunnel.client.socketPath;
+  services.mp-collector.forwardToGroup = "mp-tunnel";
 
   # The API key the collector presents to the receiver (SPEC.md §13). Set on the unit rather than
   # through services.mp-collector.apiKeyFile, which wires LoadCredential= and so wants the key in
@@ -191,6 +192,35 @@ in
   # but an unreadable one fails this unit at start, and every producer on the host posts through it.
   systemd.services.mp-collector.serviceConfig.LoadCredentialEncrypted =
     [ "mp-api-key:/etc/credentials/mp-collector/mp-api-key" ];
+
+  # The two ends of the hop above (see modules/monitoring-platform-tunnel.nix). The server half
+  # answers on an iroh endpoint and forwards to the receiver's socket; the client half serves
+  # the socket the collector posts to and dials that endpoint. Separate credential directories
+  # because they hold different things -- an identity and an address -- and because the server's
+  # secret must not be the ssh tunnel's (both listeners answer the same ALPN, so one key would
+  # make sshd and the receiver indistinguishable to a dialer; the module asserts this).
+  #
+  # The tunnel authenticates nobody: anyone holding the endpoint id can open the pipe. The gate
+  # is the API key above, which the receiver checks on every batch.
+  #
+  # Provision out-of-band, ON THIS HOST, before deploying this -- a missing blob leaves the unit
+  # *skipped* by ConditionPathExists rather than failed, and the collector then spools to the SD
+  # with nothing obviously broken. The ticket is a pure function of the secret, so the second
+  # command can be re-run any time to recover it:
+  #   iroh-ssh-generate-secret \
+  #   | systemd-creds encrypt --name=iroh-secret - /etc/credentials/mp-tunnel/server/iroh-secret
+  #
+  #   systemd-creds decrypt --name=iroh-secret /etc/credentials/mp-tunnel/server/iroh-secret - \
+  #   | iroh-ssh-ticket /dev/stdin \
+  #   | systemd-creds encrypt --name=iroh-ticket - /etc/credentials/mp-tunnel/client/iroh-ticket
+  common.mpTunnel.server = {
+    enable = true;
+    credentialDirectory = "/etc/credentials/mp-tunnel/server";
+  };
+  common.mpTunnel.client = {
+    enable = true;
+    credentialDirectory = "/etc/credentials/mp-tunnel/client";
+  };
 
   # First producer: CPU, memory, filesystem usage and the current NixOS generation, every 15
   # minutes. Wired from the collector's own options rather than restating its defaults, so the

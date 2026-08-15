@@ -169,6 +169,25 @@
           '';
         };
       };
+      # The iroh tunnel hosts/rpi5 puts between the collector and the receiver
+      # (modules/monitoring-platform-tunnel.nix). Both halves need a provisioned credential, a
+      # reachable relay and endpoint-id discovery -- an entire impersonated n0 in the test, which
+      # tests/monitoring-platform-tunnel.nix builds and no other suite has. Left on, every rpi
+      # check that asserts a measurement arrived would instead be asserting that iroh works,
+      # and would fail: the units skip on ConditionPathExists and the collector spools.
+      #
+      # So the tunnel comes out and the collector is pointed back at the receiver's own socket,
+      # which is the path this hop replaced. Priority 90 for the reason the overrides above give:
+      # it must beat hosts/rpi5's normal-priority definitions while leaving mkForce free for the
+      # one suite that switches the tunnel back on.
+      testNodeMpTunnelOff = { config, lib, ... }: {
+        common.mpTunnel.server.enable = lib.mkOverride 90 false;
+        common.mpTunnel.client.enable = lib.mkOverride 90 false;
+        services.mp-collector.forwardTo =
+          lib.mkOverride 90 config.services.monitoring-platform.socketPath;
+        services.mp-collector.forwardToGroup =
+          lib.mkOverride 90 config.services.monitoring-platform.group;
+      };
       # VM-test guest clock: tomorrow at 10:00 UTC. See lib/test-rtc-base.nix for why, and
       # for why it is a file rather than a binding here (a test file needs it for a helper
       # node that must share the clock of the node under test).
@@ -409,6 +428,7 @@
           testNodeClockGateOff
           testNodeCollectorHealthOff
           testNodeCollectorApiKey
+          testNodeMpTunnelOff
         ];
         _module.args = rpiSystemArgs;
       };
@@ -696,6 +716,15 @@
         machineModule = rpiSystemModule;
         inherit dohStamps;
       };
+      # The one suite that switches testNodeMpTunnelOff back on, because it is the
+      # one that brings a relay and a discovery domain with it.
+      mpTunnelTestRpi = import ./tests/monitoring-platform-tunnel.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+        inherit dohStamps;
+      };
       bootClockTestRpi = import ./tests/boot-clock.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
@@ -732,6 +761,9 @@
         monitoring-iroh-ssh = monitoringIrohSshTestRpi;
         firewall = firewallTestRpi;
         iroh-ssh = irohSshTestRpi;
+        # Not "monitoring-platform-tunnel": the monitoring-platform-* names in this
+        # set are upstream's own suite, mapped in below, and this is not one of them.
+        mp-tunnel = mpTunnelTestRpi;
         restic = resticTestRpi;
         boot-clock = bootClockTestRpi;
         system-metrics = systemMetricsTestRpi;
@@ -818,6 +850,7 @@
           testNodeClockGateOff
           testNodeCollectorHealthOff
           testNodeCollectorApiKey
+          testNodeMpTunnelOff
         ];
         # rpiSystemArgs verbatim: nixpkgs-stable is already the top-level `nixpkgs`, and
         # hosts/rpi5 derives its `system` from pkgs.stdenv.hostPlatform, so the nix-utils
@@ -954,6 +987,10 @@
           machineModule = rpi5X86SystemModule;
         };
         rpi5-x86-iroh-ssh = rpi5X86Test ./tests/iroh-ssh.nix {
+          machineModule = rpi5X86SystemModule;
+          inherit dohStamps;
+        };
+        rpi5-x86-mp-tunnel = rpi5X86Test ./tests/monitoring-platform-tunnel.nix {
           machineModule = rpi5X86SystemModule;
           inherit dohStamps;
         };
