@@ -1473,9 +1473,10 @@
       checks.${system} = evalChecks // anyaFeherLaptopChecks // rpi5X86Checks;
       checks.aarch64-linux = aarch64TestResults;
       # The exact patched kernel every rpi check boots (rpiTestKernel pins the
-      # node to this package, so the outPath matches the checks). CI exports its
-      # closure as the rpi-kernel-cache artifact; `make import-rpi-kernel` loads
-      # it into a laptop's store so local rpi test runs skip the kernel compile.
+      # node to this package, so the outPath matches the checks). Exposed so it
+      # can be built on its own: `make export-rpi-kernel` packs it on an aarch64
+      # machine and `make import-rpi-kernel` loads it into a laptop's store, so
+      # local rpi test runs skip the kernel compile.
       packages.aarch64-linux.rpi-test-kernel = rpi5Base.config.boot.kernelPackages.kernel;
 
       packages.${system} = {
