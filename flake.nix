@@ -156,6 +156,13 @@
       # The receiver's package goes on PATH for that step: `create-api-key` is its CLI, and
       # hosts/rpi5 installs only git, so without this the tests have no way to mint a key. Test
       # nodes only -- the deployed Pi issues its key out-of-band and needs no such tool on PATH.
+      #
+      # Inert in the two monitoring-platform suites, which compose this via the rpi node but bring
+      # upstream's own harness with them: that harness points apiKeyFile at its own plaintext
+      # /etc/mp-api-key and beats hosts/rpi5's mkDefault, so the blob below is still provisioned and
+      # simply never read. Harmless, and not worth a switch -- but it does mean the credential
+      # wiring this fixture exists to exercise is under test in the rpi5 and rpi5-x86 producer
+      # checks, not in those two.
       testNodeCollectorApiKey = { pkgs, config, ... }: {
         environment.systemPackages = [ config.services.monitoring-platform.package ];
         systemd.services.test-mp-api-key = {
@@ -250,30 +257,46 @@
       # arch-independent, so pinning it here means a laptop reproduces it in minutes instead
       # of it only surfacing on hardware neither CI nor a laptop can emulate.
       #
-      # Deliberately NOT commonDesktopModule, which would be the more faithful node: it
-      # imports modules/nix-utils.nix, which puts the sandboxed nix-utils `sqlite3` into
-      # system-wide environment.systemPackages, so root's sqlite3 is a bubblewrap wrapper
-      # restricted to /tmp and the harness cannot open the receiver's database to count rows.
-      # hosts/rpi5 has no such collision (nix-utils is on the nixos user's PATH only), so that
-      # is a desktop artifact rather than a property worth asserting on. The producer over the
-      # real deployed path is covered on x86 by rpi5-x86-system-metrics, against hosts/rpi5 --
-      # a better target than the desktop config ever was, since the Pi is the host that
-      # deploys the receiver for real.
-      monitoringPlatformNodeX86 = { ... }: {
-        imports = [
-          "${monitoring-platform}/nix/module.nix"
-          ./modules/time-sync.nix
-          # modules/time-sync.nix reads common.systemMetrics.enable to default
-          # requireClockSync, so the option has to exist even though nothing enables it here.
-          ./modules/system-metrics.nix
-          # The real enable + floor, from the same binding every host uses, so the chrony
-          # configuration under test cannot drift from the deployed one.
-          timeSyncSettings
-        ];
-      };
+      # The node is rpi5X86QuiescedModule -- the same one every other check in this set uses, and
+      # the x86 twin of the rpiQuiescedSystemModule the aarch64 run below takes. That is the whole
+      # point of a "fast companion": it is only a mirror if it is built from the same host config.
+      #
+      # It was not, until 2026-08-15, and that cost a red CI run. This suite used to get a minimal
+      # node of its own -- upstream's module.nix plus modules/time-sync.nix and nothing else -- which
+      # never composed hosts/rpi5. So when hosts/rpi5 and upstream's own harness both came to define
+      # services.mp-collector.apiKeyFile, the resulting conflict was invisible here and failed only
+      # on aarch64, where the node does compose the deployed config. A mirror that omits the thing
+      # under test reports green for the arch it cannot see.
+      #
+      # The old node's stated reason for existing does not survive the move: it was chosen over
+      # commonDesktopModule because that pulls modules/nix-utils.nix, whose sandboxed `sqlite3`
+      # shadows root's and stops the harness reading the receiver's database. hosts/rpi5 has no such
+      # collision -- nix-utils is on the nixos user's PATH only -- so the objection was always to the
+      # desktop config specifically, and the comment already noted hosts/rpi5 was the better target.
       monitoringPlatformTestsX86 = import "${monitoring-platform}/nix/tests/lib.nix" {
-        inherit pkgs stateVersion;
-        machineModules = [ monitoringPlatformNodeX86 ];
+        inherit pkgs;
+        # Not the repo-level stateVersion: this node is the Pi's config, and stateVersion changes
+        # module defaults. See rpi5StateVersion for why it is read from a file rather than taken
+        # from rpi5Base, which would drag a nixos-raspberrypi eval into every x86 check process.
+        stateVersion = rpi5StateVersion;
+        machineModules = [
+          rpi5X86QuiescedModule
+          {
+            # Same reason as the aarch64 run: the harness sets no node hostName, so without one
+            # the rpi config's mkDefault ties with the framework's.
+            networking.hostName = "monitoring-platform-test";
+            virtualisation.memorySize = nixpkgs.lib.mkDefault 2048;
+            # The tunnel has no credential in a VM so the unit would only skip, but keep the node
+            # deterministic: nothing here is about remote access.
+            common.irohSsh.enable = nixpkgs.lib.mkForce false;
+            # Undo testNodeClockGateOff, which every rpi node inherits via rpi5X86NodeBase. This
+            # suite is the one that tests the gate -- its clock-gate case asserts the gate is on
+            # the unit at all, so an off switch here would make the case fail rather than skip --
+            # and it is also the only one that can satisfy it, because its harness gives the node
+            # a real NTP server.
+            services.monitoring-platform.clockGate.enable = nixpkgs.lib.mkForce true;
+          }
+        ];
       };
       dohStamps = import ./lib/doh-stamps.nix { lib = nixpkgs.lib; };
       ntsServers = import ./lib/nts-servers.nix { lib = nixpkgs.lib; };
