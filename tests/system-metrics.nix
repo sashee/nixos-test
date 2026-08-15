@@ -259,7 +259,10 @@ nixpkgs.lib.nixos.runTest {
     system.stateVersion = stateVersion;
   };
 
-  testScript = ''
+  # Concatenated rather than interpolated into the string below: `''` strips each literal's own
+  # indentation, so a `${...}` inside this one would dedent the helper's function bodies out of
+  # their own `def`s and stop the file parsing as python.
+  testScript = (import ../lib/test-mp-auth.nix) + ''
     import json
 
     SOCKET = "/run/monitoring-platform/monitoring-platform.sock"
@@ -269,8 +272,14 @@ nixpkgs.lib.nixos.runTest {
     def query(params):
         # root is not in the monitoring-platform group but bypasses the 0750 runtime
         # directory anyway, so the test needs no extra client user of its own.
+        #
+        # --fail-with-body, so an unauthenticated read is a failed command naming its status
+        # rather than a KeyError on the missing "measurements" field several frames later:
+        # curl exits 0 on a 401 without it. auth_header() is empty until authenticate() has
+        # run, which is what makes forgetting it fail here loudly.
         raw = machine.succeed(
-            f"curl -sS --unix-socket {SOCKET} 'http://localhost/v1/measurements?{params}'"
+            f"curl -sS --fail-with-body {auth_header()}--unix-socket {SOCKET} "
+            f"'http://localhost/v1/measurements?{params}'"
         )
         return json.loads(raw)["measurements"]
 
@@ -374,6 +383,14 @@ nixpkgs.lib.nixos.runTest {
     machine.wait_for_unit("mp-collector.service")
     machine.wait_for_unit("monitoring-platform.service")
     ntp.wait_for_unit("multi-user.target")
+
+    # Here and not later, for two reasons that both point at the same line. It restarts the
+    # collector, which discards the outbox -- and the first subtest below is precisely about what
+    # the collector is holding while the clock is unset, so a batch collected before this would be
+    # thrown away and the assertion would read an empty buffer. It also has to precede every
+    # query(), since the receiver refuses an unauthenticated read. After the receiver is up,
+    # because the key is issued into the database its StateDirectory= creates.
+    authenticate(machine)
 
     with subtest("the producer names the collector and nothing further downstream"):
         # The property the whole indirection exists for: when the receiver moves off this host,

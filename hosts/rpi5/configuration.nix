@@ -172,11 +172,10 @@ in
   services.mp-collector.forwardTo = config.common.mpTunnel.client.socketPath;
   services.mp-collector.forwardToGroup = "mp-tunnel";
 
-  # The API key the collector presents to the receiver (SPEC.md §13). Set on the unit rather than
-  # through services.mp-collector.apiKeyFile, which wires LoadCredential= and so wants the key in
-  # plaintext on disk; every other secret here is a systemd-creds blob under /etc/credentials, and
-  # the collector looks for `mp-api-key` in $CREDENTIALS_DIRECTORY on its own, so the encrypted form
-  # costs nothing but this line. The credential id and the file name must both be `mp-api-key`: the
+  # The API key the collector presents to the receiver (SPEC.md §13). apiKeyEncrypted is the
+  # module's default and is left unstated: the file is a systemd-creds blob like every other secret
+  # on this host, so the module wires LoadCredentialEncrypted= and systemd decrypts it in PID 1
+  # before the sandbox exists. The credential id and the file name must both be `mp-api-key`: the
   # name is authenticated into the blob, and decryption compares it.
   #
   # Provision out-of-band, ON THIS HOST -- there is no TPM on a Pi 5, so systemd-creds falls back to
@@ -187,11 +186,13 @@ in
   #     --db /var/lib/monitoring-platform/measurements.db \
   #   | systemd-creds encrypt --name=mp-api-key - /etc/credentials/mp-collector/mp-api-key
   #
-  # Note this makes the blob load-bearing: the receiver only verifies-and-logs for now (§13 is
-  # rolling out in two steps), so a missing key would cost a warn line per batch rather than data --
-  # but an unreadable one fails this unit at start, and every producer on the host posts through it.
-  systemd.services.mp-collector.serviceConfig.LoadCredentialEncrypted =
-    [ "mp-api-key:/etc/credentials/mp-collector/mp-api-key" ];
+  # This blob is load-bearing in both directions, and there is no longer a soft failure. §13 has
+  # finished rolling out: the receiver enforces on the read path as well as the write path, so a
+  # missing or unissued key costs DATA, not a warn line -- the collector keeps retrying a rejected
+  # batch, so nothing is dropped on the floor, but nothing lands either and the outbox grows. An
+  # unreadable blob is louder still: it fails this unit at start, and every producer on the host
+  # posts through it.
+  services.mp-collector.apiKeyFile = "/etc/credentials/mp-collector/mp-api-key";
 
   # The two ends of the hop above (see modules/monitoring-platform-tunnel.nix). The server half
   # answers on an iroh endpoint and forwards to the receiver's socket; the client half serves

@@ -140,13 +140,24 @@
       # writable /etc and /var, and requiredBy= rather than a bare before= so the collector waits
       # for the key to exist instead of merely being ordered after an attempt to write it.
       #
-      # The token is well-formed but was never issued (SPEC.md §13 is `mpk_` + 16 hex + `.` + 64
-      # hex), so the receiver takes the batch and logs one "id was never issued" warning per
-      # request -- deliberate: it exercises the authenticated path the Pi will run, and the
-      # warning lands on monitoring-platform.service, which no test asserts is quiet.
-      # tests/system-metrics.nix does assert that of mp-collector.service, and the collector logs
-      # nothing about a key the receiver did not recognise.
-      testNodeCollectorApiKey = { pkgs, ... }: {
+      # The token provisioned here is a PLACEHOLDER and is meant to be refused: it is well-formed
+      # (SPEC.md §13 is `mpk_` + 16 hex + `.` + 64 hex) but was never issued, so the receiver
+      # answers 401 and keeps nothing. That is now the whole of its job -- to be a decryptable
+      # credential of the right shape so the unit starts on time, and nothing more.
+      #
+      # It used to be the key the tests ran on, back when the receiver only verified and logged.
+      # It cannot be any more: §13 phase 2 enforces, on the read path as well as the write path,
+      # so an unissued key means no telemetry reaches the receiver at all. A real key cannot be
+      # issued here either -- the database it must be issued into does not exist until the
+      # receiver's StateDirectory= makes it, which is long after this unit runs. The three tests
+      # that read the receiver back therefore issue their own at test-script time and restart the
+      # collector onto it; see lib/test-mp-auth.nix, which explains the ordering that forces this.
+      #
+      # The receiver's package goes on PATH for that step: `create-api-key` is its CLI, and
+      # hosts/rpi5 installs only git, so without this the tests have no way to mint a key. Test
+      # nodes only -- the deployed Pi issues its key out-of-band and needs no such tool on PATH.
+      testNodeCollectorApiKey = { pkgs, config, ... }: {
+        environment.systemPackages = [ config.services.monitoring-platform.package ];
         systemd.services.test-mp-api-key = {
           description = "Provision the collector's API key credential (test nodes only)";
           requiredBy = [ "mp-collector.service" ];
