@@ -14,8 +14,9 @@ concurrency:
 
 jobs:
   lock:
-    # Update the lock file and publish it as an artifact. Kept small so the two
-    # long build jobs below can start in parallel as soon as the lock is ready.
+    # Update the lock file and publish it as an artifact. Kept small so the build
+    # jobs below can start as soon as the lock is ready: the x86 legs and the rpi
+    # kernel all fan out from here, and the rpi shards from the kernel.
     runs-on: ubuntu-latest
 
     steps:
@@ -45,39 +46,14 @@ jobs:
           path: flake.lock
           if-no-files-found: error
 
-  checks:
-    # Verify every check set against the UPDATED lock, one leg per
-    # lib.checkSets entry -- the same matrix ci.yml runs, because this workflow
-    # gates an UNREVIEWED auto-commit to main: whatever CI would run on a PR has
-    # to run here too, or a nixpkgs bump could land something the next PR then
-    # fails on. The rpi5 leg is not redundant with rpi5-x86 either -- it pins the
-    # aarch64 vendor kernel and nixos-raspberrypi's own nixpkgs, so it cannot see
-    # a bump that breaks hosts/rpi5 against THIS flake's nixpkgs.
-    name: checks (${{ matrix.name }})
-    needs: lock
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: eval
-            system: x86_64-linux
-            set: eval
-            runner: ubuntu-latest
-          - name: anya-feher-laptop
-            system: x86_64-linux
-            set: anya-feher-laptop
-            runner: ubuntu-latest
-          - name: rpi5-x86
-            system: x86_64-linux
-            set: rpi5-x86
-            runner: ubuntu-latest
-          # Builds the real rpi kernel from source; unlike ci.yml this workflow
-          # does not export it as an artifact, so run-checks builds it in place.
-          - name: rpi5
-            system: aarch64-linux
-            set: rpi5
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+  rpi-kernel:
+    # The rpi kernel against the UPDATED lock -- a bump is exactly what changes it,
+    # so it cannot be reused from ci.yml and is built here from source (~1.5h).
+    # Built once and handed to the checks-rpi5 shards below, as in ci.yml: every
+    # shard boots this kernel, and rebuilding it per shard would cost 1.5h each.
+    name: rpi kernel
+    needs: [lock]
+    runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Checkout
@@ -92,50 +68,115 @@ jobs:
           name: flake-lock
           path: .
 
-      - name: Reclaim disk space
-        run: |
-          # Delete preinstalled toolchains this repo never uses (~25-30 GB on root).
-          # || true so a path missing on the arm64 image is not fatal.
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /usr/share/swift \
-            /usr/local/share/boost \
-            /opt/hostedtoolcache \
-            || true
-          sudo docker image prune --all --force || true
-          df -h
+      - uses: ./.github/actions/nix-runner
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
+      - name: Build + export rpi kernel
+        run: make export-rpi-kernel
+
+      - name: Upload rpi kernel cache
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          enable_kvm: true
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            accept-flake-config = true
+          # Same name as ci.yml's artifact, but artifacts are scoped to a run, so
+          # there is no collision -- and this one is the kernel for the UPDATED
+          # lock, which is not what any PR run built.
+          name: rpi-kernel-cache
+          path: rpi-kernel-cache
 
-      - name: Add swap
-        run: |
-          swapon --show || true
-          sudo fallocate -l 8G /mnt/ci-swapfile
-          sudo chmod 600 /mnt/ci-swapfile
-          sudo mkswap /mnt/ci-swapfile
-          sudo swapon /mnt/ci-swapfile
-          swapon --show
-          free -h
-          df -h
+  checks:
+    # Verify the x86 check sets against the UPDATED lock, one leg per
+    # lib.checkSets entry -- the same legs ci.yml runs, because this workflow
+    # gates an UNREVIEWED auto-commit to main: whatever CI would run on a PR has
+    # to run here too, or a nixpkgs bump could land something the next PR then
+    # fails on. The aarch64 rpi5 set is checks-rpi5 below; it is not redundant
+    # with rpi5-x86 -- it pins the aarch64 vendor kernel and nixos-raspberrypi's
+    # own nixpkgs, so it cannot see a bump that breaks hosts/rpi5 against THIS
+    # flake's nixpkgs.
+    name: checks (${{ matrix.name }})
+    needs: [lock]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: eval
+            system: x86_64-linux
+            set: eval
+          - name: anya-feher-laptop
+            system: x86_64-linux
+            set: anya-feher-laptop
+          - name: rpi5-x86
+            system: x86_64-linux
+            set: rpi5-x86
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Use updated lock
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: flake-lock
+          path: .
+
+      - uses: ./.github/actions/nix-runner
 
       - name: Run checks (eval+run one check at a time)
         # A single whole-flake eval peaks at ~15 GiB and OOMs the 16 GiB runner;
         # the make target evaluates and runs each check one by one.
         run: make run-checks SYSTEM=${{ matrix.system }} SET=${{ matrix.set }}
 
+  checks-rpi5:
+    # lib.checkSets.rpi5 on aarch64 against the UPDATED lock, sharded exactly as
+    # in ci.yml -- these guests run under TCG (no /dev/kvm on hosted arm64
+    # runners) and the set takes ~4.5h serially, which does not fit the 6h job
+    # limit alongside the kernel build. Shard membership is derived from the
+    # flake by run-checks, so this names no tests either.
+    name: checks (rpi5 ${{ matrix.shard }}/4)
+    needs: [lock, rpi-kernel]
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Use updated lock
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: flake-lock
+          path: .
+
+      - uses: ./.github/actions/nix-runner
+
+      - name: Download rpi kernel cache
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: rpi-kernel-cache
+          path: rpi-kernel-cache
+
+      - name: Import rpi kernel
+        # The lock is restored before this runs, so the outPath evaluated here is
+        # the updated-lock kernel -- the one rpi-kernel just built. A mismatch
+        # (e.g. the lock artifact failing to restore) fails loudly instead of
+        # silently recompiling or testing a stale kernel.
+        run: make import-rpi-kernel CACHE=rpi-kernel-cache SUDO=
+
+      - name: Run checks (eval+run one check at a time)
+        run: make run-checks SYSTEM=aarch64-linux SET=rpi5 SHARD=${{ matrix.shard }} SHARDS=${{ strategy.job-total }}
+
   commit:
-    # Only reached if every check leg passed -- the same job ci.yml's automerge
+    # Only reached if every check leg passed -- the same jobs ci.yml's automerge
     # gates on.
-    needs: [checks]
+    needs: [rpi-kernel, checks, checks-rpi5]
     runs-on: ubuntu-latest
 
     steps:
