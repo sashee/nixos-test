@@ -77,10 +77,11 @@ in
         OnUnitActiveSec = "15min";
       };
       description = ''
-        When to collect. The default matches the spec's "every 15 minutes and 5 minutes after
-        boot", which suits the USB sweep -- a passive sysfs read that costs nothing.
+        When to collect. `OnUnitActiveSec` is the spec's "every 15 minutes"; the `OnBootSec` leg is
+        only what gives the timer a first trigger, since a timer with neither `OnBootSec` nor
+        `OnCalendar` never fires at all.
 
-        Consider a longer interval on hosts with the radio collectors on. A WiFi sweep takes the
+        Note what the cadence costs on hosts with the radio collectors on. A WiFi sweep takes the
         radio off-channel for several seconds: measured on the Pi it moved the host's own RTT from
         1.4 ms to 133 ms peak, on the link its remote access runs over. Both radios also share one
         antenna, so the BLE scan costs the WiFi link too.
