@@ -37,6 +37,9 @@ let
   };
   no = lib.mkForce lib.kernel.no;
   yes = lib.mkForce lib.kernel.yes;
+  # mkRpi5 passes no specialArgs beyond dotfiles/nixpkgs-*, so the helper that builds the
+  # rest: URL and names the backend credentials is imported rather than injected.
+  resticLib = import ../../lib/restic.nix { inherit lib; };
 in
 {
   imports = [
@@ -275,12 +278,49 @@ in
     openssh.authorizedKeys.keys = [ (import ../../lib/ssh-keys.nix).sashee ];
   };
 
-  # Host-specific restic backups (restic module imported above), e.g.:
-  # common.restic.backups.home = {
-  #   repository = "rest:https://backup.example.com/rpi5"; paths = [ "/home/nixos" ];
-  #   credentialDirectory = "/etc/credentials/restic/home"; user = "nixos";
-  #   backend = { type = "rest"; credentials = [ "backend-username" "backend-password" ]; };
-  # };
+  # Nightly backup of the measurement database (restic module imported above). Runs as the
+  # receiver's own user: the state directory is 0700 and this unit has CapabilityBoundingSet=""
+  # plus PrivateUsers=true, so even root would not get in. The receiver is stopped for the
+  # backup phase only -- the DB is WAL-mode, so its files are consistent on disk only while it
+  # is down -- and started again before the prune and check phases (see modules/restic.nix).
+  # The tunnel needs no such treatment: it dials the receiver's socket lazily, once per stream,
+  # so it rides out the restart (the note on its `after` in modules/monitoring-platform-tunnel.nix).
+  #
+  # Off the default midnight slot: the auto-upgrade starts 00:00-02:00 and nix-gc runs
+  # 03:15/15:15, and all three are SD-I/O bound on this box.
+  #
+  # Provision out-of-band, ON THIS HOST -- there is no TPM on a Pi 5, so systemd-creds falls back
+  # to the host key (/var/lib/systemd/credential.secret) and a reimaged SD needs fresh blobs. All
+  # three must exist: the unit's ConditionPathExists lists them, so a missing one makes systemd
+  # *skip* the unit rather than fail it, which shows up only as a monitoring check that never
+  # goes green. The file name and the --name= must match; the name is authenticated into the blob.
+  #   sudo install -d -m 0700 /etc/credentials/restic/monitoring-platform
+  #   printf '%s' '<repo password>' | sudo systemd-creds encrypt --name=repository-password - \
+  #     /etc/credentials/restic/monitoring-platform/repository-password
+  #   printf '%s' '<rest user>'     | sudo systemd-creds encrypt --name=backend-username - \
+  #     /etc/credentials/restic/monitoring-platform/backend-username
+  #   printf '%s' '<rest password>' | sudo systemd-creds encrypt --name=backend-password - \
+  #     /etc/credentials/restic/monitoring-platform/backend-password
+  #   sudo chmod 0600 /etc/credentials/restic/monitoring-platform/*
+  #
+  # /var/lib/mp-collector is deliberately not in paths: spool plus epoch table, rebuilt from
+  # scratch. Nor are the credential blobs -- host-key-encrypted, so useless off this SD.
+  common.restic.backups.monitoring-platform = resticLib.rest {
+    user = config.services.monitoring-platform.user;
+    credentialDirectory = "/etc/credentials/restic/monitoring-platform";
+    # BorgBase gives each repository its own hostname and serves it at the root, so there is
+    # no path component -- hence the empty repository, which resticLib.rest turns into the
+    # trailing slash `rest:` wants for a root repo.
+    url = "https://uftkucf5.repo.borgbase.com";
+    repository = "";
+    paths = [ "/var/lib/monitoring-platform" ];
+    stopServices = [ "monitoring-platform.service" ];
+    timerConfig = {
+      OnCalendar = "*-*-* 05:00:00";
+      Persistent = true;
+      RandomizedDelaySec = "1h";
+    };
+  };
 
   networking.wireless.iwd.enable = true;
   common.connectivityFallback.enable = true;

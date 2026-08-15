@@ -91,9 +91,13 @@ let
     pkgs.writeShellApplication {
       name = "restic-${name}-stop-services";
       runtimeInputs = [ pkgs.coreutils pkgs.findutils config.systemd.package ];
+      # An array rather than a literal word list: with a single unit, `for u in 'a.service'`
+      # is a shellcheck error (SC2043) and writeShellApplication runs shellcheck.
       text = ''
+        units=(${lib.escapeShellArgs backup.stopServices})
+
         : > ${stoppedUnitsFile name}
-        for unit in ${lib.escapeShellArgs backup.stopServices}; do
+        for unit in "''${units[@]}"; do
           if systemctl is-active --quiet "$unit"; then
             printf '%s\n' "$unit" >> ${stoppedUnitsFile name}
           fi
