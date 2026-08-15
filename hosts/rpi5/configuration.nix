@@ -192,7 +192,14 @@ in
   # batch, so nothing is dropped on the floor, but nothing lands either and the outbox grows. An
   # unreadable blob is louder still: it fails this unit at start, and every producer on the host
   # posts through it.
-  services.mp-collector.apiKeyFile = "/etc/credentials/mp-collector/mp-api-key";
+  #
+  # mkDefault because upstream's own VM harness (nix/tests/lib.nix) sets this option too, at normal
+  # priority, for the nodes that compose this host config -- it issues a key of its own and points
+  # the collector at a plaintext /etc/mp-api-key. The option is single-valued, so two normal
+  # priorities are a hard evaluation error rather than a merge, and the harness that provisions the
+  # key is the one that has to win. Nothing but a harness ever defines it, so on the deployed Pi
+  # this is still the only definition and the rendered unit is unchanged.
+  services.mp-collector.apiKeyFile = lib.mkDefault "/etc/credentials/mp-collector/mp-api-key";
 
   # The two ends of the hop above (see modules/monitoring-platform-tunnel.nix). The server half
   # answers on an iroh endpoint and forwards to the receiver's socket; the client half serves
