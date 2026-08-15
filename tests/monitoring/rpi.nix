@@ -7,13 +7,13 @@
 # their own (monitoring every 30 min; restic/upgrade Persistent daily), then inspects reports.
 #
 # On top of the real config it layers three test-only things:
-#   - one restic backup (the Pi has none yet, but will) so the restic check reports for real,
+#   - the real monitoring-platform backup re-pointed at an in-VM REST server, so the restic
+#     check reports for real and the backup's stopServices path runs against the real receiver,
 #   - a mocked nixos-rebuild so the (real, enabled) auto-upgrade succeeds in a VM, and
 #   - nix.gc.automatic off, so a warp-triggered catch-up GC can't starve the monitoring run.
 # smart stays [SKIP] (the Pi's real setting, untouched).
 
 let
-  resticLib = import ../../lib/restic.nix { lib = nixpkgs.lib; };
   monitoringPlatform = import ./platform.nix { inherit pkgs; };
 
   # A real NixOS upgrade can't run in a VM, so mock the upgrade command. It fails on
@@ -55,19 +55,12 @@ nixpkgs.lib.nixos.runTest {
     # platform is by its node name, so the client's own hostname is cosmetic here.
     networking.hostName = "monitoring-client";
 
-    users.users.backup-user = {
-      isNormalUser = true;
-      home = "/home/backup-user";
-    };
-
-    # Add a restic backup on top of the real config so the restic check has something to
-    # report. Repo/backend secrets are provisioned as encrypted creds in the boot oneshot.
-    common.restic.backups.test = resticLib.rest {
-      user = "backup-user";
-      credentialDirectory = "/etc/credentials/restic/test";
-      url = "http://monitoring-platform:8000";
-      repository = "test";
-      paths = [ "/home/backup-user/test" ];
+    # The Pi's own backup, aimed at the in-VM REST server instead of the off-box one. Only the
+    # destination is test-only: the user, the paths and the stopServices restart of the real
+    # receiver are the deployed config, so this is where that path actually runs. mkForce on the
+    # composed repository string, because resticLib.rest already folded url + repository into it.
+    common.restic.backups.monitoring-platform = {
+      repository = lib.mkForce "rest:http://monitoring-platform:8000/monitoring-platform";
       prune.opts = [ "--keep-last 2" ];
     };
 
@@ -118,27 +111,25 @@ nixpkgs.lib.nixos.runTest {
 
     # All secrets are systemd-creds-encrypted blobs (LoadCredentialEncrypted); provision
     # them at boot runtime (the host key isn't set up during activation), before the
-    # monitoring and restic services run. The payload/home dir need no encryption.
+    # monitoring and restic services run. The credential directory is the deployed one, so
+    # this stands in for the out-of-band provisioning documented in hosts/rpi5.
     systemd.services.test-monitoring-credential = {
       wantedBy = [ "multi-user.target" ];
-      before = [ "common-monitoring.service" "restic-backups-test.service" ];
+      before = [ "common-monitoring.service" "restic-backups-monitoring-platform.service" ];
       serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
       script = ''
-        install -d -m 0700 /etc/credentials/monitoring /etc/credentials/restic/test
-        install -d -m 0755 -o backup-user -g users /home/backup-user/test
+        install -d -m 0700 /etc/credentials/monitoring /etc/credentials/restic/monitoring-platform
 
         printf '%s' 'http://monitoring-platform:8080/health' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=healthchecks-url - /etc/credentials/monitoring/healthchecks-url
-        printf '%s' 'repo-secret'    | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository-password - /etc/credentials/restic/test/repository-password
-        printf '%s' 'test-user'      | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-username - /etc/credentials/restic/test/backend-username
-        printf '%s' 'backend-secret' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-password - /etc/credentials/restic/test/backend-password
-        printf '%s\n' 'rpi payload' > /home/backup-user/test/payload.txt
+        printf '%s' 'repo-secret'    | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository-password - /etc/credentials/restic/monitoring-platform/repository-password
+        printf '%s' 'test-user'      | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-username - /etc/credentials/restic/monitoring-platform/backend-username
+        printf '%s' 'backend-secret' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-password - /etc/credentials/restic/monitoring-platform/backend-password
 
         chmod 0600 \
           /etc/credentials/monitoring/healthchecks-url \
-          /etc/credentials/restic/test/repository-password \
-          /etc/credentials/restic/test/backend-username \
-          /etc/credentials/restic/test/backend-password
-        chown backup-user:users /home/backup-user/test/payload.txt
+          /etc/credentials/restic/monitoring-platform/repository-password \
+          /etc/credentials/restic/monitoring-platform/backend-username \
+          /etc/credentials/restic/monitoring-platform/backend-password
       '';
     };
 
@@ -212,8 +203,14 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("systemctl is-active --quiet common-monitoring.timer")
     client.succeed("systemctl cat common-monitoring.service | grep -F 'LoadCredentialEncrypted=healthchecks-url:/etc/credentials/monitoring/healthchecks-url'")
     client.fail("systemctl cat common-monitoring.service | grep -F 'http://monitoring-platform:8080/health'")
-    client.succeed("systemctl cat restic-backups-test.service | grep -F 'LoadCredentialEncrypted=repository-password:/etc/credentials/restic/test/repository-password'")
-    client.succeed("systemctl show restic-backups-test.timer -p Persistent --value | grep -F yes")
+    client.succeed("systemctl cat restic-backups-monitoring-platform.service | grep -F 'LoadCredentialEncrypted=repository-password:/etc/credentials/restic/monitoring-platform/repository-password'")
+    client.succeed("systemctl show restic-backups-monitoring-platform.timer -p Persistent --value | grep -F yes")
+    client.succeed("systemctl show restic-backups-monitoring-platform.timer -p TimersCalendar --value | grep -F '*-*-* 05:00:00'")
+    # The backup stops the receiver for the backup phase and starts it again before prune/check.
+    client.succeed("systemctl cat restic-backups-monitoring-platform.service | grep -E '^ExecStartPre=\\+.*-stop-services'")
+    client.succeed("systemctl cat restic-backups-monitoring-platform.service | grep -E '^ExecStopPost=\\+.*-start-services'")
+    client.succeed("systemctl cat restic-backups-monitoring-platform.service | grep -F 'User=monitoring-platform'")
+    client.succeed("systemctl is-active --quiet monitoring-platform.service")
 
     def quiesce_monitoring():
         # Pause the timer and drain any in-flight run before touching the platform log, so a
@@ -242,18 +239,20 @@ nixpkgs.lib.nixos.runTest {
         assert events == expected, f"unexpected events: {events}"
 
     # Advance the client ~one day forward, landing clear of any :00/:30 boundary. The Persistent
-    # daily timers (restic 1h, upgrade 2h randomized-delay) are overdue after the midnight
-    # crossing and, since 05:29 is past their delay windows, catch up and fire promptly. But
-    # common-monitoring.timer is now OnCalendar=*:0/30 with Persistent=no: a non-persistent
-    # calendar timer, if left running across the jump, ALSO fires an immediate catch-up run on top
-    # of the boundary run. So we pause it across every warp (quiesce_monitoring) and arm it just
-    # after (arm_monitoring), making exactly one run fire per cycle -- keeping the asserts valid.
+    # daily timers (restic 05:00 + 1h, upgrade 00:00 + 2h randomized-delay) are overdue after the
+    # midnight crossing and, since 07:15 is past both delay windows, catch up and fire promptly --
+    # landing INSIDE a window instead would leave the timer waiting out a randomized offset in
+    # simulated time that never passes. But common-monitoring.timer is now OnCalendar=*:0/30 with
+    # Persistent=no: a non-persistent calendar timer, if left running across the jump, ALSO fires
+    # an immediate catch-up run on top of the boundary run. So we pause it across every warp
+    # (quiesce_monitoring) and arm it just after (arm_monitoring), making exactly one run fire per
+    # cycle -- keeping the asserts valid.
     def next_day():
-        client.succeed("date -s \"$(date -d 'tomorrow 05:15:00')\"")
+        client.succeed("date -s \"$(date -d 'tomorrow 07:15:00')\"")
         arm_monitoring()
 
     upgrade_marker = "/var/lib/common-monitoring/nixos-upgrade.service.last-success"
-    restic_marker = "/var/lib/common-monitoring/restic-backups-test.service.last-success"
+    restic_marker = "/var/lib/common-monitoring/restic-backups-monitoring-platform.service.last-success"
 
     # Warm up: one day forward wakes the daily timers on their own. The mocked upgrade
     # succeeds and the real restic backup to the REST server succeeds, each recording its
@@ -264,6 +263,15 @@ nixpkgs.lib.nixos.runTest {
     next_day()
     client.wait_until_succeeds(f"test -r {upgrade_marker}", timeout=600)
     client.wait_until_succeeds(f"test -r {restic_marker}", timeout=600)
+    # The receiver was stopped for the backup phase and started again before the check, on the
+    # real config -- ordering, not just liveness. Last occurrence of each: the receiver also
+    # started at boot, and only this one backup run has happened so far.
+    client.succeed("systemctl is-active --quiet monitoring-platform.service")
+    mp_log = client.succeed("journalctl -b --no-pager -u restic-backups-monitoring-platform.service -u monitoring-platform.service").splitlines()
+    assert any("Stopped Monitoring platform OTLP receiver" in line for line in mp_log), mp_log[-40:]
+    restarted = max(i for i, line in enumerate(mp_log) if "Started Monitoring platform OTLP receiver" in line)
+    checked = max(i for i, line in enumerate(mp_log) if "no errors were found" in line)
+    assert restarted < checked, mp_log[min(restarted, checked):]
     # Let the warm-up monitoring run (also fired by the jump) finish so its POSTs can't
     # leak into the next run's log after we reset it. `! systemctl is-active` is unreliable
     # here: common-monitoring.service is Type=oneshot, so while it runs it is in state
@@ -281,7 +289,7 @@ nixpkgs.lib.nixos.runTest {
     assert_events(["POST /health/start", "POST /health/log", "POST /health"])
     platform.succeed("grep -F '[SKIP] smart: disabled' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F '[SKIP] iroh-ssh: disabled' /var/lib/monitoring-platform/bodies.log")
-    platform.succeed("grep -F '[OK] restic test: restic-backups-test.service last succeeded' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed("grep -F '[OK] restic monitoring-platform: restic-backups-monitoring-platform.service last succeeded' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F '[OK] auto-upgrade: nixos-upgrade.service last succeeded' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F '[OK] disk-space:' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F '[OK] generations:' /var/lib/monitoring-platform/bodies.log")
@@ -303,12 +311,12 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("printf '%s' fail > /run/upgrade-status")
     platform.succeed("systemctl stop restic-rest-auth.socket restic-rest-auth.service")
     reset_platform()
-    client.succeed("date -s \"$(date -d '+15 days' +%Y-%m-%d) 05:15:00\"")
+    client.succeed("date -s \"$(date -d '+15 days' +%Y-%m-%d) 07:15:00\"")
     arm_monitoring()
     platform.wait_until_succeeds("grep -Fxq 'POST /health/fail' /var/lib/monitoring-platform/events.log", timeout=600)
     assert_events(["POST /health/start", "POST /health/log", "POST /health/fail"])
     platform.succeed("grep -F '[FAIL] auto-upgrade: nixos-upgrade.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")
-    platform.succeed("grep -F '[FAIL] restic test: restic-backups-test.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")
+    platform.succeed("grep -F '[FAIL] restic monitoring-platform: restic-backups-monitoring-platform.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")
     platform.succeed("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
   '';
 }
