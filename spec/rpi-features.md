@@ -55,6 +55,10 @@
 
 * [](./features/inverter-monitoring/inverter-monitoring.md)
 
+## Monitoring platform
+
+* [monitoring platform](./features/monitoring-platform/monitoring-platform.md)
+
 ## Auto-reboot
 
 * every hour it tries to resolve a DNS address
