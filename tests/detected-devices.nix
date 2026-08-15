@@ -169,7 +169,9 @@ nixpkgs.lib.nixos.runTest {
     };
   };
 
-  testScript = ''
+  # Concatenated rather than interpolated: `''` strips each literal's own indentation, so a
+  # `${...}` inside this one would dedent the helper's function bodies out of their own `def`s.
+  testScript = (import ../lib/test-mp-auth.nix) + ''
     import json
 
     start_all()
@@ -177,6 +179,12 @@ nixpkgs.lib.nixos.runTest {
     ntp.wait_for_unit("multi-user.target")
     machine.wait_for_unit("mp-collector.service")
     machine.wait_for_unit("monitoring-platform.service")
+
+    # Before the clock wait below, not after: this restarts the collector, and a restart resets
+    # `ever_synchronized` to unset -- so authenticating afterwards would throw away the very state
+    # that wait was there to establish and make it wait a second time.
+    authenticate(machine)
+
     # The collector forwards nothing until it trusts the clock, so wait for that once here rather
     # than letting every retry loop below absorb the delay.
     machine.wait_until_succeeds(
@@ -254,8 +262,11 @@ nixpkgs.lib.nixos.runTest {
 
 
     def query(params=ALL):
+        # --fail-with-body, so an unauthenticated read fails here naming its status instead of
+        # surfacing as a KeyError on the missing "measurements" field: curl exits 0 on a 401.
         raw = machine.succeed(
-            f"curl -sS --unix-socket {SOCKET} 'http://localhost/v1/measurements?{params}'"
+            f"curl -sS --fail-with-body {auth_header()}--unix-socket {SOCKET} "
+            f"'http://localhost/v1/measurements?{params}'"
         )
         return json.loads(raw)["measurements"]
 

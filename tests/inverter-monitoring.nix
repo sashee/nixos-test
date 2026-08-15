@@ -123,7 +123,9 @@ nixpkgs.lib.nixos.runTest {
     system.stateVersion = stateVersion;
   };
 
-  testScript = ''
+  # Concatenated rather than interpolated: `''` strips each literal's own indentation, so a
+  # `${...}` inside this one would dedent the helper's function bodies out of their own `def`s.
+  testScript = (import ../lib/test-mp-auth.nix) + ''
     import json
     import os
     import socket
@@ -311,8 +313,11 @@ nixpkgs.lib.nixos.runTest {
     # ------------------------------------------------------------------------------------
 
     def query(params="limit=2000"):
+        # --fail-with-body, so an unauthenticated read fails here naming its status instead of
+        # surfacing as a KeyError on the missing "measurements" field: curl exits 0 on a 401.
         raw = machine.succeed(
-            f"curl -sS --unix-socket {SOCKET} 'http://localhost/v1/measurements?{params}'"
+            f"curl -sS --fail-with-body {auth_header()}--unix-socket {SOCKET} "
+            f"'http://localhost/v1/measurements?{params}'"
         )
         return json.loads(raw)["measurements"]
 
@@ -380,6 +385,17 @@ nixpkgs.lib.nixos.runTest {
 
     machine.start()
     machine.wait_for_unit("multi-user.target")
+
+    # As early as possible, and earlier than the other two tests need it: this producer is a daemon
+    # started at boot, not a oneshot the script drives, so it is already posting cycles by the time
+    # anything here runs. authenticate() restarts the collector and a restart discards the outbox,
+    # so every second between boot and this line is inverter records thrown away. Nothing below
+    # asserts on the earliest ones -- every subtest drives a fresh cycle and waits for it -- but
+    # doing this after `udevadm settle` would widen that window by the length of a coldplug
+    # backlog, which on the emulated aarch64 node is tens of seconds.
+    machine.wait_for_unit("mp-collector.service")
+    machine.wait_for_unit("monitoring-platform.service")
+    authenticate(machine)
 
     # The two serial-less adapters CONTEST one by-id link, and udev re-picks the winner on every
     # event touching either of them. multi-user is not the end of that: the coldplug trigger only
