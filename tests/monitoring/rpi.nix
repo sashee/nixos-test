@@ -55,14 +55,10 @@ nixpkgs.lib.nixos.runTest {
     # platform is by its node name, so the client's own hostname is cosmetic here.
     networking.hostName = "monitoring-client";
 
-    # The Pi's own backup, aimed at the in-VM REST server instead of the off-box one. Only the
-    # destination is test-only: the user, the paths and the stopServices restart of the real
-    # receiver are the deployed config, so this is where that path actually runs. mkForce on the
-    # composed repository string, because resticLib.rest already folded url + repository into it.
-    common.restic.backups.monitoring-platform = {
-      repository = lib.mkForce "rest:http://monitoring-platform:8000/monitoring-platform";
-      prune.opts = [ "--keep-last 2" ];
-    };
+    # The Pi's own backup runs here unmodified: its repository is a credential, so aiming it at
+    # the in-VM REST server is done by provisioning a different blob below, not by patching the
+    # host config. Only the prune policy is test-only.
+    common.restic.backups.monitoring-platform.prune.opts = [ "--keep-last 2" ];
 
     # Mock the upgrade so the real, enabled nixos-upgrade.timer succeeds when the clock
     # wakes it and records its last-success marker via the module's OnSuccess hook.
@@ -121,12 +117,14 @@ nixpkgs.lib.nixos.runTest {
         install -d -m 0700 /etc/credentials/monitoring /etc/credentials/restic/monitoring-platform
 
         printf '%s' 'http://monitoring-platform:8080/health' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=healthchecks-url - /etc/credentials/monitoring/healthchecks-url
+        printf '%s' 'rest:http://monitoring-platform:8000/monitoring-platform' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository - /etc/credentials/restic/monitoring-platform/repository
         printf '%s' 'repo-secret'    | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository-password - /etc/credentials/restic/monitoring-platform/repository-password
         printf '%s' 'test-user'      | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-username - /etc/credentials/restic/monitoring-platform/backend-username
         printf '%s' 'backend-secret' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-password - /etc/credentials/restic/monitoring-platform/backend-password
 
         chmod 0600 \
           /etc/credentials/monitoring/healthchecks-url \
+          /etc/credentials/restic/monitoring-platform/repository \
           /etc/credentials/restic/monitoring-platform/repository-password \
           /etc/credentials/restic/monitoring-platform/backend-username \
           /etc/credentials/restic/monitoring-platform/backend-password
@@ -204,6 +202,10 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("systemctl cat common-monitoring.service | grep -F 'LoadCredentialEncrypted=healthchecks-url:/etc/credentials/monitoring/healthchecks-url'")
     client.fail("systemctl cat common-monitoring.service | grep -F 'http://monitoring-platform:8080/health'")
     client.succeed("systemctl cat restic-backups-monitoring-platform.service | grep -F 'LoadCredentialEncrypted=repository-password:/etc/credentials/restic/monitoring-platform/repository-password'")
+    client.succeed("systemctl cat restic-backups-monitoring-platform.service | grep -F 'LoadCredentialEncrypted=repository:/etc/credentials/restic/monitoring-platform/repository'")
+    # The deployed config names no repository: it comes from the credential above, so the real
+    # BorgBase URL is neither in git nor in this unit.
+    client.fail("systemctl cat restic-backups-monitoring-platform.service | grep -E 'RESTIC_REPOSITORY=|borgbase|rest:'")
     client.succeed("systemctl show restic-backups-monitoring-platform.timer -p Persistent --value | grep -F yes")
     client.succeed("systemctl show restic-backups-monitoring-platform.timer -p TimersCalendar --value | grep -F '*-*-* 05:00:00'")
     # The backup stops the receiver for the backup phase and starts it again before prune/check.
