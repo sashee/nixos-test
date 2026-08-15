@@ -68,12 +68,14 @@ nixpkgs.lib.nixos.runTest {
         install -d -m 0700 /etc/credentials/restic/timer-rest
         install -d -m 0755 -o backup-user -g users /home/backup-user/timer-rest
 
+        printf '%s' 'rest:http://restic-backend:8002/timer-rest' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository - /etc/credentials/restic/timer-rest/repository
         printf '%s' 'repo-secret'    | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository-password - /etc/credentials/restic/timer-rest/repository-password
         printf '%s' 'test-user'      | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-username - /etc/credentials/restic/timer-rest/backend-username
         printf '%s' 'backend-secret' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-password - /etc/credentials/restic/timer-rest/backend-password
         printf '%s\n' 'timer-rest payload' > /home/backup-user/timer-rest/payload.txt
 
         chmod 0600 \
+          /etc/credentials/restic/timer-rest/repository \
           /etc/credentials/restic/timer-rest/repository-password \
           /etc/credentials/restic/timer-rest/backend-username \
           /etc/credentials/restic/timer-rest/backend-password
@@ -92,8 +94,6 @@ nixpkgs.lib.nixos.runTest {
     common.restic.backups.append-ignored = resticLib.rest {
       user = "backup-user";
       credentialDirectory = "/etc/credentials/restic/append-ignored";
-      url = "http://restic-backend:8001";
-      repository = "append-ignored";
       paths = [ "/home/backup-user/append-ignored" ];
       prune = {
         ignoreErrors = true;
@@ -105,8 +105,6 @@ nixpkgs.lib.nixos.runTest {
     common.restic.backups.append-strict = resticLib.rest {
       user = "backup-user";
       credentialDirectory = "/etc/credentials/restic/append-strict";
-      url = "http://restic-backend:8001";
-      repository = "append-strict";
       paths = [ "/home/backup-user/append-strict" ];
       prune = {
         ignoreErrors = false;
@@ -118,8 +116,6 @@ nixpkgs.lib.nixos.runTest {
     common.restic.backups.normal-strict = resticLib.rest {
       user = "backup-user";
       credentialDirectory = "/etc/credentials/restic/normal-strict";
-      url = "http://restic-backend:8002";
-      repository = "normal-strict";
       paths = [ "/home/backup-user/normal-strict" ];
       prune = {
         ignoreErrors = false;
@@ -131,8 +127,6 @@ nixpkgs.lib.nixos.runTest {
     common.restic.backups.check-damaged = resticLib.rest {
       user = "backup-user";
       credentialDirectory = "/etc/credentials/restic/check-damaged";
-      url = "http://restic-backend:8002";
-      repository = "check-damaged";
       paths = [ "/home/backup-user/check-damaged" ];
       prune.opts = [ "--keep-last 99" ];
       timerConfig = null;
@@ -141,8 +135,6 @@ nixpkgs.lib.nixos.runTest {
     common.restic.backups.timer-rest = resticLib.rest {
       user = "backup-user";
       credentialDirectory = "/etc/credentials/restic/timer-rest";
-      url = "http://restic-backend:8002";
-      repository = "timer-rest";
       paths = [ "/home/backup-user/timer-rest" ];
       prune.opts = [ "--keep-last 99" ];
       timerConfig = {
@@ -155,8 +147,6 @@ nixpkgs.lib.nixos.runTest {
     common.restic.backups.quiesce = resticLib.rest {
       user = "backup-user";
       credentialDirectory = "/etc/credentials/restic/quiesce";
-      url = "http://restic-backend:8002";
-      repository = "quiesce";
       paths = [ "/home/backup-user/quiesce" ];
       stopServices = [ "quiesced-one.service" "quiesced-two.service" ];
       prune.opts = [ "--keep-last 99" ];
@@ -166,8 +156,6 @@ nixpkgs.lib.nixos.runTest {
     common.restic.backups.s3 = resticLib.s3 {
       user = "backup-user";
       credentialDirectory = "/etc/credentials/restic/s3";
-      endpoint = "http://restic-backend:3900";
-      bucket = "restic-s3";
       paths = [ "/home/backup-user/s3" ];
       exclude = [ "excluded.txt" ];
       timerConfig = null;
@@ -255,13 +243,27 @@ nixpkgs.lib.nixos.runTest {
     def service_result(name):
         return client.succeed(f"systemctl show restic-backups-{name}.service -p Result --value").strip()
 
-    def write_rest_credentials(name, backend_password="backend-secret"):
+    # The repository location is a credential like the rest, so it is provisioned at runtime and
+    # appears nowhere in the units. Single source for both the blobs and this script's own
+    # out-of-band restic calls. append-* are the append-only server, the others the normal one.
+    REPOS = {
+        "append-ignored": "rest:http://restic-backend:8001/append-ignored",
+        "append-strict": "rest:http://restic-backend:8001/append-strict",
+        "normal-strict": "rest:http://restic-backend:8002/normal-strict",
+        "check-damaged": "rest:http://restic-backend:8002/check-damaged",
+        "timer-rest": "rest:http://restic-backend:8002/timer-rest",
+        "quiesce": "rest:http://restic-backend:8002/quiesce",
+        "s3": "s3:http://restic-backend:3900/restic-s3",
+    }
+
+    def write_rest_credentials(name, backend_password="backend-secret", repository=None):
         client.succeed(f"mkdir -p /etc/credentials/restic/{name} /home/backup-user/{name}")
+        client.succeed(f"printf '%s' '{repository or REPOS[name]}' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository - /etc/credentials/restic/{name}/repository")
         client.succeed(f"printf '%s' 'repo-secret' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository-password - /etc/credentials/restic/{name}/repository-password")
         client.succeed(f"printf '%s' 'test-user' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-username - /etc/credentials/restic/{name}/backend-username")
         client.succeed(f"printf '%s' '{backend_password}' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-password - /etc/credentials/restic/{name}/backend-password")
         client.succeed(f"chmod 0700 /etc/credentials/restic/{name}")
-        client.succeed(f"chmod 0600 /etc/credentials/restic/{name}/repository-password /etc/credentials/restic/{name}/backend-username /etc/credentials/restic/{name}/backend-password")
+        client.succeed(f"chmod 0600 /etc/credentials/restic/{name}/repository /etc/credentials/restic/{name}/repository-password /etc/credentials/restic/{name}/backend-username /etc/credentials/restic/{name}/backend-password")
         client.succeed(f"chown -R backup-user:users /home/backup-user/{name}")
 
     def write_payload(name, content):
@@ -335,10 +337,24 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("systemctl cat restic-backups-s3.service | grep -F 'LoadCredentialEncrypted=aws-access-key-id:/etc/credentials/restic/s3/aws-access-key-id'")
     client.succeed("systemctl cat restic-backups-s3.service | grep -F 'LoadCredentialEncrypted=aws-secret-access-key:/etc/credentials/restic/s3/aws-secret-access-key'")
     client.succeed("systemctl cat restic-backups-s3.service | grep -F -- '--exclude-file='")
+
+    # --- the repository location is a credential, so it must appear nowhere in the units ---
+    for name in ["append-ignored", "s3"]:
+        client.succeed(f"systemctl cat restic-backups-{name}.service | grep -F 'LoadCredentialEncrypted=repository:/etc/credentials/restic/{name}/repository'")
+        client.succeed(f"systemctl cat restic-backups-{name}.service | grep -F 'ConditionPathExists=/etc/credentials/restic/{name}/repository'")
+        # Upstream would render RESTIC_REPOSITORY= from the (now absent) option; the wrapper
+        # points restic at the decrypted file instead, so the location never reaches the unit.
+        client.fail(f"systemctl cat restic-backups-{name}.service | grep -F 'RESTIC_REPOSITORY='")
+        client.fail(f"systemctl cat restic-backups-{name}.service | grep -E 'rest:|s3:'")
+        client.succeed(f"systemctl cat restic-backups-{name}.service | grep -F 'RESTIC_REPOSITORY_FILE=/run/credentials/restic-backups-{name}.service/repository'")
+    # createWrapper=false: no restic-<name> on the system PATH baking the environment into a
+    # world-readable store path.
+    client.fail("command -v restic-append-ignored")
     client.succeed("systemctl show restic-backups-timer-rest.timer -p TimersCalendar --value | grep -F '*-*-* 00:00:00'")
     client.succeed("systemctl show restic-backups-timer-rest.timer -p Persistent --value | grep -F yes")
     client.succeed("systemctl show restic-backups-timer-rest.timer -p RandomizedDelayUSec --value | grep -F '1h'")
     client.succeed("systemctl is-active --quiet restic-backups-timer-rest.timer")
+    client.succeed("test -f /etc/credentials/restic/timer-rest/repository")
     client.succeed("test -f /etc/credentials/restic/timer-rest/repository-password")
     client.succeed("test -f /etc/credentials/restic/timer-rest/backend-username")
     client.succeed("test -f /etc/credentials/restic/timer-rest/backend-password")
@@ -376,7 +392,7 @@ nixpkgs.lib.nixos.runTest {
     fire_timer(3600)
     client.wait_until_succeeds("systemctl show restic-backups-timer-rest.service -p ActiveState --value | grep -F inactive && systemctl show restic-backups-timer-rest.service -p Result --value | grep -F success && journalctl -u restic-backups-timer-rest.service | grep -F 'snapshot '", timeout=120)
     assert service_result("timer-rest") == "success"
-    client.succeed("RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY=rest:http://restic-backend:8002/timer-rest ${pkgs.restic}/bin/restic snapshots | grep -F timer-rest")
+    client.succeed(f"RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY={REPOS['timer-rest']} ${pkgs.restic}/bin/restic snapshots | grep -F timer-rest")
     client.succeed("systemctl stop restic-backups-timer-rest.timer")
 
     write_rest_credentials("normal-strict", "wrong-backend-secret")
@@ -384,12 +400,23 @@ nixpkgs.lib.nixos.runTest {
     assert service_result("normal-strict") == "exit-code"
     write_rest_credentials("normal-strict")
 
+    # A repository blob whose scheme disagrees with backend.type is caught by the wrapper's
+    # guard, instead of failing later as an opaque "unable to open repository" (the rest
+    # credentials would be loaded for an s3 repository).
+    write_rest_credentials("normal-strict", repository=REPOS["s3"])
+    client.fail("systemctl start restic-backups-normal-strict.service")
+    assert service_result("normal-strict") == "exit-code"
+    client.succeed("journalctl -u restic-backups-normal-strict.service -n 30 | grep -F 'does not name a rest repository'")
+    client.succeed("systemctl reset-failed restic-backups-normal-strict.service")
+    write_rest_credentials("normal-strict")
+
     client.succeed("mkdir -p /etc/credentials/restic/s3 /home/backup-user/s3")
+    client.succeed(f"printf '%s' '{REPOS['s3']}' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository - /etc/credentials/restic/s3/repository")
     client.succeed("printf '%s' 'repo-secret' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository-password - /etc/credentials/restic/s3/repository-password")
     client.succeed(f"printf '%s' '{s3_key_id}' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=aws-access-key-id - /etc/credentials/restic/s3/aws-access-key-id")
     client.succeed(f"printf '%s' '{s3_secret_key}' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=aws-secret-access-key - /etc/credentials/restic/s3/aws-secret-access-key")
     client.succeed("chmod 0700 /etc/credentials /etc/credentials/restic /etc/credentials/restic/s3")
-    client.succeed("chmod 0600 /etc/credentials/restic/s3/repository-password /etc/credentials/restic/s3/aws-access-key-id /etc/credentials/restic/s3/aws-secret-access-key")
+    client.succeed("chmod 0600 /etc/credentials/restic/s3/repository /etc/credentials/restic/s3/repository-password /etc/credentials/restic/s3/aws-access-key-id /etc/credentials/restic/s3/aws-secret-access-key")
     client.succeed("chown -R backup-user:users /home/backup-user/s3")
     write_payload("s3", "s3 payload")
     client.succeed("runuser -u backup-user -- sh -c \"printf '%s\\n' 'excluded' > /home/backup-user/s3/excluded.txt\"")
@@ -408,7 +435,7 @@ nixpkgs.lib.nixos.runTest {
     assert service_result("append-strict") == "exit-code"
 
     client.succeed("runuser -u backup-user -- dd if=/dev/urandom of=/home/backup-user/normal-strict/large.bin bs=1M count=64 status=none")
-    client.succeed("RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY=rest:http://restic-backend:8002/normal-strict ${pkgs.restic}/bin/restic backup /home/backup-user/normal-strict >/tmp/create-stale-lock.log 2>&1 & printf '%s' $! > /tmp/create-stale-lock.pid")
+    client.succeed(f"RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY={REPOS['normal-strict']} ${pkgs.restic}/bin/restic backup /home/backup-user/normal-strict >/tmp/create-stale-lock.log 2>&1 & printf '%s' $! > /tmp/create-stale-lock.pid")
     backend.wait_until_succeeds("set -- /var/lib/restic-normal/normal-strict/locks/*; test -e \"$1\"", timeout=10)
     client.succeed("kill -9 $(cat /tmp/create-stale-lock.pid) || true")
     backend.succeed("set -- /var/lib/restic-normal/normal-strict/locks/*; test -e \"$1\"")
@@ -432,7 +459,7 @@ nixpkgs.lib.nixos.runTest {
 
     # The snapshot is what proves it: both units wrote "stopped" before restic read the files.
     client.succeed("mkdir -p /tmp/restic-quiesce-restore")
-    client.succeed("RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY=rest:http://restic-backend:8002/quiesce ${pkgs.restic}/bin/restic restore latest --target /tmp/restic-quiesce-restore")
+    client.succeed(f"RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY={REPOS['quiesce']} ${pkgs.restic}/bin/restic restore latest --target /tmp/restic-quiesce-restore")
     client.succeed("grep -F stopped /tmp/restic-quiesce-restore/home/backup-user/quiesce/quiesced-one")
     client.succeed("grep -F stopped /tmp/restic-quiesce-restore/home/backup-user/quiesce/quiesced-two")
 
@@ -471,9 +498,9 @@ nixpkgs.lib.nixos.runTest {
     backend.succeed("test -d /var/lib/restic-append/append-ignored/data")
     backend.succeed("test -d /var/lib/restic-normal/normal-strict/data")
 
-    client.succeed(f"AWS_ACCESS_KEY_ID={s3_key_id} AWS_SECRET_ACCESS_KEY={s3_secret_key} RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY=s3:http://restic-backend:3900/restic-s3 ${pkgs.restic}/bin/restic snapshots")
+    client.succeed(f"AWS_ACCESS_KEY_ID={s3_key_id} AWS_SECRET_ACCESS_KEY={s3_secret_key} RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY={REPOS['s3']} ${pkgs.restic}/bin/restic snapshots")
     client.succeed("mkdir -p /tmp/restic-restore")
-    client.succeed(f"AWS_ACCESS_KEY_ID={s3_key_id} AWS_SECRET_ACCESS_KEY={s3_secret_key} RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY=s3:http://restic-backend:3900/restic-s3 ${pkgs.restic}/bin/restic restore latest --target /tmp/restic-restore")
+    client.succeed(f"AWS_ACCESS_KEY_ID={s3_key_id} AWS_SECRET_ACCESS_KEY={s3_secret_key} RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY={REPOS['s3']} ${pkgs.restic}/bin/restic restore latest --target /tmp/restic-restore")
     client.succeed("grep -F 's3 payload updated' /tmp/restic-restore/home/backup-user/s3/payload.txt")
     client.fail("test -e /tmp/restic-restore/home/backup-user/s3/excluded.txt")
   '';

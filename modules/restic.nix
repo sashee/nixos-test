@@ -19,6 +19,19 @@ let
         RESTIC_PASSWORD_FILE="$CREDENTIALS_DIRECTORY/repository-password"
         export RESTIC_PASSWORD_FILE
 
+        # The repository location is a credential like the rest; restic reads it from the file
+        # via RESTIC_REPOSITORY_FILE (set on the unit, see repositoryFile below), so it never
+        # lands in the environment or in the store. The scheme lives in the blob, but
+        # backend.type selects which backend credentials get loaded, so a mismatch would
+        # otherwise surface as an opaque "unable to open repository".
+        case "$(cat "$CREDENTIALS_DIRECTORY/repository")" in
+          ${backup.backend.type}:*) ;;
+          *)
+            echo "repository credential does not name a ${backup.backend.type} repository" >&2
+            exit 1
+            ;;
+        esac
+
         ${
           if backup.backend.type == "rest" then ''
             RESTIC_REST_USERNAME="$(cat "$CREDENTIALS_DIRECTORY/backend-username")"
@@ -60,7 +73,16 @@ let
       initialize = true;
       package = wrapperFor name backup;
       passwordFile = "$CREDENTIALS_DIRECTORY/repository-password";
-      repository = backup.repository;
+      # The repository location comes from the credential, so the unit carries a path to it
+      # rather than the location itself. Not "$CREDENTIALS_DIRECTORY/repository" like
+      # passwordFile above: repositoryFile is typed as an absolute path, so it has to name
+      # systemd's documented runtime location for the unit's credentials directly. Upstream
+      # asserts exactly one of repository/repositoryFile/environmentFile is set.
+      repository = null;
+      repositoryFile = "/run/credentials/restic-backups-${name}.service/repository";
+      # Upstream's `restic-<name>` PATH script bakes the unit's environment into a
+      # world-readable store path, and cannot decrypt systemd credentials anyway.
+      createWrapper = false;
       pruneOpts = [ ];
       runCheck = false;
       timerConfig = backup.timerConfig;
@@ -123,7 +145,7 @@ let
   serviceConfigFor = name: rawBackup:
     let
       backup = rawBackup // { inherit name; };
-      credentials = [ "repository-password" ] ++ backup.backend.credentials;
+      credentials = [ "repository" "repository-password" ] ++ backup.backend.credentials;
       quiesce = backup.stopServices != [ ];
       # "+" runs the command fully privileged: systemd then skips User=, the capability and
       # namespacing options and the seccomp filters for it, which is what lets systemctl
@@ -187,19 +209,18 @@ in
         credentialDirectory = lib.mkOption {
           type = lib.types.str;
           example = "/etc/credentials/restic/${name}";
-          description = "Directory containing repository-password and backend credential files.";
+          description = ''
+            Directory holding the systemd-creds-encrypted blobs this backup needs: `repository`
+            (the full restic repository string, scheme included), `repository-password`, and the
+            files named by {option}`backend.credentials`. The repository location lives here
+            rather than in the configuration so it stays out of the store and out of git.
+          '';
         };
 
         user = lib.mkOption {
           type = lib.types.str;
           example = "sashee";
           description = "User to run the backup service as.";
-        };
-
-        repository = lib.mkOption {
-          type = lib.types.str;
-          example = "rest:https://backup.example.com/home";
-          description = "Restic repository URL without embedded secrets.";
         };
 
         backend = lib.mkOption {

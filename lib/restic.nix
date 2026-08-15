@@ -13,12 +13,11 @@ let
   withPrune = args: args // { prune = defaultPrune // (args.prune or { }); };
 in
 {
+  # The repository location is a credential, not configuration, so these only name the backend
+  # and the credential files it needs. The repository string itself lives in the `repository`
+  # blob in the backup's credentialDirectory.
   rest = args:
-    let
-      normalized = builtins.removeAttrs (withPrune args) [ "url" "repository" ];
-    in
-    normalized // {
-      repository = "rest:${args.url}/${args.repository}";
+    withPrune args // {
       backend = {
         type = "rest";
         credentials = [
@@ -29,11 +28,7 @@ in
     };
 
   s3 = args:
-    let
-      normalized = builtins.removeAttrs (withPrune args) [ "endpoint" "bucket" ];
-    in
-    normalized // {
-      repository = "s3:${args.endpoint}/${args.bucket}";
+    withPrune args // {
       backend = {
         type = "s3";
         credentials = [

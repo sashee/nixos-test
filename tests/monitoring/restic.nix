@@ -35,6 +35,7 @@ let
         install -d -m 0755 -o backup-user -g users /home/backup-user/monitored
 
         printf '%s' 'http://monitoring-platform:8080/${healthPath}' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=healthchecks-url - /etc/credentials/monitoring/healthchecks-url
+        printf '%s' 'rest:${restUrl}/${name}' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository - /etc/credentials/restic/monitored/repository
         printf '%s' 'repo-secret'        | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository-password - /etc/credentials/restic/monitored/repository-password
         printf '%s' 'test-user'          | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-username - /etc/credentials/restic/monitored/backend-username
         printf '%s' '${backendPassword}' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-password - /etc/credentials/restic/monitored/backend-password
@@ -42,6 +43,7 @@ let
 
         chmod 0600 \
           /etc/credentials/monitoring/healthchecks-url \
+          /etc/credentials/restic/monitored/repository \
           /etc/credentials/restic/monitored/repository-password \
           /etc/credentials/restic/monitored/backend-username \
           /etc/credentials/restic/monitored/backend-password
@@ -52,8 +54,6 @@ let
     common.restic.backups.monitored = resticLib.rest {
       user = "backup-user";
       credentialDirectory = "/etc/credentials/restic/monitored";
-      url = restUrl;
-      repository = name;
       paths = [ "/home/backup-user/monitored" ];
       prune.opts = [ "--keep-last 2" ];
     };
