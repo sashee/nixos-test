@@ -7,6 +7,11 @@
 * all incoming communication needs to check the CRC and discard the message on failure
 * every failure exits the unit, systemd will restart it
 
+### Locking the USB
+
+* after open(), use flock()
+* if it is locked already => skip the device on discovery
+
 ### Finding the USB device
 
 * it reads all devices in /dev/ttyUSB

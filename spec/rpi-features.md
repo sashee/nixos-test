@@ -55,6 +55,10 @@
 
 * [](./features/inverter-monitoring/inverter-monitoring.md)
 
+### BMS monitoring
+
+* [](./features/bms-monitoring/bms-monitoring.md)
+
 ## Monitoring platform
 
 * [monitoring platform](./features/monitoring-platform/monitoring-platform.md)
