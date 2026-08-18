@@ -389,7 +389,17 @@ in
         MemoryDenyWriteExecute = true;
         SystemCallFilter = [ "@system-service" ];
         SystemCallArchitectures = "native";
-        CapabilityBoundingSet = [ ];
+        # `""`, NOT `[ ]`, and the spelling is the whole of it. NixOS renders a serviceConfig list
+        # as one line per element, so an empty list emits no line at all -- and a unit with no
+        # CapabilityBoundingSet= keeps the FULL default set, which is the exact opposite of what
+        # writing "no capabilities" was meant to say. The empty string renders the assignment
+        # `CapabilityBoundingSet=`, which systemd reads as "reset to the empty set".
+        #
+        # Measured, not theorised: with `[ ]` here, `systemctl show -p CapabilityBoundingSet`
+        # listed cap_sys_admin among the rest. That one matters more than most, because
+        # CAP_SYS_ADMIN is precisely what bypasses the TIOCEXCL this module's serialGroup note
+        # relies on -- so the claim made there was false while this line was a list.
+        CapabilityBoundingSet = "";
         # The same kernel-enforced local-only guarantee the rest of the measurement path gives
         # itself: this producer speaks to one unix socket and one tty, and has no business opening a
         # network connection.

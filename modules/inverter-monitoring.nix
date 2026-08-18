@@ -373,7 +373,13 @@ in
         MemoryDenyWriteExecute = true;
         SystemCallFilter = [ "@system-service" ];
         SystemCallArchitectures = "native";
-        CapabilityBoundingSet = [ ];
+        # `""`, NOT `[ ]`. NixOS renders a serviceConfig list as one line per element, so an empty
+        # list emits no line at all -- and a unit with no CapabilityBoundingSet= keeps the FULL
+        # default set, the opposite of what writing "no capabilities" was meant to say. The empty
+        # string renders `CapabilityBoundingSet=`, which systemd reads as "reset to the empty set".
+        # This was a list until 2026-08-18, and `systemctl show` on the deployed Pi duly listed
+        # cap_sys_admin among the rest.
+        CapabilityBoundingSet = "";
         # The same kernel-enforced local-only guarantee the rest of the measurement path gives
         # itself: this producer speaks to one unix socket and one tty, and has no business
         # opening a network connection.
