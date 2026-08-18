@@ -59,12 +59,20 @@ let
       (lib.attrNames (commonFeature [ "restic" "backups" ] { }))
     ++ lib.optional config.nix.gc.automatic "nix-gc.service"
     ++ lib.optional config.system.autoUpgrade.enable "nixos-upgrade.service"
-    # The other producer. Unlike this one it is long-running, so `active` is a fact about it
-    # rather than an artefact of being mid-run -- and its characteristic failure, exiting and
+    # The two USB producers. Unlike this one they are long-running, so `active` is a fact about
+    # them rather than an artefact of being mid-run -- and their characteristic failure, exiting and
     # being restarted every 15 minutes because the adapter is gone, is invisible anywhere else:
-    # its measurements simply stop, which reads the same as an inverter that is switched off.
+    # their measurements simply stop, which reads the same as an inverter that is switched off or a
+    # pack that is disconnected.
+    #
+    # It matters more for these two than for anything else in this list, because they are the only
+    # units on the host that can take each other's failure with them: they share the `/dev/ttyUSB*`
+    # pool and arbitrate with an advisory flock, so "one of them is restart-looping" is the shape a
+    # contention bug would have.
     ++ lib.optional (commonFeature [ "inverterMonitoring" "enable" ] false)
       "inverter-monitoring.service"
+    ++ lib.optional (commonFeature [ "bmsMonitoring" "enable" ] false)
+      "bms-monitoring.service"
     # Both hops of the measurement path. The receiver earns its place: if it dies the collector
     # buffers and these records arrive late, so its unit state is recoverable evidence. The
     # producer does not -- see the `units` option description.

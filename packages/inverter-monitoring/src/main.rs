@@ -40,7 +40,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use discover::{Candidate, Probe};
-use port::{SerialPort, Transport};
+use port::{Opened, SerialPort, Transport};
 use protocol::{parse_response, Command, Response, LIVE_COMMANDS, STATIC_COMMANDS};
 use record::{Cycle, Link, Record, Value};
 
@@ -394,7 +394,16 @@ fn connect(options: &Options) -> Result<(SerialPort, Candidate, String), String>
     for candidate in candidates {
         let name = candidate.describe();
         let mut serial = match SerialPort::open(&candidate.tty, BAUD) {
-            Ok(port) => port,
+            Ok(Opened::Port(port)) => port,
+            // Held by the other producer on this host. Retryable rather than a verdict about the
+            // device: it says nothing about whether an inverter is behind it, only that this
+            // process may not look right now. `connect_within`'s window is what makes that
+            // distinction matter -- the two units start together at boot, and whichever loses the
+            // race gets its answer on a later sweep.
+            Ok(Opened::Busy) => {
+                eprintln!("inverter-monitoring: {name} is held by another process; skipping");
+                continue;
+            }
             Err(error) => {
                 eprintln!("inverter-monitoring: cannot open {name}: {error}");
                 continue;

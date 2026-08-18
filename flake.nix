@@ -539,6 +539,18 @@
         machineModule = rpiSystemModule;
         globalTimeout = 2400;
       };
+      # The BMS producer against emulated FTDI adapters, with the inverter producer live beside it on
+      # the same bus -- the port contention between them is half of what this check is for, and it
+      # cannot be seen from either producer's own test. Slow here (TCG, and several subtests wait out
+      # a measurement interval), which is why the same file also runs as an x86 check; but this is
+      # the run on the kernel the Pi actually boots.
+      bmsMonitoringTestRpi = import ./tests/bms-monitoring.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+        globalTimeout = 3000;
+      };
       nixGcRetentionTestRpi = import ./tests/nix-gc-retention.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
@@ -802,6 +814,7 @@
         boot-clock = bootClockTestRpi;
         system-metrics = systemMetricsTestRpi;
         inverter-monitoring = inverterMonitoringTestRpi;
+        bms-monitoring = bmsMonitoringTestRpi;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
         rpiNixUtilsTests)
@@ -1006,6 +1019,13 @@
         # this runs the same on either arch -- but it is the set that runs under KVM, which
         # matters for a test whose subtests each wait out a poll interval.
         rpi5-x86-inverter-monitoring = rpi5X86Test ./tests/inverter-monitoring.nix {
+          machineModule = rpi5X86SystemModule;
+        };
+        # The BMS producer, and the port contention between the two USB producers. `usb-serial` is a
+        # QEMU device rather than a guest kernel feature, so this runs the same on either arch -- but
+        # this is the set that gets KVM, which matters for a test whose subtests each wait out a
+        # measurement interval and which drives a service through an automatic restart.
+        rpi5-x86-bms-monitoring = rpi5X86Test ./tests/bms-monitoring.nix {
           machineModule = rpi5X86SystemModule;
         };
         rpi5-x86-monitoring = rpi5X86Test ./tests/monitoring/rpi.nix {
