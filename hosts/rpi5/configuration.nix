@@ -51,6 +51,7 @@ in
     ../../modules/system-metrics.nix
     ../../modules/detected-devices.nix
     ../../modules/inverter-monitoring.nix
+    ../../modules/bms-monitoring.nix
     ../../modules/time-sync.nix
     ../../modules/connectivity-fallback.nix
     ../../modules/connectivity-watchdog.nix
@@ -262,6 +263,24 @@ in
   # defaults. Everything else (2400 8N1, the command set, the 15-minute restart) is protocol or
   # spec and lives in the module.
   common.inverterMonitoring = {
+    enable = true;
+    socketPath = config.services.mp-collector.socketPath;
+    group = config.services.mp-collector.group;
+  };
+
+  # Fourth producer: the battery BMS on the other USB serial adapter. Same wiring rule again.
+  #
+  # This one and the inverter above share the /dev/ttyUSB* pool and both start at boot, which is
+  # the one interaction worth knowing about at the host level: they arbitrate with an advisory
+  # flock on the device node, so no ordering or device pinning is declared here and none is needed.
+  # See modules/bms-monitoring.nix for what that costs and why the alternative (udev-pinning each
+  # cable to a fixed node) was not taken.
+  #
+  # Note the record cost, which is higher than the other three producers put together: a status row
+  # plus one row per cell every minute, ~8.9M rows a year for a 16-cell pack. That is deliberate --
+  # per-cell divergence is the whole reason to monitor a battery -- but it is the first thing to
+  # turn down if the SD card fills.
+  common.bmsMonitoring = {
     enable = true;
     socketPath = config.services.mp-collector.socketPath;
     group = config.services.mp-collector.group;

@@ -1,0 +1,22 @@
+[package]
+name = "bms-monitoring"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Passively read a JK BMS over USB serial and report it to a local monitoring-platform receiver"
+
+[dependencies]
+# The same crate the receiver decodes with, so the message definitions cannot drift. Identical
+# reasoning (and identical features) to packages/inverter-monitoring: the producers speak the same
+# wire format to the same socket.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs"] }
+prost = "0.14"
+# Safe termios, flock and clock wrappers. AGENTS.md asks for no unsafe blocks, and configuring a
+# serial line -- 115200 8N1, raw, no flow control -- is otherwise a tcsetattr(2) call through libc
+# that would need one. `flock` and `ioctl_tiocexcl` are here for the same reason; between them they
+# are what stops this producer and inverter-monitoring reading one port at once.
+rustix = { version = "1", features = ["fs", "termios", "time"] }
+
+[[bin]]
+name = "bms-monitoring"
+path = "src/main.rs"

@@ -49,9 +49,15 @@ let
   # to ask "what does the inverter say right now" without reading it back out of the store a
   # minute later -- and it works while the service is running, because it opens its own port.
   #
-  # It does NOT work while the service holds the port: TIOCEXCL is exactly the protection that
-  # makes this fail loudly rather than interleave half-frames with the daemon. Stop the unit
-  # first; the error says so.
+  # It does NOT work while the service holds the port, and says so rather than interleaving
+  # half-frames with the daemon: the producer takes an advisory flock on the device node before it
+  # configures or reads the line, so a second copy reports the port busy and moves on. Stop the
+  # unit first.
+  #
+  # flock rather than TIOCEXCL is what makes that true HERE. The ioctl is also set, and it is what
+  # turns away a non-cooperating opener -- but it is bypassed by CAP_SYS_ADMIN, so this command
+  # under `sudo` would sail past it, and it can only reject opens that come *after* it, which the
+  # boot race between this unit and bms-monitoring does not guarantee.
   pollCommand = pkgs.writeShellApplication {
     name = "inverter-monitoring";
     text = ''

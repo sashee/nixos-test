@@ -75,6 +75,19 @@ nixpkgs.lib.nixos.runTest {
     common.monitoring.enable = lib.mkForce false;
     common.irohSsh.enable = lib.mkForce false;
 
+    # The sibling producer, off -- and this one is not about credentials. hosts/rpi5 enables it, so
+    # without this it runs here too and competes for the same three adapters. That breaks the
+    # premise of the `probed first` subtest below: it forces a probe order with the remembered-device
+    # file, which only decides anything if this producer is the one deciding. With bms-monitoring
+    # also sweeping, it holds each candidate's flock for its own listen window, and the inverter
+    # skips the very port the subtest seeded -- so the run never reaches the `unsolicited` log line
+    # it waits for.
+    #
+    # The contention between the two producers is not lost by switching it off here: it is the
+    # subject of tests/bms-monitoring.nix, which runs both together and asserts each holds its own
+    # port. This test stays about the inverter.
+    common.bmsMonitoring.enable = lib.mkForce false;
+
     common.inverterMonitoring = {
       intervalSeconds = lib.mkForce intervalSeconds;
       # Paid once per candidate port, and there are three. The production 10s would put half a
