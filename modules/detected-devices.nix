@@ -244,8 +244,17 @@ in
         # channel: Operation not permitted" and the capture comes back empty, which is
         # indistinguishable from a quiet neighbourhood. Each is granted only where its collector is
         # on, so the default sandbox is unchanged.
-        CapabilityBoundingSet = lib.optional cfg.wifi.enable "CAP_NET_ADMIN"
-          ++ lib.optional cfg.bluetooth.enable "CAP_NET_RAW";
+        # Joined into a string rather than left a list, because the all-off case is the one that
+        # matters: NixOS renders a serviceConfig list as one line per element, so with neither
+        # collector on this would emit no CapabilityBoundingSet= at all and the unit would keep the
+        # FULL default set. "The default sandbox is unchanged" above would then be exactly backwards
+        # -- unchanged means unbounded. A joined string gives systemd one space-separated assignment
+        # when there is something to grant, and `CapabilityBoundingSet=` (reset to empty) when there
+        # is not.
+        CapabilityBoundingSet = lib.concatStringsSep " " (
+          lib.optional cfg.wifi.enable "CAP_NET_ADMIN"
+          ++ lib.optional cfg.bluetooth.enable "CAP_NET_RAW"
+        );
         AmbientCapabilities = lib.optional cfg.wifi.enable "CAP_NET_ADMIN"
           ++ lib.optional cfg.bluetooth.enable "CAP_NET_RAW";
         ProtectHome = true;

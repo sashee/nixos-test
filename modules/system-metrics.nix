@@ -590,9 +590,17 @@ in
         # Reading the firewall's rule set is a privileged operation even though it changes
         # nothing; smartctl needs to issue device commands. Both are granted only when the
         # record that needs them is switched on, so the default sandbox is unchanged.
-        CapabilityBoundingSet =
+        # Joined into a string rather than left a list, because the all-off case is the one that
+        # matters: NixOS renders a serviceConfig list as one line per element, so with neither
+        # record on this would emit no CapabilityBoundingSet= at all and the unit would keep the FULL
+        # default set. "The default sandbox is unchanged" above would then be exactly backwards --
+        # unchanged means unbounded. A joined string gives systemd one space-separated assignment
+        # when there is something to grant, and `CapabilityBoundingSet=` (reset to empty) when there
+        # is not.
+        CapabilityBoundingSet = lib.concatStringsSep " " (
           lib.optional cfg.irohFailsafe.enable "CAP_NET_ADMIN"
-          ++ lib.optional cfg.smart.enable "CAP_SYS_RAWIO";
+          ++ lib.optional cfg.smart.enable "CAP_SYS_RAWIO"
+        );
         AmbientCapabilities =
           lib.optional cfg.irohFailsafe.enable "CAP_NET_ADMIN"
           ++ lib.optional cfg.smart.enable "CAP_SYS_RAWIO";
