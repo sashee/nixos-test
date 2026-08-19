@@ -113,6 +113,23 @@ in
     "vm.dirty_background_bytes" = 16777216;   # 16 MiB
   };
 
+  # Spec: journal max size = 256M (spec/rpi-features.md, System). journald's default is 10% of
+  # the filesystem capped at 4 GB, i.e. ~2.9 GiB on this 29 GB SD -- and it gets there: the card
+  # was holding 1022 MiB across 126 boots reaching back to 2024-12-19 before this cap. That is
+  # both space this host cannot spare (the nightly upgrade needs GBs of headroom for a
+  # from-source kernel) and steady write wear on the SD, for logs nobody reads past the last
+  # few boots.
+  #
+  # No typed nixpkgs option exists for this: the journald module writes Storage/RateLimit*/Audit
+  # from options and appends `extraConfig` verbatim, so the raw key is the documented route.
+  # SystemMaxUse bounds archived + active journal files together; journald enforces it when it
+  # rotates, so a switch does not shrink an over-cap journal on the spot --
+  # `journalctl --vacuum-size=256M` does that immediately.
+  #
+  # Deliberately left alone: SystemKeepFree (default 15% of the fs), which is the other half of
+  # the bound and only ever more conservative than a 256M cap here.
+  services.journald.extraConfig = "SystemMaxUse=256M";
+
   # Spec: bluetooth enabled (spec/rpi-features.md, System). Set here rather than in a shared
   # module because the two hosts disagree -- modules/laptop-base.nix enables it for laptops and
   # anya-feher-laptop forces it back off, so there is no common default to inherit.

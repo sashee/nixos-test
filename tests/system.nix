@@ -1,5 +1,6 @@
 { nixpkgs, pkgs, stateVersion, machineModule, dirtyBytes, dirtyBackgroundBytes
 , bluetooth ? true
+, journalMaxUse ? null
 }:
 
 # The shared System feature (spec/features/system.md): zram swap plus the
@@ -12,6 +13,11 @@
 # the parameter of the same name in tests/common-desktop.nix -- the hosts disagree (the rpi5
 # spec asks for it, anya-feher-laptop's spec asks for it off), so this cannot be a constant.
 # The disabled case is asserted by the host's own test, tests/anya-feher-laptop.nix.
+#
+# `journalMaxUse`: expected SystemMaxUse, or null for "this host does not cap the journal".
+# Only the rpi5 spec asks for a cap (its 29 GB SD cannot afford journald's ~10%-of-the-disk
+# default), so unlike dirtyBytes this has no laptop counterpart to pass -- hence the default
+# rather than a required argument.
 nixpkgs.lib.nixos.runTest {
   name = "system";
   hostPkgs = pkgs;
@@ -58,6 +64,22 @@ nixpkgs.lib.nixos.runTest {
     # ratio here would mean the byte value never took (defaults are 20 and 10).
     assert machine.succeed("cat /proc/sys/vm/dirty_ratio").strip() == "0"
     assert machine.succeed("cat /proc/sys/vm/dirty_background_ratio").strip() == "0"
+    ${nixpkgs.lib.optionalString (journalMaxUse != null) ''
+      # the spec'd journal cap reached the config journald reads
+      machine.succeed("grep -qE '^[[:space:]]*SystemMaxUse=${journalMaxUse}[[:space:]]*$' /etc/systemd/journald.conf")
+
+      # ... and journald accepted the key. This is the half that would otherwise go untested:
+      # the size actually in force is not exposed anywhere queryable, and systemd's config
+      # parser only *warns* on an unrecognised key and carries on, so a typo would leave the
+      # journal silently uncapped with a passing grep above.
+      machine.fail(
+          "journalctl -b -u systemd-journald --no-pager"
+          " | grep -qiE 'unknown key|failed to parse|invalid'"
+      )
+
+      # journald is up on that config rather than crash-looping on it
+      machine.succeed("systemctl is-active systemd-journald.service")
+    ''}
     ${nixpkgs.lib.optionalString bluetooth ''
       # BlueZ is installed and bluetoothd is wired up to start.
       machine.succeed("systemctl is-enabled bluetooth.service")

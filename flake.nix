@@ -518,6 +518,7 @@
         machineModule = rpiSystemModule;
         dirtyBytes = 67108864;             # 64 MiB
         dirtyBackgroundBytes = 16777216;   # 16 MiB
+        journalMaxUse = "256M";
       };
       # The measurement producer against the receiver the Pi actually deploys. Slow here (TCG),
       # which is why the same file also runs as a generic x86 check.
@@ -1005,6 +1006,7 @@
           machineModule = rpi5X86SystemModule;
           dirtyBytes = 67108864;             # 64 MiB
           dirtyBackgroundBytes = 16777216;   # 16 MiB
+          journalMaxUse = "256M";
         };
         rpi5-x86-system-metrics = rpi5X86Test ./tests/system-metrics.nix {
           machineModule = rpi5X86SystemModule;

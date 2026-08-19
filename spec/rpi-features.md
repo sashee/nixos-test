@@ -7,6 +7,7 @@
 * vm.dirty_bytes = 67108864
 * vm.dirty_background_bytes = 16777216
 * bluetooth enabled
+* journal max size = 256M
 
 ## Wifi
 
