@@ -507,15 +507,28 @@ nixpkgs.lib.nixos.runTest {
         # difference between a re-dated sample and one shipped with a shrug.
         held = query("type=system.memory&limit=10")
         assert held, "the held batch never arrived"
-        uncertain = held[0]["attributes"].get("record.attributes.mp.clock.uncertain")
-        assert uncertain in (None, False, "false"), (
-            f"the batch was flushed on timeout rather than on sync: {held[0]['attributes']}"
+
+        # The collector stamps clock attributes BY EXCEPTION (design 6.3/9.1): a record that was
+        # corrected, from a synchronised clock, with no ambiguity, carries none at all. So the
+        # happy path is asserted as absence -- and the absence is worth asserting, because every
+        # key that could appear here names a way this flush went wrong:
+        #   uncertain  -- flushed on the 300s cap without ever syncing
+        #   resolution -- NOT corrected; `passthrough` is a timestamp that silently degraded
+        #   ambiguity_spread_ns -- the frame resolved to more than one candidate
+        clock_attrs = {
+            k: v for k, v in held[0]["attributes"].items()
+            if k.startswith("record.attributes.mp.clock.")
+        }
+        assert not clock_attrs, (
+            f"a batch flushed on sync must be an ordinary corrected record, stamped with no clock "
+            f"attributes at all: {clock_attrs}"
         )
-        # Proof the hop happened at all: these attributes are the collector's, and a producer
-        # posting straight at the receiver could not have produced them.
-        assert any(
-            k.startswith("record.attributes.mp.clock.") for k in held[0]["attributes"]
-        ), f"the batch did not travel through the collector: {held[0]['attributes']}"
+        # Nothing per-record proves the collector hop any more, and that is the point of stamping
+        # by exception: on the normal path the corrected timestamp IS the output. The hop is
+        # established instead by the pair of states either side of this line -- the store empty
+        # while the collector's buffer held records (the subtest above), and both inverted here.
+        # Neither is reachable if the producer were posting straight at the receiver, which the
+        # first subtest also pins on the rendered ExecStart.
 
     with subtest("the states the later subtests measure are reached first"):
         # Every record type has to be reachable before --dry-run is compared against a real
