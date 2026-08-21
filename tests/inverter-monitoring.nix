@@ -54,9 +54,14 @@ let
   # It has to be an explicitly EMPTY `serial=`, not an omitted one: with the property unset QEMU
   # synthesises a serial from the bus topology (`1-0000:00:0a.0-3`), which is unique per port and
   # would quietly defeat the whole point of these two devices.
+  #
+  # The `id=` on the device -- as opposed to the one on the chardev -- exists so the monitor can
+  # `device_del` it, which is how the last subtest unplugs an adapter. That is a definite USB
+  # detach: the guest logs `usb N-1: USB disconnect` and ftdi_sio hangs up the tty, which is the
+  # state that subtest is about and which muting the simulator does not reach.
   usbSerial = id: path: serial: [
     "-chardev socket,id=${id},path=${path}"
-    "-device usb-serial,bus=xhci.0,chardev=${id},serial=${nixpkgs.lib.optionalString (serial != null) serial}"
+    "-device usb-serial,id=${id}-dev,bus=xhci.0,chardev=${id},serial=${nixpkgs.lib.optionalString (serial != null) serial}"
   ];
 in
 
@@ -818,5 +823,65 @@ nixpkgs.lib.nixos.runTest {
             return latest()["body"]["battery_voltage_volts"] is not None
 
         retry(answering)
+
+    # The third case, and the one the mute above is routinely mistaken for: the adapter itself goes
+    # away mid-cycle. LAST, because the device does not come back.
+    #
+    # A hung-up tty answers a *read* with an instant zero-length result, byte-for-byte what an
+    # unanswered command looks like, which is how the sibling producer came to treat a vanished
+    # adapter as a quiet one and spin on it for 154 seconds when the fleet's Pi lost its xHCI
+    # controller on 2026-08-21.
+    #
+    # This producer reaches the same end by a different road, and the difference is worth writing
+    # down because it is why the fix here is less visible than the sibling's: it WRITES before every
+    # read, and a write to a hung-up tty fails EIO outright. So in the poll loop the command is what
+    # notices, and that path was already fatal and already prompt -- which is what the assertions
+    # below check, since it is what actually happens.
+    #
+    # The read path still matters here, in the two places no write precedes it: `listen()` during
+    # discovery, which probes for unprompted chatter and has no early exit at all, and a `read_frame`
+    # whose write was accepted before the device went. Neither is reachable from this harness --
+    # discovery only runs at boot and after a restart, by which time the adapter is simply absent
+    # rather than vanishing mid-read -- so both are covered by unit tests against a real hangup on a
+    # real fd instead. See packages/inverter-monitoring/src/port.rs.
+    #
+    # Asserted semantically rather than by the clock: a spin would show up as the response timeouts
+    # it had to wait out, so their absence is what says the run ended on the disconnect.
+    with subtest("an adapter that vanishes ends the run at once instead of reading as a mute unit"):
+        machine.succeed("systemctl is-active --quiet inverter-monitoring.service")
+        device = latest()["attributes"]["resource.attributes.inverter.device"]
+        inv_tty = next(f"ttyUSB{n}" for n in range(3) if by_path_of(f"ttyUSB{n}") == device)
+        before_restarts = restarts()
+
+        # Everything it says from here on, and nothing it said before: the mute subtest above
+        # produced the silence messages on purpose, so the negative assertions need a window.
+        cursor = machine.succeed(
+            "journalctl -u inverter-monitoring.service --no-pager -n0 --show-cursor "
+            "| sed -n 's/^-- cursor: //p'"
+        ).strip()
+        assert cursor, "no journal cursor, so the assertions below would read the whole boot"
+
+        # A genuine USB unplug: the guest takes it through its real ftdi_sio and its real udev.
+        machine.send_monitor_command("device_del inv-dev")
+        machine.wait_until_fails(f"test -e /dev/{inv_tty}", timeout=120)
+
+        def gave_up(_):
+            return restarts() > before_restarts
+
+        retry(gave_up)
+        after = machine.succeed(
+            "journalctl -u inverter-monitoring.service --no-pager "
+            f"--after-cursor '{cursor}'"
+        )
+
+        # It ended on the port rather than on the protocol: a lost adapter is not something a retry
+        # can mend, and the module documents a 15-minute wait as the answer. Either half of the
+        # exchange may be the one that notices -- the write does, here -- so this asserts the
+        # property both share rather than pinning the message of whichever wins the race.
+        assert "Input/output error" in after or "the port hung up" in after, after
+        # And it got there without waiting out a single response timeout or counting a silent cycle,
+        # which is what it would have done had the disconnect read as a mute unit.
+        assert "timed out after" not in after, after
+        assert "answered nothing" not in after, after
   '';
 }

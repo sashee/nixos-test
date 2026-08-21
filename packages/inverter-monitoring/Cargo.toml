@@ -11,10 +11,14 @@ description = "Poll a Voltronic-protocol solar inverter over USB serial and repo
 # same wire format to the same socket.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs"] }
 prost = "0.14"
-# Safe termios and clock wrappers. AGENTS.md asks for no unsafe blocks, and configuring a serial
-# line -- 2400 8N1, raw, no flow control -- is otherwise a tcsetattr(2) call through libc that
-# would need one. `ioctl_tiocexcl` is here for the same reason.
-rustix = { version = "1", features = ["fs", "termios", "time"] }
+# Safe termios, poll and clock wrappers. AGENTS.md asks for no unsafe blocks, and configuring a
+# serial line -- 2400 8N1, raw, no flow control -- is otherwise a tcsetattr(2) call through libc
+# that would need one. `ioctl_tiocexcl` is here for the same reason.
+#
+# `event` is poll(2), which is how the read path tells a quiet line from a disconnected adapter --
+# see the comment on `SerialPort::wait`. `pipe` is used only by that module's tests, to produce a
+# real hangup on a real fd without an adapter to unplug.
+rustix = { version = "1", features = ["event", "fs", "pipe", "termios", "time"] }
 
 [[bin]]
 name = "inverter-monitoring"

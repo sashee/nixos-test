@@ -52,9 +52,19 @@ let
   # An explicitly EMPTY `serial=` for the two that stand in for the fleet's CH340: with the property
   # unset QEMU synthesises one from the bus topology, which is unique per port and would defeat the
   # by-id collision these devices exist to reproduce.
+  #
+  # The `id=` on the device -- as opposed to the one on the chardev -- exists so the monitor can
+  # `device_del` it, which is how the last subtest unplugs an adapter. That is a definite USB
+  # detach: the guest logs `usb N-1: USB disconnect` and ftdi_sio hangs up the tty, which is the
+  # state that subtest is about and which nothing else here reaches.
+  #
+  # Whether letting a chardev socket close would do the same is deliberately not relied on. The
+  # comment on `pack_cells` below reports it detaching the device, but the ~20s it took the producer
+  # to notice is also exactly three frame timeouts -- the go-quiet path -- so that observation does
+  # not distinguish the two, and a subtest asserting a hangup cannot rest on it.
   usbSerial = id: path: serial: [
     "-chardev socket,id=${id},path=${path}"
-    "-device usb-serial,bus=xhci.0,chardev=${id},serial=${nixpkgs.lib.optionalString (serial != null) serial}"
+    "-device usb-serial,id=${id}-dev,bus=xhci.0,chardev=${id},serial=${nixpkgs.lib.optionalString (serial != null) serial}"
   ];
 in
 
@@ -924,5 +934,58 @@ nixpkgs.lib.nixos.runTest {
             return latest()["body"]["pack_voltage_volts"] == 52.036
 
         retry(answering)
+
+    # The third case, and the one the other two are routinely mistaken for: the adapter itself goes
+    # away under a running reader. LAST, because the device does not come back.
+    #
+    # On 2026-08-21 the fleet's Pi lost its whole xHCI controller and the FTDI with it. The producer
+    # read that as a quiet pack and took the silence path: a hung-up tty answers a read with an
+    # instant zero-length result, which is byte-for-byte what an idle line's VTIME expiry looks like,
+    # so the read loop could not tell them apart and spun a core flat for 154 seconds while the
+    # silent-cycle counter walked to three. `SerialPort::wait` separates them with poll(2), and this
+    # is the only place the separation can be checked against a real tty rather than a pipe.
+    #
+    # Both halves are asserted, and neither by the clock -- a TCG runner is too slow for wall-clock
+    # thresholds to mean anything. The spin shows up as the frame-timeout messages it would have had
+    # to wait out; their absence is what says the run ended on the disconnect instead.
+    with subtest("an adapter that vanishes ends the run at once instead of reading as silence"):
+        machine.succeed("systemctl is-active --quiet bms-monitoring.service")
+        bms_tty = tty_for(latest()["attributes"]["resource.attributes.bms.device"])
+        before = restarts("bms-monitoring.service")
+
+        # Everything the producer says from here on, and nothing it said before: an earlier subtest
+        # produced the silence messages on purpose, so the negative assertions below need a window.
+        cursor = machine.succeed(
+            "journalctl -u bms-monitoring.service --no-pager -n0 --show-cursor "
+            "| sed -n 's/^-- cursor: //p'"
+        ).strip()
+        assert cursor, "no journal cursor, so the assertions below would read the whole boot"
+
+        # A genuine USB unplug: the guest takes it through its real ftdi_sio and its real udev.
+        machine.send_monitor_command("device_del bms-dev")
+        machine.wait_until_fails(f"test -e /dev/{bms_tty}", timeout=120)
+
+        def gave_up(_):
+            return restarts("bms-monitoring.service") > before
+
+        retry(gave_up)
+        after = machine.succeed(
+            f"journalctl -u bms-monitoring.service --no-pager --after-cursor '{cursor}'"
+        )
+
+        # It named the disconnect, which is the fatal branch the module documents for a lost port.
+        assert "the port hung up" in after, after
+        # And it got there without waiting out a single frame timeout. Before the fix there were
+        # three of these, at 8 seconds and a hot loop each.
+        assert "no realtime frame within" not in after, after
+        assert "pushed nothing" not in after, after
+
+        # The documented consequence, once the adapter is gone for good: systemd starts it over and
+        # it finds nothing, rather than attaching to one of the two adapters that are not a BMS.
+        machine.wait_until_succeeds(
+            "journalctl -u bms-monitoring.service --no-pager "
+            f"--after-cursor '{cursor}' | grep -q 'no BMS found'",
+            timeout=180,
+        )
   '';
 }
