@@ -11,11 +11,15 @@ description = "Passively read a JK BMS over USB serial and report it to a local 
 # wire format to the same socket.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs"] }
 prost = "0.14"
-# Safe termios, flock and clock wrappers. AGENTS.md asks for no unsafe blocks, and configuring a
-# serial line -- 115200 8N1, raw, no flow control -- is otherwise a tcsetattr(2) call through libc
-# that would need one. `flock` and `ioctl_tiocexcl` are here for the same reason; between them they
-# are what stops this producer and inverter-monitoring reading one port at once.
-rustix = { version = "1", features = ["fs", "termios", "time"] }
+# Safe termios, flock, poll and clock wrappers. AGENTS.md asks for no unsafe blocks, and
+# configuring a serial line -- 115200 8N1, raw, no flow control -- is otherwise a tcsetattr(2) call
+# through libc that would need one. `flock` and `ioctl_tiocexcl` are here for the same reason;
+# between them they are what stops this producer and inverter-monitoring reading one port at once.
+#
+# `event` is poll(2), which is how the read path tells an idle line from a disconnected adapter --
+# see the comment on `SerialPort::wait`. `pipe` is used only by that module's tests, to produce a
+# real hangup on a real fd without an adapter to unplug.
+rustix = { version = "1", features = ["event", "fs", "pipe", "termios", "time"] }
 
 [[bin]]
 name = "bms-monitoring"

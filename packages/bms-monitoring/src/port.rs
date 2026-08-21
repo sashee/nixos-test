@@ -13,6 +13,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Instant;
 
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::fs::{fcntl_setfl, flock, FlockOperation, OFlags};
 use rustix::io::Errno;
 use rustix::termios::{
@@ -25,8 +26,14 @@ use crate::frame::{Frame, FrameReader};
 /// What the reader needs from a port. A trait so the framing and the poll loop can be driven from
 /// a scripted fake; the VM test exercises the real implementation against an emulated FTDI.
 pub trait Transport {
-    /// Read whatever has arrived, bounded by the driver's own `VTIME`. `Ok(0)` is "nothing yet",
-    /// which on this line is the normal state -- the wire is idle between bursts.
+    /// Read whatever has arrived. `Ok(0)` is "nothing yet", which on this line is the normal state
+    /// -- the wire is idle between bursts. An `Err` means the port is finished, which the caller
+    /// treats as fatal.
+    ///
+    /// An implementation must not answer `Ok(0)` without having waited: the caller reads that as
+    /// "ask again" and has no pacing of its own. [`SerialPort`] gets that from the `poll(2)` in
+    /// [`SerialPort::wait`]. The test fake ignores the contract and answers instantly, which is
+    /// why the tests below give it short deadlines.
     fn read_some(&mut self, buffer: &mut [u8]) -> std::io::Result<usize>;
 }
 
@@ -41,9 +48,14 @@ pub trait Transport {
 /// across calls. A fresh reader per measurement would resynchronise from scratch every minute and
 /// lose the frame that was half-arrived when the last one returned.
 ///
-/// No sleep on an empty read: the driver provides the pacing, since `VMIN`/`VTIME` make a real
-/// read block for up to 100ms. A fake port answers instantly and so spins, which is why tests give
-/// it short deadlines.
+/// No sleep on an empty read, because [`Transport::read_some`] is what blocks -- see the contract
+/// there. That contract is load-bearing rather than incidental: while the pacing was the driver's
+/// `VTIME` instead of this process's own `poll(2)`, a *disconnected* adapter began answering
+/// zero-length reads instantly and for ever, and this loop spun a core flat for the whole
+/// deadline. Measured on the fleet's Pi on 2026-08-21: 154.995s of CPU across the 154s between the
+/// adapter vanishing and the third silent measurement ending the run.
+///
+/// A fake port answers instantly by design, which is why tests give it short deadlines.
 pub fn read_until<T: Transport>(
     transport: &mut T,
     reader: &mut FrameReader,
@@ -71,6 +83,52 @@ pub fn read_until<T: Transport>(
         }
     }
     Ok(None)
+}
+
+/// How long one wait blocks before reporting an idle line.
+///
+/// The same 100ms the line's `VTIME` is set to, so the loop above ticks at the rate it always did.
+/// What changed is whose clock it is: this process's, not the driver's.
+const WAIT: Timespec = Timespec { tv_sec: 0, tv_nsec: 100_000_000 };
+
+/// What one wait on the port found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ready {
+    /// Bytes are waiting to be read.
+    Readable,
+    /// Nothing arrived inside [`WAIT`]. The ordinary state of this line between bursts.
+    Idle,
+    /// The port is gone. Distinct from [`Ready::Idle`] and that distinction is the point of this
+    /// enum: a BMS that has stopped talking is idle and recoverable, an adapter that has been
+    /// unplugged is neither.
+    Gone,
+}
+
+/// Read one `poll(2)` result.
+///
+/// Pure, and deliberately separated from the syscall: this mapping is the whole of the fix, and
+/// none of the interesting cases can be produced on demand from a real adapter.
+///
+/// `HUP` outranks `IN`. A hung-up tty may report both, but the hangup flushes the input queue, so
+/// whatever `IN` is promising is not the pack's -- and taking the `IN` branch is precisely what
+/// used to happen, whereupon the read returned zero instantly and the caller looped on it.
+fn classify(revents: PollFlags) -> Ready {
+    if revents.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL) {
+        Ready::Gone
+    } else if revents.contains(PollFlags::IN) {
+        Ready::Readable
+    } else {
+        Ready::Idle
+    }
+}
+
+/// The error a vanished adapter produces.
+///
+/// `NotConnected` rather than a bare string so the kind carries the meaning: it is the same kind
+/// [`fake::FakePort::failing_after`] has always used to stand in for an unplugged adapter, and the
+/// caller's fatal/transient split can be made on it if it ever needs to be finer than "any `Err`".
+fn disconnected() -> std::io::Error {
+    std::io::Error::new(ErrorKind::NotConnected, "the port hung up; the adapter is gone")
 }
 
 /// Take the whole-device advisory lock, or report that someone else has it.
@@ -181,6 +239,10 @@ impl SerialPort {
         // frame deadline is enforced by the loop above this, not by the driver: one frame is 300
         // bytes and ~26ms of wire time at 115200, but they arrive 6.7 seconds apart, so any
         // single-read timeout long enough to span that gap would be far too coarse to cancel on.
+        //
+        // These are no longer what paces the read loop -- `wait()` is -- but they stay, because
+        // they bound the one read that follows a `poll(2)` claiming the port is readable. That is
+        // the case where poll and the read can disagree, and without VTIME it would block.
         termios.special_codes[SpecialCodeIndex::VMIN] = 0;
         termios.special_codes[SpecialCodeIndex::VTIME] = 1;
 
@@ -189,17 +251,45 @@ impl SerialPort {
 
         Ok(Opened::Port(SerialPort { file }))
     }
+
+    /// Block until the port has something to say, [`WAIT`] passes, or the port goes away.
+    ///
+    /// The only place the read path blocks, and asking `poll(2)` rather than letting the driver's
+    /// `VTIME` do it is what separates an idle line from a disconnected one. A zero-length read
+    /// cannot separate them: the tty layer answers a hung-up port with an instant end-of-file that
+    /// is byte-for-byte indistinguishable from an idle port's VTIME expiry.
+    ///
+    /// That ambiguity is what cost the fleet's Pi a core of CPU for 154 seconds on 2026-08-21, when
+    /// a dying USB controller took the adapter with it. The lost measurements were the controller's
+    /// doing and no read loop could have saved them; the spin, and the 90 seconds spent reaching a
+    /// conclusion the first read already had the evidence for, were this function's absence.
+    fn wait(&self) -> std::io::Result<Ready> {
+        let mut fds = [PollFd::new(&self.file, PollFlags::IN)];
+        match poll(&mut fds, Some(&WAIT)) {
+            Ok(_) => Ok(classify(fds[0].revents())),
+            // A signal is not news about the port, and the caller's next turn asks again.
+            Err(Errno::INTR) => Ok(Ready::Idle),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 impl Transport for SerialPort {
     fn read_some(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        match self.file.read(buffer) {
-            Ok(count) => Ok(count),
-            // VTIME expiry surfaces as a zero-length read, but a port that momentarily has
-            // nothing can also answer EAGAIN; neither is an error on an idle line.
-            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(0),
-            Err(error) if error.kind() == ErrorKind::Interrupted => Ok(0),
-            Err(error) => Err(error),
+        match self.wait()? {
+            Ready::Idle => Ok(0),
+            Ready::Gone => Err(disconnected()),
+            Ready::Readable => match self.file.read(buffer) {
+                // Readable and yet empty is end-of-file, and a tty gets there only by being hung
+                // up. It is NOT silence: the wait above has just said there were bytes, so a read
+                // that finds none is the port ending rather than the line being quiet.
+                Ok(0) => Err(disconnected()),
+                Ok(count) => Ok(count),
+                // A spurious wakeup, which costs nothing now that the wait is what paces the loop.
+                Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(0),
+                Err(error) if error.kind() == ErrorKind::Interrupted => Ok(0),
+                Err(error) => Err(error),
+            },
         }
     }
 }
@@ -215,6 +305,12 @@ pub mod fake {
     /// Silence rather than EOF, because that is what the hardware does -- a BMS that has stopped
     /// talking leaves the port open and readable, returning nothing. An EOF would make the
     /// go-silent path look like an I/O error and take a different branch.
+    ///
+    /// That is exactly the [`Ready::Idle`] / [`Ready::Gone`] split, and the two fakes line up with
+    /// it: [`FakePort::silent`] is a live pack saying nothing, [`FakePort::failing_after`] is the
+    /// adapter being pulled. What this fake cannot model is the ambiguity underneath -- the real
+    /// port answers both with a zero-length read, and separating them is `SerialPort`'s job and is
+    /// tested against a real fd rather than here.
     pub struct FakePort {
         pub chunks: VecDeque<Vec<u8>>,
         pub reads: usize,
@@ -261,6 +357,7 @@ pub mod fake {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -351,6 +448,95 @@ mod tests {
             .unwrap()
             .expect("a frame split into 3-byte reads is still a frame");
         assert!(frame.is_realtime());
+    }
+
+    #[test]
+    fn a_hangup_outranks_everything_else_poll_can_say() {
+        assert_eq!(classify(PollFlags::IN), Ready::Readable);
+        assert_eq!(classify(PollFlags::empty()), Ready::Idle);
+        assert_eq!(classify(PollFlags::HUP), Ready::Gone);
+        // Both at once, which is what a tty can report at the moment it is unplugged. Readable
+        // wins here and the port spins; Gone wins and the run ends.
+        assert_eq!(classify(PollFlags::HUP | PollFlags::IN), Ready::Gone);
+        assert_eq!(classify(PollFlags::ERR), Ready::Gone);
+        assert_eq!(classify(PollFlags::NVAL), Ready::Gone);
+    }
+
+    /// A port over a pipe. Not a tty, and it does not need to be: what these tests are about is the
+    /// `poll(2)`/`read(2)` pair and the three answers it can give, and a pipe produces all three on
+    /// demand where an FTDI adapter produces the interesting ones only by being unplugged. That the
+    /// *hardware* reaches them at all is what tests/bms-monitoring.nix checks, against a QEMU
+    /// usb-serial device it detaches mid-run.
+    fn pipe_port() -> (SerialPort, File) {
+        let (read, write) = rustix::pipe::pipe().expect("a pipe");
+        (SerialPort { file: File::from(read) }, File::from(write))
+    }
+
+    /// The regression this whole arrangement exists for. A port whose other end has gone must be an
+    /// error, not silence: as silence it costs three frame timeouts to reach the same conclusion,
+    /// and spends them spinning.
+    #[test]
+    fn a_vanished_peer_is_an_error_rather_than_silence() {
+        let (mut port, write) = pipe_port();
+        drop(write);
+
+        let mut chunk = [0u8; 8];
+        let error = port.read_some(&mut chunk).expect_err("a hangup must not read as an idle line");
+        assert_eq!(error.kind(), ErrorKind::NotConnected, "{error}");
+    }
+
+    /// And the loop above must end on it at once rather than burning the deadline. This is the
+    /// shape of the Pi's 2026-08-21 failure: a 30-second frame timeout, an adapter that is gone,
+    /// and -- before the fix -- 30 seconds of hot loop per measurement.
+    #[test]
+    fn a_vanished_peer_ends_the_read_loop_without_spinning() {
+        let (mut port, write) = pipe_port();
+        drop(write);
+
+        let mut reader = FrameReader::default();
+        let started = Instant::now();
+        let outcome = read_until(
+            &mut port,
+            &mut reader,
+            Instant::now() + Duration::from_secs(30),
+            Frame::is_realtime,
+        );
+
+        assert!(outcome.is_err(), "a gone port must not be waited out");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "took {:?} of a 30s deadline",
+            started.elapsed()
+        );
+    }
+
+    /// The other half, and the property that actually bounds the CPU: an open port with nothing on
+    /// it is silence, and one empty answer costs a wait rather than a turn of a hot loop. Without
+    /// this, `read_until` is free to spin however correct its hangup handling is.
+    #[test]
+    fn an_idle_port_costs_a_wait_rather_than_a_spin() {
+        // The write end is held open and nothing is written: a live pack between bursts.
+        let (mut port, _write) = pipe_port();
+
+        let mut chunk = [0u8; 8];
+        let started = Instant::now();
+        assert_eq!(port.read_some(&mut chunk).unwrap(), 0, "an idle port is not an error");
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "an empty read returned in {:?}, so the caller is free to spin on it",
+            started.elapsed()
+        );
+    }
+
+    /// And bytes still arrive, which is the case the added `poll(2)` must not get in the way of.
+    #[test]
+    fn bytes_on_a_live_port_are_still_returned() {
+        let (mut port, mut write) = pipe_port();
+        write.write_all(b"hello").unwrap();
+
+        let mut chunk = [0u8; 8];
+        assert_eq!(port.read_some(&mut chunk).unwrap(), 5);
+        assert_eq!(&chunk[..5], b"hello");
     }
 
     fn temp_path(name: &str) -> PathBuf {
