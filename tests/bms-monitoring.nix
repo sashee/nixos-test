@@ -519,6 +519,29 @@ nixpkgs.lib.nixos.runTest {
         return int(machine.succeed(f"systemctl show -p NRestarts --value {unit}").strip())
 
 
+    def cursor_now(unit="bms-monitoring.service"):
+        """A journal cursor at this instant, to read what a unit says from here on.
+
+        Every wait below that is about one particular run of the producer needs one: the messages
+        it emits are the same ones earlier subtests provoked on purpose, so without a window they
+        would be satisfied, or falsified, by the wrong boot.
+        """
+        cursor = machine.succeed(
+            f"journalctl -u {unit} --no-pager -n0 --show-cursor "
+            "| sed -n 's/^-- cursor: //p'"
+        ).strip()
+        assert cursor, f"no journal cursor for {unit}, so the read would cover the whole boot"
+        return cursor
+
+
+    def says_after(cursor, text, unit="bms-monitoring.service", timeout=240):
+        """Wait for `text` in `unit`'s journal, counting only what follows `cursor`."""
+        machine.wait_until_succeeds(
+            f"journalctl -u {unit} --no-pager --after-cursor '{cursor}' | grep -qF '{text}'",
+            timeout=timeout,
+        )
+
+
     def links_of(tty, kind):
         """The `/dev/serial/<kind>/` link names udev made for one tty.
 
@@ -925,11 +948,19 @@ nixpkgs.lib.nixos.runTest {
 
         # And it comes back on its own once the pack does: the restart is a recovery path, not a
         # tombstone.
+        #
+        # Waited out by the attach line, because neither of the two obvious gates says anything
+        # about the restarted process. `active` covers the whole of discovery, which is a scan
+        # over three adapters and costs ~8s on a TCG runner. And this producer publishes NOTHING
+        # while the pack is quiet -- the silence branch only logs -- so `latest()` is still the
+        # last pre-mute row, and a predicate over it is already true before the new process has
+        # opened a thing. Both let the subtest below unplug an adapter nobody was reading.
+        recovered = cursor_now()
         with lock:
             state["mute"] = False
-        machine.wait_until_succeeds("systemctl is-active --quiet bms-monitoring.service")
+        says_after(recovered, "BMS on ")
 
-        # A measurement that read a frame, not merely one more record.
+        # And, having attached, it is reading frames off it again rather than merely holding it.
         def answering(_):
             return latest()["body"]["pack_voltage_volts"] == 52.036
 
@@ -955,11 +986,7 @@ nixpkgs.lib.nixos.runTest {
 
         # Everything the producer says from here on, and nothing it said before: an earlier subtest
         # produced the silence messages on purpose, so the negative assertions below need a window.
-        cursor = machine.succeed(
-            "journalctl -u bms-monitoring.service --no-pager -n0 --show-cursor "
-            "| sed -n 's/^-- cursor: //p'"
-        ).strip()
-        assert cursor, "no journal cursor, so the assertions below would read the whole boot"
+        cursor = cursor_now()
 
         # A genuine USB unplug: the guest takes it through its real ftdi_sio and its real udev.
         machine.send_monitor_command("device_del bms-dev")
@@ -982,10 +1009,6 @@ nixpkgs.lib.nixos.runTest {
 
         # The documented consequence, once the adapter is gone for good: systemd starts it over and
         # it finds nothing, rather than attaching to one of the two adapters that are not a BMS.
-        machine.wait_until_succeeds(
-            "journalctl -u bms-monitoring.service --no-pager "
-            f"--after-cursor '{cursor}' | grep -q 'no BMS found'",
-            timeout=180,
-        )
+        says_after(cursor, "no BMS found", timeout=180)
   '';
 }
