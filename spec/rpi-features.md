@@ -66,8 +66,8 @@
 
 ## Auto-reboot
 
-* every hour it tries to resolve a DNS address
-* if it hasn't succeeded in 24 hours then reboot
+* every 10 minutes it tries to resolve a DNS address
+* if it hasn't succeeded in 3 hours then reboot
 
 ## Backups
 
