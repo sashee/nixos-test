@@ -492,13 +492,28 @@ nixpkgs.lib.nixos.runTest {
         return json.loads(raw)["measurements"]
 
 
-    def of_type(kind):
-        return [m for m in query() if m["type"] == kind]
+    def of_type(kind, limit=1000):
+        """Every stored record of one type, newest first, up to `limit`.
+
+        Filtered by the reader rather than here. Two reasons, and the first is the one that made
+        this a bug: every read comes back through the test driver's backdoor as one base64 blob
+        down a virtio-console, and an unfiltered page is a thousand records of it -- the decode
+        that failed on the rpi5-x86 leg on 2026-08-21 was already 96 KB in when it broke. This
+        suite issues something over a hundred reads per run, 146 of them on that one before it
+        died, and each was the whole page for the sake of a field or two.
+
+        The second is that `type=` filters the WHOLE table, where the Python it replaces filtered a
+        fixed-size window of the newest rows of every type. That window slides -- the node writes
+        tens of records an interval -- so a count taken from it could shrink while nothing was
+        deleted, which is not a property any assertion below wants to rest on.
+        """
+        return query(f"type={kind}&limit={limit}")
 
 
     def latest(kind="bms.status"):
-        # The read API orders event_time DESC, id DESC, so the newest record of a kind is first.
-        rows = of_type(kind)
+        # The read API orders event_time DESC, id DESC, so one row is the newest record of a kind.
+        # Asked for as one row: this is the hot path, inside nearly every predicate below.
+        rows = of_type(kind, limit=1)
         assert rows, f"no {kind} measurement in the store"
         return rows[0]
 
@@ -509,6 +524,10 @@ nixpkgs.lib.nixos.runTest {
         NOT a way to wait for the effect of something the test just did: the record that lands next
         may have been read off the wire before it. Waiting for an effect means retrying on the value
         it changes, which is what the named predicates below all do.
+
+        Counting is sound only while the count can still grow: `of_type` stops at the API's 1000-row
+        cap, and a saturated count would never exceed `before`. bms.status arrives once an interval,
+        so the suite would have to run for well over an hour to reach it.
         """
         before = len(of_type("bms.status"))
         retry(lambda _: len(of_type("bms.status")) > before)
@@ -802,6 +821,10 @@ nixpkgs.lib.nixos.runTest {
     with subtest("the interleaved Modbus traffic is skipped rather than decoded"):
         # 136 bytes of RS485 records per cycle, and not one of them may become a frame or a record:
         # everything this producer emits is one of the five documented types.
+        #
+        # The one read in this file that is deliberately NOT filtered by type, and the only one that
+        # pays the full page for it: a `type=` filter here would ask the reader for the types this
+        # assertion exists to prove nobody wrote.
         emitted = {m["type"] for m in query() if m["type"].startswith("bms.")}
         assert emitted <= {
             "bms.status", "bms.status.cell", "bms.status.alarm",
@@ -904,18 +927,22 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed("systemctl reset-failed system-metrics.service")
         machine.succeed("systemctl start system-metrics.service")
 
-        def watched(_):
-            return any(
-                m["attributes"].get("record.attributes.unit") == "bms-monitoring.service"
-                for m in query() if m["type"] == "system.unit"
-            )
+        def watching():
+            """The newest system.unit record about this producer, or None if there is not one yet.
 
-        retry(watched)
-        unit = next(
-            m for m in query()
-            if m["type"] == "system.unit"
-            and m["attributes"].get("record.attributes.unit") == "bms-monitoring.service"
-        )
+            Both halves of the filter are the reader's: `type=`, and `attr.<key>`, whose key the
+            API quotes as one literal JSON path segment -- so the dotted attribute name goes
+            through verbatim rather than being read as three levels of nesting.
+            """
+            rows = query(
+                "type=system.unit"
+                "&attr.record.attributes.unit=bms-monitoring.service"
+                "&limit=1"
+            )
+            return rows[0] if rows else None
+
+        retry(lambda _: watching() is not None)
+        unit = watching()
         assert unit["body"]["active_state"] == "active", unit["body"]
 
     # The other half of the taxonomy. A pack that stops pushing entirely -- the cable pulled, the
