@@ -743,10 +743,12 @@
           common.autoUpgrade.enable = lib.mkForce false;
           common.monitoring.enable = lib.mkForce false;
           common.irohSsh.failsafe.enable = lib.mkForce false;
-          # Its 1h timer cannot fire inside this test's ~950 virtual seconds, so this is
-          # belt-and-braces rather than a fix -- but the whole test rests on the guest
-          # being idle between the two boundaries it measures, so a unit that wakes it up
-          # is exactly the thing to keep off this node (see the header note).
+          # Load-bearing, not belt-and-braces: at the 600s interval hosts/rpi5 deploys, its
+          # OnBootSec elapses inside this test's ~950 virtual seconds. The whole test rests on
+          # the guest being idle between the two boundaries it measures, so a unit that wakes
+          # it up is exactly the thing to keep off this node (see the header note). It read as
+          # belt-and-braces while the interval was 1h and could not fire at all; shortening it
+          # to 10min is what made this line the fix.
           common.connectivityWatchdog.enable = lib.mkForce false;
         };
       };

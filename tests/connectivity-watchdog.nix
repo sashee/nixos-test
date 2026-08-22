@@ -98,7 +98,7 @@ nixpkgs.lib.nixos.runTest {
     system.stateVersion = stateVersion;
   };
 
-  nodes.machine = { ... }: {
+  nodes.machine = { lib, ... }: {
     imports = [ machineModule ];
 
     networking.hostName = "nixos-rpi5";
@@ -106,10 +106,19 @@ nixpkgs.lib.nixos.runTest {
     # Only this CA, so dnscrypt-proxy still performs real certificate validation.
     security.pki.certificateFiles = [ interceptor.caFile ];
 
+    # mkForce, not plain definitions: the aarch64 variant composes the real hosts/rpi5 config,
+    # which pins afterSeconds and intervalSeconds at normal priority (3h and 10min), and two
+    # differing normal-priority definitions of an int is an eval CONFLICT, not an override. So
+    # without this the valuable variant of this test does not build at all. Forced even where
+    # the host does not set it today (accuracySeconds) so that a host tuning the remaining knob
+    # cannot break this test either -- the shortened values are the whole premise here, and
+    # this block is the statement that they win regardless of what the composed host wants.
+    # `enable` needs no force: both definitions are `true`, and equal values merge.
     common.connectivityWatchdog = {
       enable = true;
-      inherit afterSeconds accuracySeconds;
-      intervalSeconds = interval;
+      afterSeconds = lib.mkForce afterSeconds;
+      accuracySeconds = lib.mkForce accuracySeconds;
+      intervalSeconds = lib.mkForce interval;
     };
 
     # No extra disk for the reboot breadcrumb: virtualisation.diskImage defaults to a
