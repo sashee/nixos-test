@@ -330,7 +330,7 @@ nixpkgs.lib.nixos.runTest {
 
     # ------------------------------------------------------------------------------------
 
-    def query(params="limit=2000"):
+    def query(params):
         # --fail-with-body, so an unauthenticated read fails here naming its status instead of
         # surfacing as a KeyError on the missing "measurements" field: curl exits 0 on a 401.
         raw = machine.succeed(
@@ -340,17 +340,35 @@ nixpkgs.lib.nixos.runTest {
         return json.loads(raw)["measurements"]
 
 
+    def of_type(kind, limit=1000):
+        """Every stored record of one type, newest first, up to `limit`.
+
+        Filtered by the reader rather than here, because every read comes back through the test
+        driver's backdoor as one base64 blob down a virtio-console, and an unfiltered page is a
+        thousand records of it. In the sibling suite one such decode arrived corrupt on the
+        rpi5-x86 leg on 2026-08-21 and failed the build; both suites issue something over a
+        hundred reads per run, so that is a lot of exposure for the sake of a field or two.
+
+        1000 is also the API's own page cap, which is why the old `limit=2000` here never meant
+        anything: the reader clamped it. A `type=` filter is what actually widens the reach, since
+        it selects over the whole table rather than over a fixed-size window of the newest rows of
+        every type -- a window this node slides by tens of records an interval.
+        """
+        return query(f"type={kind}&limit={limit}")
+
+
     def statuses():
-        return [m for m in query() if m["type"] == "inverter.status"]
+        return of_type("inverter.status")
 
 
     def flags():
-        return [m for m in query() if m["type"] == "inverter.status.flag"]
+        return of_type("inverter.status.flag")
 
 
     def latest():
-        # The read API orders event_time DESC, id DESC, so the newest status record is first.
-        rows = statuses()
+        # The read API orders event_time DESC, id DESC, so one row is the newest status record.
+        # Asked for as one row: this is the hot path, inside nearly every predicate below.
+        rows = of_type("inverter.status", limit=1)
         assert rows, "no inverter.status measurement in the store"
         return rows[0]
 
@@ -364,6 +382,10 @@ nixpkgs.lib.nixos.runTest {
         flight that predates whatever the test has just changed. Waiting for an effect means
         retrying on the value it changes -- `changed`, `cleared`, `corrupted` and `naked` below
         are all that shape.
+
+        Counting is sound only while the count can still grow: `of_type` stops at the API's
+        1000-row cap, and a saturated count would never exceed `before`. inverter.status arrives
+        once an interval, so the suite would have to run for well over an hour to reach it.
         """
         before = len(statuses())
         retry(lambda _: len(statuses()) > before)
@@ -767,18 +789,22 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed("systemctl reset-failed system-metrics.service")
         machine.succeed("systemctl start system-metrics.service")
 
-        def watched(_):
-            return any(
-                m["attributes"].get("record.attributes.unit") == "inverter-monitoring.service"
-                for m in query() if m["type"] == "system.unit"
-            )
+        def watching():
+            """The newest system.unit record about this producer, or None if there is not one yet.
 
-        retry(watched)
-        unit = next(
-            m for m in query()
-            if m["type"] == "system.unit"
-            and m["attributes"].get("record.attributes.unit") == "inverter-monitoring.service"
-        )
+            Both halves of the filter are the reader's: `type=`, and `attr.<key>`, whose key the
+            API quotes as one literal JSON path segment -- so the dotted attribute name goes
+            through verbatim rather than being read as three levels of nesting.
+            """
+            rows = query(
+                "type=system.unit"
+                "&attr.record.attributes.unit=inverter-monitoring.service"
+                "&limit=1"
+            )
+            return rows[0] if rows else None
+
+        retry(lambda _: watching() is not None)
+        unit = watching()
         assert unit["body"]["active_state"] == "active", unit["body"]
 
     # The other half of the taxonomy. A unit that stops answering entirely -- the cable pulled,
@@ -878,7 +904,18 @@ nixpkgs.lib.nixos.runTest {
         # can mend, and the module documents a 15-minute wait as the answer. Either half of the
         # exchange may be the one that notices -- the write does, here -- so this asserts the
         # property both share rather than pinning the message of whichever wins the race.
-        assert "Input/output error" in after or "the port hung up" in after, after
+        #
+        # Three spellings, because the write races udev for which errno it gets. ftdi_sio hands back
+        # EIO while the port is hung up but still registered, and ENODEV once it has been
+        # unregistered; on 2026-08-22 CI took the second road and failed a build here on a run that
+        # was otherwise correct. `exchange` in packages/inverter-monitoring/src/main.rs maps either
+        # to Failure::Fatal, so both are the prompt end this subtest is about, and pinning one of
+        # them was asserting the timing of a udev callback rather than the producer's behaviour.
+        assert (
+            "Input/output error" in after
+            or "No such device" in after
+            or "the port hung up" in after
+        ), after
         # And it got there without waiting out a single response timeout or counting a silent cycle,
         # which is what it would have done had the disconnect read as a mute unit.
         assert "timed out after" not in after, after
