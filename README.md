@@ -700,18 +700,31 @@ only report it to a server that is by definition unreachable, and the iroh-ssh
 failsafe above only opens a port on the local network — which is no help on a
 headless box that nobody shares a LAN with. A reboot does fix those.
 
-Every hour it resolves one name through the host's own resolver at `127.0.0.1`
-and reboots once nothing has resolved for 24 hours. Three details are
-load-bearing rather than incidental. The query name is a **fresh random label**
-under `example.com` on every probe, because `dnscrypt-proxy`'s cache is keyed on
-the question and its `cache_max_ttl` defaults to exactly this module's threshold
-— one fixed name could be answered from cache for the entire window, hiding a
-real outage. Success is an explicit DNS **rcode**, not `dig`'s exit status: with
+On the Pi it resolves one name through the host's own resolver at `127.0.0.1`
+every 10 minutes and reboots once nothing has resolved for 3 hours. The fuse
+length is the interesting number, because it bounds the cost of the watchdog
+being *wrong*: an outage no reboot can fix — a dead ISP — costs one pointless
+reboot per threshold for as long as it lasts, so the module defaults to a
+conservative 24 hours and the Pi's shorter value is argued for at its call site.
+It is not shorter still because a reboot is not free there: `monitoring-platform`
+gates its own startup on the clock being synced, so rebooting with no DNS means
+it does not come back at all, and a box left alone through an ISP outage keeps
+collecting local metrics that a box rebooting through one loses. The 2026-08-22
+outage is what moved it off a day — a lease taken from a second router during a
+wifi roam left the Pi behind a dead default route, and the watchdog had the right
+verdict in the journal within the hour but was 23 hours from acting.
+
+Three details are load-bearing rather than incidental. The query name is a
+**fresh random label** under `example.com` on every probe, because
+`dnscrypt-proxy`'s cache is keyed on the question and its `cache_max_ttl`
+defaults to 86400s — which dwarfs any threshold this module would carry, so one
+fixed name could be answered from cache for the entire window, hiding a real
+outage. Success is an explicit DNS **rcode**, not `dig`'s exit status: with
 every upstream unreachable `dnscrypt-proxy` answers SERVFAIL, which is a
 perfectly valid response, so `dig` exits 0 and an offline box would read as
 healthy. And the age is measured in **monotonic uptime**, never the wall clock,
-so NTP stepping the clock on a Pi 5 with no RTC battery cannot be mistaken for a
-day without DNS. The verdict is left in the journal rather than a breadcrumb
+so NTP stepping the clock on a Pi 5 with no RTC battery cannot be mistaken for
+hours without DNS. The verdict is left in the journal rather than a breadcrumb
 file (journald is persistent by default), readable after the fact with
 `journalctl -b -1 -u connectivity-watchdog`.
 

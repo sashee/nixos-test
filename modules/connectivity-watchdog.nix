@@ -59,8 +59,9 @@ let
       # A UNIQUE label every time. dnscrypt-proxy's cache is keyed on the question, so a
       # name never asked before cannot be a hit, positive or negative -- which is what
       # stops a cached answer masking a real outage. It matters here specifically because
-      # dnscrypt's cache_max_ttl defaults to 86400s, i.e. exactly this module's default
-      # threshold: one fixed name could be served from cache for the entire window.
+      # dnscrypt's cache_max_ttl defaults to 86400s, which dwarfs any threshold this module
+      # would sensibly carry -- the 24h default, the 3h hosts/rpi5 deploys -- so one fixed
+      # name could be served from cache for the entire window whichever is chosen.
       #
       # This is sufficient because of WHAT dnscrypt-proxy is: a forwarding proxy with a
       # question-keyed response cache, require_dnssec = false, no validation of its own. A
@@ -151,11 +152,22 @@ in
       description = ''
         How long DNS must have been failing, in seconds, before the host reboots.
 
-        Long on purpose. The remedy is drastic and the trigger consults the network, so
-        the threshold is what keeps a rotted or unlucky signal cheap: at a day, a
-        misbehaving probe costs one pointless reboot per day instead of the reboot every
-        15m23s that modules/connectivity-fallback.nix caused on 2026-07-27. Seconds rather
-        than a systemd duration string because the check does integer arithmetic on it.
+        This is the fuse length, and what it buys is a bound on the cost of being WRONG. The
+        remedy is drastic and the trigger consults the network, so a signal that has rotted --
+        or an outage no reboot can fix, like a dead ISP -- costs one pointless reboot per
+        threshold, forever. At the default day that is one a day; the value to keep away from
+        is the reboot every 15m23s that modules/connectivity-fallback.nix caused on 2026-07-27.
+
+        Which means the right value is per host, not universal, and the default is deliberately
+        the conservative end for a host nobody has reasoned about. Shortening it trades that
+        bound for downtime on a wedge a reboot DOES fix, and what sets the exchange rate is
+        what a reboot costs the host: on hosts/rpi5 a reboot with no DNS means
+        monitoring-platform does not come back at all (it gates startup on the clock being
+        synced), so rebooting through an ISP outage destroys the local metrics that surviving it
+        would have kept -- see the reasoning at its call site for why it still runs 3h.
+
+        Seconds rather than a systemd duration string because the check does integer arithmetic
+        on it.
 
         Must also outlast a boot, which is why the assertions below impose a floor. On the
         boot AFTER a watchdog reboot there is no /run marker, so the age is the uptime
@@ -172,8 +184,10 @@ in
         How often to probe, in seconds (OnBootSec and OnUnitActiveSec on the timer).
 
         Bounds how late the reboot can be: the host reboots within afterSeconds +
-        intervalSeconds + accuracySeconds of DNS breaking. Probing far more often than that
-        buys nothing, since the decision is about a whole day.
+        intervalSeconds + accuracySeconds of DNS breaking. So this is worth keeping small
+        relative to afterSeconds -- at the deployed 600s against a 3h fuse it adds ~11 minutes
+        to a 3h wait -- but there is no value in going far below that, because the decision is
+        about hours and every probe is a real DNS exchange with a real timeout.
 
         Seconds rather than a systemd duration string so the assertions below can relate it
         to afterSeconds and accuracySeconds; a string leaves the constraints stated in prose
@@ -194,7 +208,7 @@ in
         this size. So an intervalSeconds that is not a multiple of it does not mean what it
         says: every nominal elapse lands between grid points and is pushed to the next one,
         and the real cadence is neither value. Both that and "no coarser than the interval"
-        are asserted below. At the production 3600/60 the interval is an exact multiple and
+        are asserted below. At the deployed 600/60 the interval is an exact multiple and
         firings land on grid points with no drift; it is the shortened intervals in
         tests/connectivity-watchdog.nix that need this turned down, and before it was
         configurable that test's 20s interval was silently a 60s one.

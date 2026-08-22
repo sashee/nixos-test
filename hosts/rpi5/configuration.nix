@@ -359,9 +359,28 @@ in
   # The other half of the connectivity story: connectivityFallback only reacts to "not
   # associated to any wifi", because its remedy is new credentials. This one covers
   # associated-but-the-stack-is-wedged (brcmfmac firmware halt, wedged dnscrypt, an IPv4LL
-  # lease) by rebooting after a day with no DNS at all -- on a headless box with no LAN
-  # access that is otherwise a trip to the device.
+  # lease, a broken route) by rebooting once nothing has resolved for hours -- on a headless
+  # box with no LAN access that is otherwise a trip to the device.
+  #
+  # Shorter than the module's 24h default, which this host earned on 2026-08-22: iwd's first
+  # association failed, it landed on a same-SSID BSS at -87 dBm, took a lease from a second
+  # router on that segment (192.168.0.254) and roamed back to the right BSS -- and dhcpcd does
+  # not re-DHCP on an intra-SSID roam, so the box sat behind a dead default route for 7 hours.
+  # The watchdog had the right verdict in the journal by 03:14 and hourly after, and was still
+  # 23 hours from acting when the box was power cycled by hand.
+  #
+  # 3h rather than 1h because a reboot is not free on THIS host: monitoring-platform gates its
+  # own startup on the clock being synced, so a reboot with no DNS means it does not come back
+  # at all (that outage: `poll=48 of=60`, then `Failed to start`). Leaving a healthy box alone
+  # through an ISP outage keeps local metrics flowing, where rebooting through one loses them
+  # for its whole duration. 3h bounds that at ~8 pointless reboots/day and leaves short
+  # hiccups alone entirely, for ~3h11m of downtime on a wedge a reboot does fix.
   common.connectivityWatchdog.enable = true;
+  # 10min probes, so a 3h fuse takes ~18 consecutive failures. Left as separate seconds
+  # values because the module relates them to each other at eval time: the interval has to
+  # stay below afterSeconds and a multiple of the default 60s accuracySeconds, which 600 is.
+  common.connectivityWatchdog.afterSeconds = 10800;
+  common.connectivityWatchdog.intervalSeconds = 600;
   # SSH over iroh (see modules/iroh-ssh.nix): sshd is reached through the tunnel's
   # outbound connection, so no inbound port is needed. Secret provisioned out-of-band:
   #   iroh-ssh-generate-secret | systemd-creds encrypt --name=iroh-secret - /etc/credentials/iroh-ssh/iroh-secret
