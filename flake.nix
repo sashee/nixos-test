@@ -780,6 +780,12 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiSystemModule;
       };
+      thingspeakTestRpi = import ./tests/thingspeak.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+      };
       # Nix only exposes /dev/kvm in the sandbox based on the daemon's system-features
       # (auto-set from the host's /dev/kvm), NOT a derivation's requiredSystemFeatures.
       # So dropping the kvm *requirement* lets tests schedule on KVM-less builders (the
@@ -818,6 +824,7 @@
         system-metrics = systemMetricsTestRpi;
         inverter-monitoring = inverterMonitoringTestRpi;
         bms-monitoring = bmsMonitoringTestRpi;
+        thingspeak = thingspeakTestRpi;
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
         rpiNixUtilsTests)
@@ -1052,6 +1059,12 @@
           machineModule = rpi5X86SystemModule;
           inherit dohStamps;
         };
+        # The ThingSpeak reporter. Several of its subtests have to wait out an interval
+        # boundary -- a run reads the *previous* whole interval -- so this is the leg that
+        # matters for iterating on it, and its aarch64 twin gets the longer ceiling.
+        rpi5-x86-thingspeak = rpi5X86Test ./tests/thingspeak.nix {
+          machineModule = rpi5X86SystemModule;
+        };
         rpi5-x86-restic = rpi5X86Test ./tests/restic.nix {
           commonDesktopModule = rpi5X86QuiescedModule;
         };
@@ -1256,6 +1269,15 @@
       # One base evaluation plus an extendModules per case, rather than a system build per case.
       timeSyncAssertionsTest = import ./tests/time-sync-assertions.nix {
         inherit pkgs nixpkgs ntsServers;
+      };
+      # rpi5 only, unlike timeSyncDeployedTest below: the laptop does not import
+      # modules/thingspeak.nix, so `common.thingspeak` is not an option there at all and reading
+      # it would be an evaluation error rather than a `false`. The check still reports which
+      # hosts it covered, so rpi5 dropping the feature shows up as a check that asserted nothing
+      # instead of as a pass.
+      thingspeakDeployedTest = import ./tests/thingspeak-deployed.nix {
+        inherit pkgs;
+        hosts.rpi5 = rpi5Base;
       };
       timeSyncDeployedTest = import ./tests/time-sync-deployed.nix {
         inherit pkgs ntsServers dohStamps;
@@ -1494,6 +1516,7 @@
         doh-providers = dohProvidersTest;
         time-sync-deployed = timeSyncDeployedTest;
         time-sync-assertions = timeSyncAssertionsTest;
+        thingspeak-deployed = thingspeakDeployedTest;
         qemu-graphical-eval = qemuGraphicalEval;
       };
     in

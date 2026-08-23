@@ -57,6 +57,7 @@ in
     ../../modules/connectivity-watchdog.nix
     ../../modules/iroh-ssh.nix
     ../../modules/monitoring-platform-tunnel.nix
+    ../../modules/thingspeak.nix
     ../../modules/required-kernel-modules.nix
     # Same default-deny inbound firewall as the laptops (nftables backend,
     # allowPing=false + ICMP echo-drop pre-table). The iroh tunnel is unaffected;
@@ -301,6 +302,63 @@ in
     enable = true;
     socketPath = config.services.mp-collector.socketPath;
     group = config.services.mp-collector.group;
+  };
+
+  # The only *consumer* on this host: once a minute it reads back the latest reading of eight
+  # fields the two USB producers above stored, and posts them to a ThingSpeak channel. Which is
+  # what makes the solar data survive this box -- everything else here writes to an SQLite file
+  # on an SD card with a documented failure history, backed up nightly and readable only through
+  # the iroh tunnel.
+  #
+  # It goes through iroh with its own ticket rather than joining the collector's `mp-tunnel`
+  # group, so the two consumers are independent: this one can be pointed at a moved receiver, or
+  # revoked, without touching the measurement path that everything else on the host depends on.
+  # Its own API key for the same reason -- the receiver's keys carry no scope (SPEC.md §13), so
+  # separate keys buy blast radius, not permission.
+  #
+  # Provision out-of-band, ON THIS HOST -- same host-key caveat as the collector's key above, and
+  # the same silence on a missing blob: the units are skipped by ConditionPathExists, not failed,
+  # which is why common.systemMetrics watches the timer and the tunnel. If a unit does sit idle,
+  # `systemctl show -p ConditionResult --value thingspeak.service` says so.
+  #
+  #   install -d -m 0700 /etc/credentials/thingspeak/{platform,channel,tunnel}
+  #
+  # Both keys are pasted into stdin rather than passed as arguments, so neither sits in the shell
+  # history. `head -n 1` makes Enter the terminator instead of ctrl-D, and also absorbs the
+  # newline a bracketed paste may already carry; `tr` then settles the question either way,
+  # though it need not -- the reporter reads both keys through `$(cat ...)`, which strips
+  # trailing newlines, as `parse_ticket` does for the ticket below.
+  #
+  # The reader gets an API key of its own -- issued from the receiver's /keys page, or by
+  # `create-api-key` -- rather than a copy of the collector's, so revoking it cannot take the
+  # measurement path down with it:
+  #   head -n 1 | tr -d '\n' | systemd-creds encrypt --name=mp-api-key - \
+  #     /etc/credentials/thingspeak/platform/mp-api-key
+  #   head -n 1 | tr -d '\n' | systemd-creds encrypt --name=thingspeak-key - \
+  #     /etc/credentials/thingspeak/channel/thingspeak-key
+  #
+  # And the ticket, copied from the collector's rather than re-derived from the server secret --
+  # both name the same endpoint, and this needs neither the secret nor iroh-ssh-ticket. `--name`
+  # must be `iroh-ticket` on both ends: it is authenticated into the blob and decryption compares
+  # it. Note what sharing an endpoint does and does not buy: the two consumers are independent in
+  # their credential, so either can be re-pointed at a moved receiver on its own, but until one
+  # is they dial the same listener (which serves a task per stream, so that costs nothing).
+  #   systemd-creds decrypt --name=iroh-ticket /etc/credentials/mp-tunnel/client/iroh-ticket - \
+  #   | systemd-creds encrypt --name=iroh-ticket - \
+  #       /etc/credentials/thingspeak/tunnel/iroh-ticket
+  # The clock gate has to be pointed at chrony's marker, not left on the module's timesyncd
+  # default: enabling chrony forces services.timesyncd.enable to false, so nothing would ever
+  # create /run/systemd/timesync/synchronized and the unit would be skipped forever -- silently,
+  # since a skipped unit is not a failed one. Wired from the option that owns the marker rather
+  # than restating its path. modules/time-sync.nix does the same repoint for the metrics
+  # producer, but does it there because every host with that producer also has chrony; this one
+  # is Pi-only, so the wiring belongs here.
+  common.thingspeak = {
+    enable = true;
+    platform.credentialDirectory = "/etc/credentials/thingspeak/platform";
+    credentialDirectory = "/etc/credentials/thingspeak/channel";
+    tunnel.credentialDirectory = "/etc/credentials/thingspeak/tunnel";
+    syncedMarker = config.common.timeSync.syncedMarker;
   };
 
   users.users.nixos = {
