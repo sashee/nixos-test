@@ -64,6 +64,34 @@
 
 * [monitoring platform](./features/monitoring-platform/monitoring-platform.md)
 
+## Thingspeak solar reporting
+
+* a timer that fires every minute
+* reads these via systemd:
+    * an API key for the monitoring platform
+    * a write API key for thingspeak
+    * the iroh endpoint ticket
+* if the clock is not synchronized, exit early
+* the data interval: the end is the current time truncated to the interval, the start is end minus the interval
+* it reads the last value in the data interval for these measurements from the monitoring platform (using the API key via its API, via iroh):
+    * bms.status.soc_percent
+    * bms.status.pack_power_watts
+    * bms.status.temperature_1_celsius
+    * bms.status.pack_voltage_volts
+    * inverter.status.pv1_charging_power_watts
+    * inverter.status.pv2_charging_power_watts
+    * inverter.status.output_active_power_watts
+    * inverter.status.battery_voltage_volts
+* if there is at least one value:
+    * make a POST request to https://api.thingspeak.com/update?api_key=<thingspeak key>&created_at=<timestamp>&field<N>=<val>
+        * where:
+            * <N> is the index of the measurement (1-based, the line it is specified in this document)
+            * <val> is the value
+            * <timestamp> is the end of the data interval in ISO8601 format in seconds with Z
+            * and <thingspeak_key> is the thingspeak write API key
+        * each measurement that has a value are added as fields to the query parameters
+        * a 2XX status code where the body is not "0" is a success
+
 ## Auto-reboot
 
 * every 10 minutes it tries to resolve a DNS address
