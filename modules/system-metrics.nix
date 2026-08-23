@@ -73,6 +73,13 @@ let
       "inverter-monitoring.service"
     ++ lib.optional (commonFeature [ "bmsMonitoring" "enable" ] false)
       "bms-monitoring.service"
+    # The ThingSpeak reporter's tunnel, for the reason its own module gives: it is skipped
+    # rather than failed when its ticket is missing, and a skipped unit looks like nothing at
+    # all. Its reporting oneshot is deliberately absent -- see the `units` option description --
+    # so the timer below is what says the reporting still happens.
+    ++ lib.optional (commonFeature [ "thingspeak" "enable" ] false
+      && commonFeature [ "thingspeak" "tunnel" "enable" ] false)
+      "thingspeak-tunnel.service"
     # Both hops of the measurement path. The receiver earns its place: if it dies the collector
     # buffers and these records arrive late, so its unit state is recoverable evidence. The
     # producer does not -- see the `units` option description.
@@ -92,6 +99,7 @@ let
     ++ lib.optional (commonFeature [ "connectivityWatchdog" "enable" ] false)
       "connectivity-watchdog.timer"
     ++ lib.optional (commonFeature [ "timeSync" "enable" ] false) "time-correction.timer"
+    ++ lib.optional (commonFeature [ "thingspeak" "enable" ] false) "thingspeak.timer"
     ++ lib.optional config.services.fstrim.enable "fstrim.timer";
 
   excludeArgs = lib.concatMap (t: [ "--exclude-fstype" t ]) cfg.excludeFsTypes;
