@@ -91,14 +91,42 @@ fn parse_ticket(ticket: &str) -> Result<EndpointTicket> {
     EndpointTicket::from_str(ticket.trim()).std_context("invalid ticket")
 }
 
+/// A placeholder published alongside this endpoint's addresses, whose *content*
+/// is deliberately meaningless and whose *presence* is load-bearing. Do not
+/// remove it, and do not put anything identifying in it: the value is world
+/// readable by anyone holding the endpoint id.
+///
+/// Without it a restarting endpoint erases its own discovery record. iroh skips
+/// publishing only when relay, addresses and user data are *all* absent
+/// (`publish_my_addr`), and that check runs before `PkarrPublisher` applies its
+/// default `AddrFilter::relay_only()` -- so in the boot-time window where the
+/// interface addresses are known but the home relay is not, the filtered set is
+/// empty and iroh signs a packet with zero records. The pkarr relay accepts it
+/// and `_iroh.<id>.dns.iroh.link` starts answering NXDOMAIN, which is not a
+/// value any resolver should cache (`dns.iroh.link`'s SOA carries MINIMUM=0) but
+/// which DNS4EU and some Cloudflare shards cache for the SOA's own 14-day TTL.
+/// On 2026-08-28 that cost this host two weeks of intermittent tunnel failures
+/// from a window a few seconds wide.
+///
+/// One attribute is enough to make the packet non-empty, so the name always
+/// resolves and there is never a negative answer to mis-cache. The endpoint may
+/// still publish a record carrying no addresses -- a dial against that fails the
+/// same way -- but it expires with the record's 30s TTL instead of persisting in
+/// a third party's cache.
+const PUBLISHED_USER_DATA: &str = ".";
+
 /// Create an iroh endpoint that verifies relay TLS against the OS trust store
 /// (`rustls-platform-verifier`) rather than compiled-in Mozilla roots, so
 /// `security.pki`-installed CAs are honored.
 pub async fn create_endpoint(secret_key: SecretKey, alpns: Vec<Vec<u8>>) -> Result<Endpoint> {
+    let user_data = PUBLISHED_USER_DATA
+        .parse()
+        .expect("one byte, well inside UserData's 245 byte limit");
     Endpoint::builder(presets::N0)
         .ca_tls_config(CaTlsConfig::system())
         .secret_key(secret_key)
         .alpns(alpns)
+        .user_data_for_address_lookup(user_data)
         .bind()
         .await
         .anyerr()
