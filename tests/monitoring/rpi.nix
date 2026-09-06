@@ -57,8 +57,19 @@ nixpkgs.lib.nixos.runTest {
 
     # The Pi's own backup runs here unmodified: its repository is a credential, so aiming it at
     # the in-VM REST server is done by provisioning a different blob below, not by patching the
-    # host config. Only the prune policy is test-only.
-    common.restic.backups.monitoring-platform.prune.opts = [ "--keep-last 2" ];
+    # host config. Only the prune policy is test-only -- prune.ignoreErrors is NOT overridden,
+    # because the append-only server below exists to exercise exactly that setting.
+    #
+    # --keep-last 1, not 2: retention must have something to expire from the second backup on,
+    # or `forget` never issues a DELETE and the append-only server is never actually exercised.
+    # A policy that only bites once the repo is old enough is what hid the deployed failure for
+    # eight days -- so the test picks the one that bites on run two.
+    #
+    # mkForce is load-bearing: prune.opts is a listOf, which the module system merges by
+    # CONCATENATION, so a plain definition here would be appended to the host's policy rather
+    # than replace it -- "keep 1 latest, 7 daily, 4 weekly, 12 monthly", under which two
+    # snapshots a simulated day apart are both kept as daily and forget deletes nothing at all.
+    common.restic.backups.monitoring-platform.prune.opts = lib.mkForce [ "--keep-last 1" ];
 
     # Mock the upgrade so the real, enabled nixos-upgrade.timer succeeds when the clock
     # wakes it and records its last-success marker via the module's OnSuccess hook.
@@ -151,10 +162,19 @@ nixpkgs.lib.nixos.runTest {
       requires = [ "restic-rest-auth.socket" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
+        # --append-only is read from a marker file rather than baked in, so the test can turn
+        # it off mid-run (restart the unit) against the SAME repository. That is the only way
+        # to prove the backlog an append-only server refused to delete is actually collected
+        # once the refusal goes away -- a second, separate normal repo would start empty and
+        # prove nothing about it. The deployed backend is append-only, which is what the Pi's
+        # prune.ignoreErrors is for; a plain rest-server here would model neither.
         ExecStart = pkgs.writeShellScript "restic-rest-auth" ''
           set -eu
           if [ ! -e /var/lib/restic/.htpasswd ]; then
             ${pkgs.apacheHttpd}/bin/htpasswd -Bbc /var/lib/restic/.htpasswd test-user backend-secret
+          fi
+          if [ -e /var/lib/restic/.append-only ]; then
+            exec ${pkgs.restic-rest-server}/bin/rest-server --path /var/lib/restic --append-only
           fi
           exec ${pkgs.restic-rest-server}/bin/rest-server --path /var/lib/restic
         '';
@@ -164,6 +184,9 @@ nixpkgs.lib.nixos.runTest {
 
     systemd.tmpfiles.rules = [
       "d /var/lib/restic 0755 root root -"
+      # Starts append-only, like the deployed backend. The test removes this to flip the
+      # server over and restarts the unit.
+      "f /var/lib/restic/.append-only 0644 root root -"
     ];
 
     systemd.services.monitoring-platform = {
@@ -256,6 +279,32 @@ nixpkgs.lib.nixos.runTest {
     upgrade_marker = "/var/lib/common-monitoring/nixos-upgrade.service.last-success"
     restic_marker = "/var/lib/common-monitoring/restic-backups-monitoring-platform.service.last-success"
 
+    # The backup is only ever driven by its own timer, so "the run I just triggered has
+    # finished" has to be read from its last-success marker taking a NEW value: a oneshot the
+    # warp has not reached yet and one that already finished both read as "inactive", and the
+    # marker merely existing is already true from the previous run. Returns the new value, to
+    # be handed back in as `previous` at the next warp.
+    def restic_ran_since(previous):
+        client.wait_until_succeeds(f"test \"$(cat {restic_marker})\" != {previous!r}", timeout=600)
+        result = client.succeed("systemctl show restic-backups-monitoring-platform.service -p Result --value").strip()
+        assert result == "success", result
+        return client.succeed(f"cat {restic_marker}").strip()
+
+    # Deletes the server refused, counted over the whole boot. Two readings around a run say
+    # whether that run was refused anything, without depending on journal timestamps (this test
+    # warps the clock, so --since is meaningless) or on a finished oneshot still reporting an
+    # InvocationID to match on.
+    def refusals():
+        return int(client.succeed(
+            "journalctl -b --no-pager -u restic-backups-monitoring-platform.service"
+            " | grep -c -F '(403): 403 Forbidden' || true"
+        ).strip())
+
+    # Read off the server's own filesystem rather than through `restic snapshots`: it is the
+    # side the refusal comes from, and it needs no repository password on this node.
+    def snapshot_ids():
+        return set(platform.succeed("ls -1 /var/lib/restic/monitoring-platform/snapshots").split())
+
     # Warm up: one day forward wakes the daily timers on their own. The mocked upgrade
     # succeeds and the real restic backup to the REST server succeeds, each recording its
     # last-success marker via the module's OnSuccess. No unit is ever started by hand.
@@ -265,6 +314,11 @@ nixpkgs.lib.nixos.runTest {
     next_day()
     client.wait_until_succeeds(f"test -r {upgrade_marker}", timeout=600)
     client.wait_until_succeeds(f"test -r {restic_marker}", timeout=600)
+    backup_at = client.succeed(f"cat {restic_marker}").strip()
+    # Backup #1: one snapshot, and --keep-last 1 keeps it, so forget has nothing to delete
+    # and the append-only server has nothing to refuse yet.
+    assert len(snapshot_ids()) == 1, snapshot_ids()
+    assert refusals() == 0
     # The receiver was stopped for the backup phase and started again before the check, on the
     # real config -- ordering, not just liveness. Last occurrence of each: the receiver also
     # started at boot, and only this one backup run has happened so far.
@@ -305,6 +359,42 @@ nixpkgs.lib.nixos.runTest {
     platform.succeed("grep -F '[INFO] common: repo=https://github.com/sashee/nixos-test rev=cafe1234cafe1234cafe1234cafe1234cafe1234 lastModified=2023-11-14T22:13:20Z' /var/lib/monitoring-platform/bodies.log")
     platform.fail("grep -F 'branch=' /var/lib/monitoring-platform/bodies.log")
     platform.fail("grep -F 'narHash' /var/lib/monitoring-platform/bodies.log")
+
+    # --- append-only: the run survives a prune it is not allowed to perform ---------------
+    # Backup #2 (fired by the OK-run jump above) is the first whose forget has an expired
+    # snapshot to drop, so the first the append-only server refuses. The Pi sets
+    # prune.ignoreErrors, so the "-" prefix on unlock/forget keeps the unit succeeding, the
+    # marker still gets recorded, and `check` -- the command AFTER forget in the ExecStart
+    # list, which a strict prune failure would skip entirely -- still runs and still passes on
+    # the half-pruned repository. That combination is what let the OK run above report [OK];
+    # without ignoreErrors this unit fails nightly while the backups themselves keep working,
+    # and the restic check only notices 14 days later, once the marker goes stale.
+    backup_at = restic_ran_since(backup_at)
+    refused = refusals()
+    assert refused > 0, "append-only server refused no delete; forget had nothing to expire"
+    stale = snapshot_ids()
+    assert len(stale) == 2, stale
+    client.succeed("journalctl -b --no-pager -u restic-backups-monitoring-platform.service | grep -F 'no errors were found'")
+
+    # --- append-only off: the same repository actually gets pruned ------------------------
+    # Only the server's refusal goes away -- same repo, same credentials, same policy. The next
+    # backup's forget must collect the whole backlog the refusals left behind, which is what
+    # separates "retention is blocked at the backend" from "retention is quietly not running":
+    # ignoreErrors must swallow the error, not the work.
+    platform.succeed("rm /var/lib/restic/.append-only")
+    platform.succeed("systemctl restart restic-rest-auth.service")
+    platform.wait_until_succeeds("systemctl show restic-rest-auth.service -p ActiveState --value | grep -qx active")
+
+    quiesce_monitoring()
+    next_day()
+    restic_ran_since(backup_at)
+    assert refusals() == refused, "a delete was still refused after append-only was turned off"
+    # Backup #3 took the repo to three snapshots; --keep-last 1 must leave exactly one, and it
+    # must be the new one -- both snapshots the append-only server had refused to delete are
+    # gone, rather than the run having merely stopped trying.
+    remaining = snapshot_ids()
+    assert len(remaining) == 1, remaining
+    assert not (remaining & stale), (remaining, stale)
 
     # FAIL run: break both success sources (mock upgrade now fails; REST backend down),
     # then jump 15 days so both markers age past maxAge (14d) with no new success recorded.

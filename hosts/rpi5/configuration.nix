@@ -405,6 +405,16 @@ in
     credentialDirectory = "/etc/credentials/restic/monitoring-platform";
     paths = [ "/var/lib/monitoring-platform" ];
     stopServices = [ "monitoring-platform.service" ];
+    # The repository is append-only: the backend answers every DELETE with 403, so
+    # `forget --prune` cannot expire anything and, left strict, fails the whole unit --
+    # taking the `check` that follows it down too, and eventually the monitoring restic
+    # check once the marker aged past 14d. That is the point of an append-only repo (a
+    # compromised Pi must not be able to erase its own backups), so the retention has to
+    # happen on the backend, not from here. Earned on 2026-09-06: this defaulted to false,
+    # and because retention only has something to expire once the oldest snapshot falls
+    # out of --keep-daily 7, the unit ran green for the repo's first eight days and then
+    # failed every night from 2026-08-24 while the backups themselves kept succeeding.
+    prune.ignoreErrors = true;
     timerConfig = {
       OnCalendar = "*-*-* 05:00:00";
       Persistent = true;
