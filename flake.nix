@@ -581,6 +581,12 @@
         machineModule = rpiSystemModule;
         globalTimeout = 3000;
       };
+      nixBuildDirCleanupTestRpi = import ./tests/nix-build-dir-cleanup.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+      };
       nixGcRetentionTestRpi = import ./tests/nix-gc-retention.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
@@ -837,6 +843,7 @@
         nix-gc-boot-trigger = nixGcBootTriggerTestRpi;
         system = systemTestRpi;
         nix-gc-retention = nixGcRetentionTestRpi;
+        nix-build-dir-cleanup = nixBuildDirCleanupTestRpi;
         monitoring = monitoringTestRpi;
         connectivity-fallback = connectivityFallbackTestRpi;
         connectivity-fallback-trigger = connectivityFallbackTriggerTestRpi;
@@ -1051,6 +1058,9 @@
         rpi5-x86-auto-upgrade-prebuild = rpi5X86Test ./tests/auto-upgrade-prebuild.nix { };
         rpi5-x86-nix-gc-upgrade-exclusion = rpi5X86Test ./tests/nix-gc-upgrade-exclusion.nix { };
         rpi5-x86-nix-gc-boot-trigger = rpi5X86Test ./tests/nix-gc-boot-trigger.nix { };
+        rpi5-x86-nix-build-dir-cleanup = rpi5X86Test ./tests/nix-build-dir-cleanup.nix {
+          machineModule = rpi5X86SystemModule;
+        };
         rpi5-x86-system = rpi5X86Test ./tests/system.nix {
           machineModule = rpi5X86SystemModule;
           dirtyBytes = 67108864;             # 64 MiB
@@ -1405,6 +1415,10 @@
         gcOptions = "--delete-older-than 14d";
         gcDates = "Mon *-*-* 00:00:00";
       };
+      anyaFeherLaptopNixBuildDirCleanupTest = import ./tests/nix-build-dir-cleanup.nix {
+        inherit nixpkgs pkgs stateVersion;
+        machineModule = anyaFeherLaptopSystemModule;
+      };
       anyaFeherLaptopNixGcRetentionTest = import ./tests/nix-gc-retention.nix {
         inherit nixpkgs pkgs stateVersion;
         machineModule = anyaFeherLaptopSystemModule;
@@ -1535,6 +1549,7 @@
         anya-feher-laptop-auto-upgrade-no-reboot = anyaFeherLaptopAutoUpgradeNoRebootTest;
         anya-feher-laptop-nix-settings = anyaFeherLaptopNixSettingsTest;
         anya-feher-laptop-nix-gc-retention = anyaFeherLaptopNixGcRetentionTest;
+        anya-feher-laptop-nix-build-dir-cleanup = anyaFeherLaptopNixBuildDirCleanupTest;
         anya-feher-laptop-nm-captive-portal = anyaFeherLaptopNmCaptivePortalTest;
         anya-feher-laptop-nm-captive-portal-ipv6 = anyaFeherLaptopNmCaptivePortalIpv6Test;
         anya-feher-laptop-restic = anyaFeherLaptopResticTest;

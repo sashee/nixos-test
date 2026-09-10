@@ -111,6 +111,35 @@ in
           experimental-features = [ "nix-command" "flakes" ];
         };
       };
+
+      # spec/features/gc.md, Auto build cleanup. Nix removes a build directory when a build
+      # ends normally, but not when the process is SIGKILLed -- so an OOM-killed or power-cut
+      # build leaves its whole tree behind, and nothing else ever reclaims it:
+      # nix-collect-garbage ignores these (they are not store paths). One OOM-killed kernel
+      # build on the Pi left 1.7 GB sitting there, still present hours and several GCs later,
+      # on a 29 GB SD card where a full disk has previously corrupted the nix database.
+      #
+      # tmpfiles rather than a unit of our own, for two reasons. NixOS already expresses
+      # exactly this for the sibling directories -- `R! /nix/var/nix/gcroots/tmp` and
+      # `R! /nix/var/nix/temproots` in 00-nixos.conf -- and `builds` looks simply to have
+      # been missed when nix moved build directories out of /tmp (where
+      # boot.tmp.cleanOnBoot used to handle them) into /nix/var. And systemd-tmpfiles-setup
+      # runs inside sysinit.target, which is before nix-daemon.socket and long before
+      # nixos-upgrade, so the spec's "the auto-upgrade does not start before the directory is
+      # cleaned" comes for free rather than needing Before= wiring that could rot.
+      #
+      # `R!` is boot-only and recursive, and it removes the directory *itself*, not just its
+      # contents (both measured). The `d` line puts it back: nix would very likely recreate
+      # it, as it does for temproots, but tmpfiles runs its remove phase before its create
+      # phase (also measured), so pairing them costs nothing and removes the assumption.
+      #
+      # Not gated on nix.gc.automatic: this is unrelated to collection, and a host with GC
+      # disabled needs it just as much. Accepted consequence: a leak from an interruption
+      # that does *not* reboot persists until the next boot.
+      systemd.tmpfiles.rules = [
+        "R! /nix/var/nix/builds - - - - -"
+        "d /nix/var/nix/builds 0755 root root -"
+      ];
     }
 
     # Guarded on nix.gc.automatic even though it is set true just above, because a host or
