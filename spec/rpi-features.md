@@ -39,7 +39,6 @@
 ## Auto GC
 
 * [](./features/gc.md)
-* runs twice daily
 * only the last generation is kept
 
 ## Monitoring
