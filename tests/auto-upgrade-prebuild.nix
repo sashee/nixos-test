@@ -24,11 +24,22 @@ let
       inputs.common.url = "path:/etc/common-src";
       outputs = { self, common }:
         let
+          # Writes the builder's NIX_BUILD_CORES, which is what makes the loop's `--cores 1`
+          # observable from the test. Chained ahead of leaf rather than left as a second
+          # root so the build order below stays a total order -- two independent
+          # derivations would make the expected order depend on a topo-sort tie-break.
+          cores = derivation {
+            name = "obo-cores";
+            system = "${system}";
+            builder = "${builder}";
+            args = [ "-c" "echo $NIX_BUILD_CORES > $out" ];
+          };
           leaf = derivation {
             name = "obo-leaf";
             system = "${system}";
             builder = "${builder}";
             outputs = [ "out" "dev" ];
+            dep = cores;
             args = [ "-c" "echo leaf > $out; echo leafdev > $dev" ];
           };
           mid = derivation {
@@ -102,6 +113,11 @@ nixpkgs.lib.nixos.runTest {
     # under test are three echo statements.
     nix.settings.sandbox = lib.mkForce false;
 
+    # Two, not the test framework's default of one: nix's `cores` default of 0 means "every
+    # CPU the machine has", so on a single-core guest NIX_BUILD_CORES is 1 whether or not
+    # the loop passes `--cores 1` -- and the assertion on it would pass vacuously.
+    virtualisation.cores = 2;
+
     # mkForce because nix.settings.substituters is a list option -- a plain `[ ]` merges
     # with nixpkgs' default and leaves cache.nixos.org in place, which in a network-less VM
     # means every single `nix build` first spends ~5s failing to resolve it.
@@ -167,14 +183,14 @@ nixpkgs.lib.nixos.runTest {
     with subtest("every outstanding derivation is built, one per nix process"):
         assert run_upgrade() == 0, upgrade_log()
         log = upgrade_log()
-        # leaf, mid, top -- and the count nix planned must match what the loop iterated,
-        # which is the cross-check that stops a parse regression from silently building
-        # nothing and falling back to one monolithic (OOM-prone) build.
-        assert "building 3 derivations, one per nix process" in log, log
-        assert "all 3 derivations built" in log, log
+        # cores, leaf, mid, top -- and the count nix planned must match what the loop
+        # iterated, which is the cross-check that stops a parse regression from silently
+        # building nothing and falling back to one monolithic (OOM-prone) build.
+        assert "building 4 derivations, one per nix process" in log, log
+        assert "all 4 derivations built" in log, log
 
     with subtest("built in dependency order"):
-        assert built_names() == ["obo-leaf", "obo-mid", "obo-top"], built_names()
+        assert built_names() == ["obo-cores", "obo-leaf", "obo-mid", "obo-top"], built_names()
 
     with subtest("all outputs of every derivation are realised"):
         # The ^* requirement. A derivation whose default output is built but whose other
@@ -192,17 +208,65 @@ nixpkgs.lib.nixos.runTest {
           done
         """)
 
+    with subtest("every build runs with a single core"):
+        # spec/features/auto-upgrade.md: "only one core and job is running concurrently".
+        # `--cores 1` is observable rather than a text match: nix exports it to the builder
+        # as NIX_BUILD_CORES, and obo-cores writes it out. This is the flag that actually
+        # bounds a build -- nixpkgs' cargo hook passes NIX_BUILD_CORES as `-j`, which is
+        # what put two 1.1 GiB rustc processes in the same OOM.
+        got = machine.succeed(f"""
+          set -eu
+          drv=$(nix eval --raw '{toplevel_attr}.drvPath')
+          d=$(nix-store --query --requisites "$drv" | grep -F obo-cores.drv)
+          cat "$(nix-store --query --outputs "$d")"
+        """).strip()
+        assert got == "1", f"builds ran with NIX_BUILD_CORES={got!r}, want '1'"
+
+    with subtest("the build loop caps concurrent jobs at one"):
+        # A text assertion, unlike the cores check above, because it cannot be made
+        # behavioural here: the loop hands each invocation a derivation whose inputs are
+        # already present, so a single build has exactly one goal and no job parallelism to
+        # observe. Reads the flag off the prebuild script the unit actually runs, reached
+        # through ExecStartPre, so it cannot drift from what is deployed.
+        machine.succeed("""
+          set -eu
+          pre=$(systemctl show nixos-upgrade.service -p ExecStartPre --value | grep -oE '/nix/store/[^ ;]*' | head -1)
+          prebuild=$(grep -oE '/nix/store/[^ ]*nixos-upgrade-prebuild' "$pre" | head -1)
+          grep -F -- '--max-jobs 1' "$prebuild"
+        """)
+
     with subtest("a second run has nothing to build"):
         assert run_upgrade() == 0
         assert "nothing to build" in upgrade_log()
 
+    with subtest("the flake inputs are updated, and the new lock is committed"):
+        # spec/features/auto-upgrade.md: "update the flake inputs". Behavioural rather than
+        # a command-shape assertion (which is what this replaced in
+        # tests/auto-upgrade-mocked-service.nix): move what the `common` input resolves to
+        # and the locked hash has to follow. The derivations under test never reference
+        # `common`, so their drv paths do not change and this stays a nothing-to-build run.
+        before_lock = machine.succeed("cat /etc/nixos/flake.lock")
+        machine.succeed("date +%s%N > /etc/common-src/marker")
+        assert run_upgrade() == 0, upgrade_log()
+        assert machine.succeed("cat /etc/nixos/flake.lock") != before_lock, (
+            "the locked input did not move after its source changed; the upgrade would "
+            "rebuild the same system every night"
+        )
+
+        # --commit-lock-file: the new lock must land as a commit rather than sit dirty in
+        # the tree. This is also what proves the unit's GIT_AUTHOR_*/GIT_COMMITTER_*
+        # environment reached git -- without it `git commit` fails with "Author identity
+        # unknown" (see the header note on running this through the unit).
+        machine.succeed('cd /etc/nixos && test -z "$(git status --porcelain flake.lock)"')
+        machine.succeed('cd /etc/nixos && git log -1 --name-only --format= | grep -Fqx flake.lock')
+
     with subtest("a failing derivation aborts the loop and blocks the rebuild"):
         install_flake("${flakeMidFails}")
         assert run_upgrade() != 0, "the upgrade should fail when a derivation fails"
-        # Only obo-mid and obo-top are in this plan: obo-leaf is byte-identical between the
-        # two flake variants, so it is already built and correctly excluded. obo-mid fails,
-        # so obo-top -- which depends on it -- must never be attempted, and the rebuild must
-        # not run on a half-built system.
+        # Only obo-mid and obo-top are in this plan: obo-cores and obo-leaf are
+        # byte-identical between the two flake variants, so they are already built and
+        # correctly excluded. obo-mid fails, so obo-top -- which depends on it -- must never
+        # be attempted, and the rebuild must not run on a half-built system.
         assert built_names() == ["obo-mid"], built_names()
         assert "fake nixos-rebuild" not in upgrade_log(), upgrade_log()
   '';
