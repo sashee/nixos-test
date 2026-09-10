@@ -263,8 +263,10 @@ nixpkgs.lib.nixos.runTest {
         # its clock. A Pi 5 with no RTC battery does exactly that on every boot.
         #
         # +1h, not +1d: it dwarfs the threshold while staying inside the same guest day as
-        # the testRtcBase 10:00 clock, so no nix-gc slot (03:15/15:15) or auto-upgrade
-        # window is crossed and no test certificate leaves its validity period.
+        # the testRtcBase 10:00 clock, so neither the weekly nix-gc slot nor the auto-upgrade
+        # window is crossed and no test certificate leaves its validity period. (The GC's
+        # other trigger is post-boot rather than calendar-based, so a clock jump cannot
+        # summon it -- see lib/test-rtc-base.nix.)
         machine.succeed("date -s '+1 hour'")
         base = count("probe failed")
         dohpeer.succeed("systemctl stop fake-doh.service")

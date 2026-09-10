@@ -7,14 +7,6 @@
 }:
 
 let
-  # Flake dir (the part before '#'), as used by the preStart `nix flake update`.
-  flakeRoot = builtins.head (nixpkgs.lib.splitString "#" flakeRef);
-  fakeNix = pkgs.writeShellScriptBin "nix" ''
-    set -eu
-    printf 'nix' >> /run/auto-upgrade-calls.log
-    printf ' %s' "$@" >> /run/auto-upgrade-calls.log
-    printf '\n' >> /run/auto-upgrade-calls.log
-  '';
   fakeNixosRebuild = pkgs.runCommand "fake-nixos-rebuild" { } ''
     mkdir -p $out/bin
     cat > $out/bin/nixos-rebuild <<'EOF'
@@ -53,7 +45,22 @@ nixpkgs.lib.nixos.runTest {
     systemd.tmpfiles.rules = [ "f /run/auto-upgrade-calls.log 0644 root root -" ];
 
     system.build.nixos-rebuild = lib.mkForce fakeNixosRebuild;
-    systemd.services.nixos-upgrade.path = lib.mkBefore [ fakeNix ];
+
+    # The prebuild phase is deliberately NOT exercised here -- tests/auto-upgrade-prebuild.nix
+    # runs the real one against a purpose-built flake. It also cannot be mocked the way it
+    # used to be: the old `path = mkBefore [ fakeNix ]` trick no longer intercepts anything,
+    # because the prebuild is a writeShellApplication that puts its own runtimeInputs
+    # (including the real nix) at the front of PATH. So replace the whole phase with a marker
+    # that logs exactly one line, keeping this test about the unit's shape.
+    systemd.services.nixos-upgrade.preStart = lib.mkForce ''
+      ${pkgs.coreutils}/bin/printf 'prebuild\n' >> /run/auto-upgrade-calls.log
+    '';
+
+    # The upgrade drags a GC in ahead of itself. An unbounded collect over the 9p-mounted
+    # host store would dominate this test's runtime, so make it a no-op; that the real GC is
+    # pulled in (and not skipped by its own guard) is covered by
+    # tests/nix-gc-upgrade-exclusion.nix.
+    systemd.services.nix-gc.script = lib.mkForce "${pkgs.coreutils}/bin/true";
   };
 
   testScript = ''
@@ -111,15 +118,28 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed("systemctl show nixos-upgrade.service -p Result --value | grep -qx success")
         return calls() - before_calls
 
-    # One daily occurrence == one run == two mocked calls (nix flake update + nixos-rebuild).
+    # One daily occurrence == one run == two mocked calls (prebuild + nixos-rebuild).
     first = trigger_daily_upgrade("2027-01-02")
-    assert first == 2, f"one upgrade should log 2 calls (nix flake update + nixos-rebuild), got {first}"
+    assert first == 2, f"one upgrade should log 2 calls (prebuild + nixos-rebuild), got {first}"
 
     # The timer must re-arm: the next daily occurrence adds exactly one more run.
     next_day = trigger_daily_upgrade("2027-01-03")
     assert next_day == 2, f"the next day's occurrence should add 2 more calls, got {next_day}"
 
-    machine.succeed("test \"$(tail -n 2 /run/auto-upgrade-calls.log | sed -n '1p')\" = 'nix flake update common --flake ${flakeRoot} --commit-lock-file'")
+    with subtest("the prebuild runs before the rebuild"):
+        # spec/features/auto-upgrade.md orders the whole prebuild (gc, lock update, eval,
+        # one-by-one build) ahead of the rebuild. Ordering, not just presence: a rebuild that
+        # ran first would be building an un-prepared system.
+        machine.succeed("test \"$(tail -n 2 /run/auto-upgrade-calls.log | sed -n '1p')\" = 'prebuild'")
+
+    with subtest("a GC is ordered before the upgrade"):
+        # Declared here, exercised for real in tests/nix-gc-upgrade-exclusion.nix. Pinned
+        # because the alternative implementation -- calling `systemctl start --wait
+        # nix-gc.service` from the prebuild -- is silently broken: the upgrade is
+        # `activating` at that point, so nix-gc's own guard would skip it.
+        machine.succeed("systemctl show nixos-upgrade.service -p Wants --value | grep -F 'nix-gc.service'")
+        machine.succeed("systemctl show nixos-upgrade.service -p After --value | grep -F 'nix-gc.service'")
+
     machine.succeed("""
       second="$(tail -n 2 /run/auto-upgrade-calls.log | sed -n '2p')"
       case "$second" in

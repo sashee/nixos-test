@@ -502,6 +502,8 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         extraModule = rpiSystemModule;
         gcOptions = "--delete-old";
+        # systemd normalises "weekly" to this; asserted verbatim like the other cadences.
+        gcDates = "Mon *-*-* 00:00:00";
       };
       autoUpgradeRebootTestRpi = import ./tests/auto-upgrade-reboot.nix {
         nixpkgs = nixrpi;
@@ -1006,11 +1008,19 @@
         rpi5-x86-nix-settings = rpi5X86Test ./tests/nix-settings.nix {
           extraModule = rpi5X86SystemModule;
           gcOptions = "--delete-old";
+          gcDates = "Mon *-*-* 00:00:00";
         };
         rpi5-x86-nix-gc-retention = rpi5X86Test ./tests/nix-gc-retention.nix {
           machineModule = rpi5X86SystemModule;
           keptAfterGc = 1;  # --delete-old keeps only the current generation
         };
+        # Both build their own minimal node rather than taking a host module, but they live
+        # in this set because the constraints they encode are the Pi's: a 4 GB host cannot
+        # survive one monolithic `nix build` of a large plan, and its SD cannot survive a GC
+        # racing that build.
+        rpi5-x86-auto-upgrade-prebuild = rpi5X86Test ./tests/auto-upgrade-prebuild.nix { };
+        rpi5-x86-nix-gc-upgrade-exclusion = rpi5X86Test ./tests/nix-gc-upgrade-exclusion.nix { };
+        rpi5-x86-nix-gc-boot-trigger = rpi5X86Test ./tests/nix-gc-boot-trigger.nix { };
         rpi5-x86-system = rpi5X86Test ./tests/system.nix {
           machineModule = rpi5X86SystemModule;
           dirtyBytes = 67108864;             # 64 MiB
@@ -1168,6 +1178,7 @@
       nixSettingsTest = import ./tests/nix-settings.nix {
         inherit nixpkgs pkgs stateVersion;
         gcOptions = "--delete-older-than 14d";
+        gcDates = "Mon *-*-* 00:00:00";
       };
       autoUpgradeMockedServiceTest = import ./tests/auto-upgrade-mocked-service.nix {
         autoUpgradeModule = ./modules/auto-upgrade.nix;
@@ -1258,6 +1269,12 @@
       };
       dohProvidersTest = import ./tests/doh-providers.nix {
         inherit pkgs dohStamps;
+      };
+      # Guards lib/upgrade-plan-parse.nix, the only place the one-derivation-per-process
+      # upgrade reads nix's human-readable output. Eval-set rather than a VM test: it feeds
+      # the parser fixture plans, so it needs no machine image.
+      upgradePlanParseTest = import ./tests/upgrade-plan-parse.nix {
+        inherit pkgs;
       };
       # Unlike the eval checks above this one is not pure data -- it forces both deployed host
       # configs to render time-correction.timer and time-correction.service, which costs an eval
@@ -1356,6 +1373,7 @@
         inherit nixpkgs pkgs stateVersion;
         extraModule = anyaFeherLaptopSystemModule;
         gcOptions = "--delete-older-than 14d";
+        gcDates = "Mon *-*-* 00:00:00";
       };
       anyaFeherLaptopNixGcRetentionTest = import ./tests/nix-gc-retention.nix {
         inherit nixpkgs pkgs stateVersion;
@@ -1518,6 +1536,7 @@
         time-sync-assertions = timeSyncAssertionsTest;
         thingspeak-deployed = thingspeakDeployedTest;
         qemu-graphical-eval = qemuGraphicalEval;
+        upgrade-plan-parse = upgradePlanParseTest;
       };
     in
     {

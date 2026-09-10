@@ -40,7 +40,19 @@ let
     ++ lib.optional (cfg.autoUpgrade.enable && config.system.autoUpgrade.enable)
       { name = "nixos-upgrade"; unit = "nixos-upgrade.service"; }
     ++ lib.optional (cfg.nixGc.enable && config.nix.gc.automatic)
-      { name = "nix-gc"; unit = "nix-gc.service"; };
+      {
+        name = "nix-gc";
+        unit = "nix-gc.service";
+        # nix-gc carries an ExecCondition (modules/nix-settings.nix) that skips the run while
+        # an upgrade is in flight, so "the unit finished without failing" no longer implies
+        # "a collection happened". Recording from ExecStartPost makes the marker track real
+        # work by construction: ExecStartPost cannot run unless ExecStart did. Whether
+        # OnSuccess would also be safe here is untested -- and not worth depending on, since
+        # getting it wrong means the check reports healthy GCs that never ran, which is
+        # precisely the silent-green failure it exists to catch.
+        # tests/nix-gc-upgrade-exclusion.nix asserts a skipped GC leaves the marker alone.
+        recordVia = "execStartPost";
+      };
 
   monitorScript = pkgs.writeShellApplication {
     name = "common-monitoring-checks";
@@ -654,20 +666,31 @@ in
           };
         };
       }
-    ] ++ map (m: {
-      # Record the unit's last successful run; started by the unit's OnSuccess.
-      ${recordServiceName m.name} = {
-        description = "Record last successful run of ${m.unit}";
-        serviceConfig = {
-          Type = "oneshot";
-          ExecStart = "${lib.getExe recordSuccess} ${markerPath m.unit}";
+    ] ++ map (m:
+      let
+        recordCmd = "${lib.getExe recordSuccess} ${markerPath m.unit}";
+      in
+      if (m.recordVia or "onSuccess") == "execStartPost" then {
+        # For units that can be skipped by an ExecCondition -- see the nix-gc entry in
+        # monitoredUnits for why the marker must hang off ExecStart having actually run.
+        ${m.name}.serviceConfig.ExecStartPost = recordCmd;
+      } else {
+        # Record the unit's last successful run; started by the unit's OnSuccess.
+        ${recordServiceName m.name} = {
+          description = "Record last successful run of ${m.unit}";
+          serviceConfig = {
+            Type = "oneshot";
+            ExecStart = recordCmd;
+          };
         };
-      };
-      # Have the monitored unit record success without touching its own ExecStart.
-      ${m.name} = {
-        unitConfig.OnSuccess = "${recordServiceName m.name}.service";
-      };
-    }) monitoredUnits);
+        # Have the monitored unit record success without touching its own ExecStart.
+        # Deliberately not ExecStartPost here: nixos-upgrade already uses ExecStartPost for
+        # its reboot hook, and OnSuccess cannot fail the unit it is attached to.
+        ${m.name} = {
+          unitConfig.OnSuccess = "${recordServiceName m.name}.service";
+        };
+      }
+    ) monitoredUnits);
 
     systemd.timers.common-monitoring = {
       wantedBy = [ "timers.target" ];
