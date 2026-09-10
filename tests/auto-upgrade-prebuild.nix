@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion }:
+{ nixpkgs, pkgs, stateVersion, globalTimeout ? 900 }:
 
 # Covers the prebuild phase of modules/auto-upgrade.nix: instantiate once, then build every
 # outstanding derivation in its own `nix` process, in dependency order, with all outputs.
@@ -72,7 +72,7 @@ in
 nixpkgs.lib.nixos.runTest {
   name = "auto-upgrade-prebuild";
   hostPkgs = pkgs;
-  globalTimeout = 900;
+  inherit globalTimeout;
 
   nodes.machine = { lib, ... }: {
     imports = [
