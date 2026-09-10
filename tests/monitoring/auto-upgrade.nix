@@ -23,11 +23,6 @@ let
     chmod +x $out/bin/nixos-rebuild
   '';
 
-  # Satisfies the `nix flake update` preStart of nixos-upgrade.service.
-  fakeNix = pkgs.writeShellScriptBin "nix" ''
-    exit 0
-  '';
-
   clockQemuOptions = [
     "-rtc"
     "base=${testClockBase},clock=vm"
@@ -67,7 +62,16 @@ nixpkgs.lib.nixos.runTest {
     };
 
     system.build.nixos-rebuild = lib.mkForce fakeNixosRebuild;
-    systemd.services.nixos-upgrade.path = lib.mkBefore [ fakeNix ];
+
+    # Skip the prebuild phase. a stub `nix` on the unit's path no longer neutralises it: the
+    # prebuild is a writeShellApplication that puts its own runtimeInputs (the real nix) at
+    # the front of PATH, so it would evaluate a /etc/nixos that does not exist here, the unit
+    # would fail, and its OnSuccess would never record the marker this test reads.
+    systemd.services.nixos-upgrade.preStart = lib.mkForce "";
+
+    # The upgrade now pulls a GC in ahead of itself; an unbounded collect over the 9p-mounted
+    # host store would dominate a test that only cares about the success marker.
+    systemd.services.nix-gc.script = lib.mkForce "${pkgs.coreutils}/bin/true";
 
     # Provision the report URL as a systemd-creds-encrypted blob at boot runtime
     # (encryption needs the host key, which isn't set up yet during activation).

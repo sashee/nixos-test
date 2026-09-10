@@ -96,8 +96,11 @@ nixpkgs.lib.nixos.runTest {
     # dotfiles: nix-utils on the path
     machine.succeed("command -v all-info-json")
 
-    # spec cadences: auto GC and monitoring both run daily
-    machine.succeed("systemctl show nix-gc.timer -p TimersCalendar | grep -F '*-*-* 03:15:00'")
+    # spec cadences: monitoring runs daily; the GC is weekly (systemd normalises "weekly"
+    # to Mon 00:00) plus a post-boot trigger, which is what actually collects on a laptop
+    # that is off most of the time.
+    machine.succeed("systemctl show nix-gc.timer -p TimersCalendar | grep -F 'Mon *-*-* 00:00:00'")
+    machine.succeed("systemctl cat nix-gc.timer | grep -E '^OnBootSec='")
     machine.succeed("systemctl show common-monitoring.timer -p TimersCalendar | grep -F '*-*-* 00:00:00'")
   '';
 }

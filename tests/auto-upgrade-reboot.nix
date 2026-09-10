@@ -35,7 +35,18 @@ nixpkgs.lib.nixos.runTest {
     system.stateVersion = stateVersion;
 
     system.build.nixos-rebuild = lib.mkForce fakeNixosRebuild;
-    systemd.services.nixos-upgrade.path = lib.mkBefore [ (pkgs.writeShellScriptBin "nix" "exit 0") ];
+
+    # Skip the prebuild entirely. It used to be neutralised with a stub `nix` on the unit's
+    # path, which no longer works: the prebuild is a writeShellApplication and puts its own
+    # runtimeInputs (the real nix) at the front of PATH, so it would try to evaluate a
+    # /etc/nixos that does not exist here and fail before the reboot decision is reached.
+    # The prebuild has its own test (tests/auto-upgrade-prebuild.nix); this one is about
+    # what happens *after* a changed upgrade.
+    systemd.services.nixos-upgrade.preStart = lib.mkForce "";
+
+    # The upgrade pulls a GC in ahead of itself; an unbounded collect over the 9p-mounted
+    # host store would dominate the runtime of a test that only cares about rebooting.
+    systemd.services.nix-gc.script = lib.mkForce "${pkgs.coreutils}/bin/true";
   };
 
   testScript = ''

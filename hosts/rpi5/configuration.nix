@@ -149,11 +149,13 @@ in
   # generation on GC (laptops keep 14 days to roll back from the boot menu).
   common.nixSettings.gcOptions = "--delete-old";
 
-  # GC twice a day: the nightly upgrade (starts 00:00-02:00) can run past the default
-  # 03:15 slot (a nixpkgs-bump kernel rebuild took until ~05:20), which would leave the
-  # old generation + build deps (GBs) on the SD until the *next* night -- overlapping
-  # the next upgrade's download. The 15:15 pass clears them the same afternoon.
-  nix.gc.dates = "*-*-* 03,15:15:00";
+  # No nix.gc.dates override: scheduling now comes from modules/nix-settings.nix, which
+  # runs GC after boot and weekly, and modules/auto-upgrade.nix, which pulls a GC in before
+  # the upgrade builds anything. That last one is what the old twice-daily schedule was
+  # really compensating for -- it existed because a long nightly upgrade would overrun the
+  # 03:15 slot and leave the old generation plus build deps (GBs) on the SD until the next
+  # night, overlapping the following upgrade. Reclaiming immediately before the build needs
+  # the space addresses that directly instead of guessing at clock slots.
 
   # Health checks every 30 minutes (disk-space, generations, auto-upgrade). smart disabled (SD
   # card has no SMART); restic auto-skips with no backups. Reporting posts to a
@@ -376,8 +378,8 @@ in
   # The tunnel needs no such treatment: it dials the receiver's socket lazily, once per stream,
   # so it rides out the restart (the note on its `after` in modules/monitoring-platform-tunnel.nix).
   #
-  # Off the default midnight slot: the auto-upgrade starts 00:00-02:00 and nix-gc runs
-  # 03:15/15:15, and all three are SD-I/O bound on this box.
+  # Off the default midnight slot: the auto-upgrade starts 00:00-02:00 and drags a GC in
+  # ahead of itself, and all of them are SD-I/O bound on this box.
   #
   # The repository location is a credential too, not config: this repo is public, so the URL
   # would otherwise be in git (and, via upstream's PATH wrapper, in a world-readable store path).

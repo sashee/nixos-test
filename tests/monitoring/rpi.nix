@@ -32,10 +32,6 @@ let
     chmod +x $out/bin/nixos-rebuild
   '';
 
-  # Satisfies the `nix flake update` preStart of nixos-upgrade.service.
-  fakeNix = pkgs.writeShellScriptBin "nix" ''
-    exit 0
-  '';
 in
 nixpkgs.lib.nixos.runTest {
   name = "monitoring-rpi";
@@ -74,7 +70,11 @@ nixpkgs.lib.nixos.runTest {
     # Mock the upgrade so the real, enabled nixos-upgrade.timer succeeds when the clock
     # wakes it and records its last-success marker via the module's OnSuccess hook.
     system.build.nixos-rebuild = lib.mkForce fakeNixosRebuild;
-    systemd.services.nixos-upgrade.path = lib.mkBefore [ fakeNix ];
+    # See tests/monitoring/auto-upgrade.nix: the prebuild's own PATH wins over the unit's,
+    # so a stub `nix` on the unit's path cannot neutralise it -- skip the phase instead.
+    # No GC override needed here: nix.gc.automatic is forced off below, and the upgrade only
+    # depends on nix-gc when there is an automatic GC to depend on.
+    systemd.services.nixos-upgrade.preStart = lib.mkForce "";
     # Test-only safety: a "successful" mocked upgrade must never reboot mid-test (it
     # changes no system, so it wouldn't anyway, but pin both reboot paths off to be sure).
     system.autoUpgrade.allowReboot = lib.mkForce false;
