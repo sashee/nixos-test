@@ -1,4 +1,5 @@
 ## Auto GC
 
-* periodically deletes old generations and runs gc
+* after boot it deletes old generations and runs gc
+* plus there is a weekly gc
 
