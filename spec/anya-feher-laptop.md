@@ -31,7 +31,6 @@
 ## Auto GC
 
 * [](./features/gc.md)
-* runs daily
 * generations are kept for 14 days
 
 ## Monitoring
