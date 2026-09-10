@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion }:
+{ nixpkgs, pkgs, stateVersion, globalTimeout ? 900 }:
 
 # spec/features/gc.md: "it does not run if the nixos-upgrade script is running", and
 # spec/features/auto-upgrade.md: the upgrade "run[s] the nix-gc first".
@@ -31,7 +31,7 @@ in
 nixpkgs.lib.nixos.runTest {
   name = "nix-gc-upgrade-exclusion";
   hostPkgs = pkgs;
-  globalTimeout = 900;
+  inherit globalTimeout;
 
   nodes.machine = { lib, config, ... }: {
     imports = [

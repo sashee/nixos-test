@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, stateVersion }:
+{ nixpkgs, pkgs, stateVersion, globalTimeout ? 600 }:
 
 # spec/features/gc.md: "after boot it deletes old generations and runs gc".
 #
@@ -16,7 +16,7 @@
 nixpkgs.lib.nixos.runTest {
   name = "nix-gc-boot-trigger";
   hostPkgs = pkgs;
-  globalTimeout = 600;
+  inherit globalTimeout;
 
   nodes.machine = { ... }: {
     imports = [ ../modules/nix-settings.nix ];

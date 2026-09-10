@@ -511,6 +511,33 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiSystemModule;
       };
+      # The three upgrade/GC-plumbing checks. They build their own minimal node rather than
+      # taking rpiSystemModule -- the subject is the prebuild loop and the GC guard, not the
+      # host config -- but they run on both arches like every other test here, because this
+      # is the leg that decides: the constraints they encode are the Pi's, and the x86 twin
+      # is only the fast KVM preview of it.
+      #
+      # TCG ceilings, not the files' KVM defaults. auto-upgrade-prebuild gets the largest
+      # because it is the one that runs real `nix build` invocations in the guest -- four of
+      # them, plus an eval and two store queries, each paying emulated process startup.
+      autoUpgradePrebuildTestRpi = import ./tests/auto-upgrade-prebuild.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        globalTimeout = 2400;
+      };
+      nixGcUpgradeExclusionTestRpi = import ./tests/nix-gc-upgrade-exclusion.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        globalTimeout = 1800;
+      };
+      nixGcBootTriggerTestRpi = import ./tests/nix-gc-boot-trigger.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        globalTimeout = 1200;
+      };
       # spec/rpi-features.md overrides the shared writeback thresholds with a
       # quarter of the laptop values (SD-card backing store).
       systemTestRpi = import ./tests/system.nix {
@@ -805,6 +832,9 @@
         auto-upgrade = autoUpgradeTestRpi;
         nix-settings = nixSettingsTestRpi;
         auto-upgrade-reboot = autoUpgradeRebootTestRpi;
+        auto-upgrade-prebuild = autoUpgradePrebuildTestRpi;
+        nix-gc-upgrade-exclusion = nixGcUpgradeExclusionTestRpi;
+        nix-gc-boot-trigger = nixGcBootTriggerTestRpi;
         system = systemTestRpi;
         nix-gc-retention = nixGcRetentionTestRpi;
         monitoring = monitoringTestRpi;
@@ -1014,10 +1044,10 @@
           machineModule = rpi5X86SystemModule;
           keptAfterGc = 1;  # --delete-old keeps only the current generation
         };
-        # Both build their own minimal node rather than taking a host module, but they live
-        # in this set because the constraints they encode are the Pi's: a 4 GB host cannot
-        # survive one monolithic `nix build` of a large plan, and its SD cannot survive a GC
-        # racing that build.
+        # All three build their own minimal node rather than taking a host module, but they
+        # belong to the Pi: a 4 GB host cannot survive one monolithic `nix build` of a large
+        # plan, and its SD cannot survive a GC racing that build. Twins of the aarch64
+        # entries of the same name -- this is the KVM preview, that is the deciding run.
         rpi5-x86-auto-upgrade-prebuild = rpi5X86Test ./tests/auto-upgrade-prebuild.nix { };
         rpi5-x86-nix-gc-upgrade-exclusion = rpi5X86Test ./tests/nix-gc-upgrade-exclusion.nix { };
         rpi5-x86-nix-gc-boot-trigger = rpi5X86Test ./tests/nix-gc-boot-trigger.nix { };
