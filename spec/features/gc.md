@@ -4,7 +4,7 @@
 * plus there is a weekly gc
 * it does not run if the nixos-upgrade script is running
 
-### Build cleanup
+### Nix build directories
 
-* clean the Nix build directory after boot
+* nix build directories are cleaned up automatically
 
