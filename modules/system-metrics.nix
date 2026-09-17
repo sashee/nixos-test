@@ -22,6 +22,15 @@
 let
   cfg = config.common.systemMetrics;
 
+  ntsServers = import ../lib/nts-servers.nix { inherit lib; };
+  dohStamps = import ../lib/doh-stamps.nix { inherit lib; };
+
+  # dnscrypt-proxy's own default, in minutes, for the case where nothing sets it. Only reached on
+  # a host that enables the resolver without modules/doh.nix, which pins it explicitly precisely
+  # so this fallback is never the operative number on a host we deploy.
+  certRefreshMinutes =
+    lib.attrByPath [ "cert_refresh_delay" ] 240 config.services.dnscrypt-proxy.settings;
+
   # A `common.*` option from a module this host may not import.
   #
   # Load-bearing: this module is imported by configurations that import none of the other
@@ -102,11 +111,50 @@ let
     ++ lib.optional (commonFeature [ "thingspeak" "enable" ] false) "thingspeak.timer"
     ++ lib.optional config.services.fstrim.enable "fstrim.timer";
 
+  # The NTS providers this host actually points chrony at, described the way lib/nts-servers.nix
+  # describes them. Intersected with that file rather than taken from it wholesale, so a host that
+  # configures a subset reports that subset -- and a hostname the file does not describe is left
+  # out rather than reported under a guessed operator, which would make two servers look like two
+  # independent votes when nobody knows whether they are.
+  #
+  # Gated on chronyd actually running, not merely on the server list being set. That list keeps
+  # its default when `common.timeSync.enable` is false -- which is the state every VM test node is
+  # in, since the test base turns the feature off at priority 90 -- so without the gate those
+  # hosts would configure four providers against a daemon that is not there.
+  configuredNtsProviders =
+    let
+      wanted = commonFeature [ "timeSync" "servers" ] [ ];
+    in
+    lib.optionalAttrs config.services.chrony.enable (
+      lib.filterAttrs (_: p: lib.elem p.hostname wanted) ntsServers.providers
+    );
+
+  # The DoH stamps this host actually gives dnscrypt-proxy. `server_names` is
+  # `builtins.attrNames doh.stamps` (modules/doh.nix), so these keys are exactly the names that
+  # turn up in the journal -- no translation, unlike the NTS side.
+  # Gated on the resolver running for the same reason as the NTS side: with dnscrypt-proxy off
+  # there is no journal to read, and every provider would report unknown forever.
+  configuredDohProviders =
+    let
+      wanted = lib.attrByPath [ "server_names" ] [ ] config.services.dnscrypt-proxy.settings;
+    in
+    lib.optionalAttrs config.services.dnscrypt-proxy.enable (
+      lib.filterAttrs (name: _: lib.elem name wanted) dohStamps.endpoints
+    );
+
   excludeArgs = lib.concatMap (t: [ "--exclude-fstype" t ]) cfg.excludeFsTypes;
   resourceArgs =
     lib.concatLists (lib.mapAttrsToList (k: v: [ "--resource-attr" "${k}=${v}" ]) cfg.resourceAttributes);
   unitArgs = lib.concatMap (u: [ "--unit" u ]) cfg.units;
   timerArgs = lib.concatMap (t: [ "--timer" t ]) cfg.timers;
+
+  ntsProviderArgs = lib.concatLists (
+    lib.mapAttrsToList (name: p: [ "--nts-provider" "${name}=${p.hostname}@${p.operator}" ])
+      cfg.timeProviders
+  );
+  dohProviderArgs = lib.concatLists (
+    lib.mapAttrsToList (name: family: [ "--doh-provider" "${name}=${family}" ]) cfg.dnsProviders
+  );
 
   collectArgs = [
     "--socket"
@@ -137,6 +185,11 @@ let
     "${config.systemd.package}/bin/journalctl"
   ]
   ++ lib.optionals (cfg.flakeLock.path != null) [ "--flake-lock" cfg.flakeLock.path ]
+  # chronyc rides the fifteen-minute tick: chronyd maintains the reachability register on its own
+  # poll schedule, so reading it is a local socket round trip and costs no network traffic at all.
+  ++ lib.optionals (cfg.timeProviders != { }) (
+    [ "--chronyc" (lib.getExe' cfg.tools.chrony "chronyc") ] ++ ntsProviderArgs
+  )
   ++ lib.optionals cfg.smart.enable [ "--smartctl" (lib.getExe' cfg.smart.package "smartctl") ]
   ++ lib.optionals cfg.irohFailsafe.enable [
     "--iroh-failsafe-marker"
@@ -147,6 +200,28 @@ let
     (lib.getExe' cfg.tools.nftables "nft")
   ]
   ++ excludeArgs ++ resourceArgs ++ unitArgs ++ timerArgs;
+
+  # The DoH half runs on its own, much slower schedule, so it is its own invocation rather than
+  # more flags on the one above.
+  #
+  # `--only` is what keeps that from being expensive: without it this run would also re-sample CPU,
+  # filesystems and sensors four more times a day, producing records indistinguishable from the
+  # ones the fifteen-minute timer already stores. The DoH records themselves are nearly free per
+  # run and would be nearly all duplicates at the faster cadence -- fifteen of every sixteen rows
+  # re-reporting one four-hourly probe -- which is the whole reason the two cadences differ.
+  dnsCollectArgs = [
+    "--socket"
+    cfg.socketPath
+    "--only"
+    "system.dns_provider"
+    "--dnscrypt-unit"
+    cfg.dns.unit
+    "--dns-window-seconds"
+    (toString cfg.dns.windowSeconds)
+    "--journalctl"
+    "${config.systemd.package}/bin/journalctl"
+  ]
+  ++ dohProviderArgs ++ resourceArgs;
 
   # The same invocation the timer runs, on the operator's PATH. `system-metrics --dry-run`
   # prints the batch the next run would send without sending it, which on a headless box
@@ -403,6 +478,114 @@ in
       '';
     };
 
+    timeProviders = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = {
+          hostname = lib.mkOption {
+            type = lib.types.str;
+            description = "The name chrony knows this provider by, i.e. what `chronyc -N` prints.";
+          };
+          operator = lib.mkOption {
+            type = lib.types.str;
+            description = "The organisation that runs it.";
+          };
+        };
+      });
+      default = configuredNtsProviders;
+      defaultText = lib.literalMD
+        "the entries of `lib/nts-servers.nix` this host points chrony at";
+      description = ''
+        NTS providers reported as `system.time_provider`, one record each, keyed by the attribute
+        name.
+
+        None of this comes out of chrony, which is why it is configuration rather than discovery.
+        `chronyc -N` prints the hostname from chrony's own config (`ptbtime1.ptb.de`), never the
+        key (`ptb1`), and `operator` is not a chrony concept at any level -- it exists because the
+        quorum rule counts organisations rather than hostnames, and two PTB machines are one
+        failure. Both live in `lib/nts-servers.nix`.
+
+        Derived from [](#opt-common.timeSync.servers) rather than hardcoded, so a host that points
+        chrony at a subset reports that subset. A hostname `lib/nts-servers.nix` does not describe
+        is left out rather than reported under a guessed operator: an operator invented here would
+        make two servers look like two independent votes when nothing knows whether they are.
+
+        Empty disables the record and drops `--chronyc` from the invocation entirely.
+      '';
+    };
+
+    dnsProviders = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = lib.mapAttrs (_: e: e.family) configuredDohProviders;
+      defaultText = lib.literalMD
+        "the `lib/doh-stamps.nix` endpoints this host gives dnscrypt-proxy, mapped to their family";
+      description = ''
+        DoH providers reported as `system.dns_provider`, one record each, mapped to the address
+        family the stamp is pinned to.
+
+        The names need no translation, unlike the NTS side: `server_names` is
+        `builtins.attrNames doh.stamps`, so what `lib/doh-stamps.nix` calls a provider is literally
+        what turns up in dnscrypt-proxy's journal. `family` is not a dnscrypt-proxy concept at all
+        and comes from the same file -- it is what makes "how many v6-capable upstreams are left"
+        a question the store can answer, which matters here because
+        `tests/doh-endpoints.nix` requires at least two single-family providers per family.
+
+        Empty disables the record and its timer.
+      '';
+    };
+
+    dns = {
+      unit = lib.mkOption {
+        type = lib.types.str;
+        default = "dnscrypt-proxy.service";
+        description = "Unit whose journal the DoH refresh reports are read from.";
+      };
+
+      windowSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 21600;
+        description = ''
+          How far back the `system.dns_provider` journal read reaches.
+
+          **Must span dnscrypt-proxy's `cert_refresh_delay`**, and an assertion below enforces it.
+          That refresh is the only thing that probes every configured server, so a window shorter
+          than it contains no pass at all and every provider reports `ok` absent -- not failed,
+          which is the honest reading, but also not useful. At the stock 240-minute refresh a
+          six-hour window always contains a complete pass, and consecutive runs at
+          [](#opt-common.systemMetrics.dns.timerConfig)'s cadence tile the timeline with neither a
+          gap nor a double count.
+
+          The coupling is the reason `modules/doh.nix` pins `cert_refresh_delay` explicitly rather
+          than leaving it at dnscrypt-proxy's default: a version bump that changed that default
+          would otherwise silently empty this record with no error anywhere.
+        '';
+      };
+
+      timerConfig = lib.mkOption {
+        type = lib.types.attrsOf lib.types.anything;
+        default = {
+          OnBootSec = "10m";
+          OnUnitActiveSec = "6h";
+          AccuracySec = "5m";
+        };
+        description = ''
+          systemd timer configuration for the DoH collection.
+
+          Six-hourly rather than the fifteen minutes the rest of the producer runs at, because the
+          underlying probe is four-hourly: at the faster cadence fifteen of every sixteen rows
+          would re-report one probe with only `probe_age_seconds` moving, which is ~420k rows a
+          year against ~17k for the same information. Detection latency is the price -- up to four
+          hours for the refresh to notice plus up to six for a run to observe it -- and it is the
+          right trade here, because a pool that has failed *completely* stops answering and
+          `common.connectivityWatchdog` reboots on that within three hours. What this record is
+          for is the slow erosion above that floor, which no fuse catches.
+
+          `OnBootSec` is later than the main collector's so the two do not contend on a cold boot,
+          and `AccuracySec` is generous because nothing here is time-critical -- it lets systemd
+          coalesce the wakeup rather than waking the box alone for it.
+        '';
+      };
+    };
+
     journalWindowSeconds = lib.mkOption {
       type = lib.types.ints.positive;
       default = 900;
@@ -469,6 +652,70 @@ in
         description = "Package providing `nft`, used to read the firewall's input-allow chain.";
       };
 
+      chrony = lib.mkOption {
+        type = lib.types.package;
+        default = config.services.chrony.package;
+        defaultText = lib.literalExpression "config.services.chrony.package";
+        description = ''
+          Package providing `chronyc`, used to read `system.time_provider`.
+
+          Separate from `services.chrony.package` so a VM test can point it at a fixture without
+          also replacing the daemon the rest of the host depends on -- the same reason
+          [](#opt-common.systemMetrics.smart.package) is its own option.
+        '';
+      };
+
+      chronyGroup = lib.mkOption {
+        type = lib.types.str;
+        default = "chrony";
+        description = ''
+          Group owning chronyd's command socket directory, which the producer must join to read
+          `system.time_provider`.
+
+          A plain string rather than a reference to `services.chrony.group`, because nixpkgs'
+          chrony module has no such option: it hardcodes the name, in a tmpfiles rule and nowhere
+          else. Naming it here at least makes the dependency visible, and gives a host whose
+          chrony is packaged differently somewhere to say so.
+        '';
+      };
+
+      chronyRuntimeDir = lib.mkOption {
+        type = lib.types.path;
+        default = "/run/chrony";
+        description = ''
+          Directory holding chronyd's command socket, which the producer needs **write** access
+          to.
+
+          Not a typo for read access. `chronyc` does not simply connect to `chronyd.sock`: it
+          binds a reply socket of its own in the same directory, under `chronyc.$PID/$RANDOM/`,
+          because chronyd has to be able to send the answer back to a path it can see (chrony's
+          client.c, `open_unix_socket`). So the unit needs this in `ReadWritePaths` on top of
+          membership of [](#opt-common.systemMetrics.tools.chronyGroup) -- `ProtectSystem=strict`
+          would otherwise leave it read-only and every read would fail, reporting nulls that look
+          exactly like a chrony with nothing to say.
+
+          Compiled into chrony rather than configured, so like the group there is no nixpkgs
+          option to read it from.
+        '';
+      };
+
+      chronySocket = lib.mkOption {
+        type = lib.types.path;
+        default = "${cfg.tools.chronyRuntimeDir}/chronyd.sock";
+        defaultText = lib.literalExpression ''"''${config.common.systemMetrics.tools.chronyRuntimeDir}/chronyd.sock"'';
+        description = ''
+          chronyd's command socket.
+
+          The producer needs write permission on it -- connecting to a unix *datagram* socket is a
+          write, not a read -- which is why this is named separately from the directory: the two
+          are chmod'd together and both are necessary.
+
+          It is also the only endpoint that answers the whole command set. chronyd grants
+          `full_access` to the unix socket alone; requests arriving on the UDP command port get a
+          restricted set that excludes `authdata`, so a fallback to it would silently cost every
+          NTS field.
+        '';
+      };
     };
 
     timerConfig = lib.mkOption {
@@ -535,6 +782,37 @@ in
         '';
       }
       {
+        # The whole DoH record rests on this inequality. dnscrypt-proxy's refresh is the only
+        # thing that probes every configured server, so a window that does not span one contains
+        # no pass, and `ok` is absent for every provider on every run -- a record that is
+        # perfectly well-formed, never alarms, and says nothing. Exactly the failure this feature
+        # exists to avoid, so it is a build error rather than a silence.
+        assertion =
+          cfg.dnsProviders == { } || cfg.dns.windowSeconds >= certRefreshMinutes * 60;
+        message = ''
+          common.systemMetrics.dns.windowSeconds is ${toString cfg.dns.windowSeconds}, but
+          dnscrypt-proxy refreshes its servers every ${toString certRefreshMinutes} minutes
+          (${toString (certRefreshMinutes * 60)}s). A window shorter than the refresh interval
+          contains no probe of most providers, so system.dns_provider would report `ok` as absent
+          on nearly every run. Raise common.systemMetrics.dns.windowSeconds to at least
+          ${toString (certRefreshMinutes * 60)}, or lower
+          services.dnscrypt-proxy.settings.cert_refresh_delay.
+        '';
+      }
+      {
+        # SupplementaryGroups names a group that would not exist, and systemd refuses to start a
+        # unit whose supplementary group is unresolvable -- so this would be a every-tick failure
+        # with a message about users rather than about time.
+        assertion = cfg.timeProviders == { } || config.services.chrony.enable;
+        message = ''
+          common.systemMetrics.timeProviders names ${toString (lib.length (lib.attrNames cfg.timeProviders))}
+          NTS provider(s), but services.chrony.enable is false on this host. The record is read
+          from chronyd's command socket, so there is nothing to read and the unit would fail on
+          its missing "${cfg.tools.chronyGroup}" group. Enable chrony, or set
+          common.systemMetrics.timeProviders to { }.
+        '';
+      }
+      {
         # Membership of the wrong group leaves the socket unreachable and every tick failing,
         # which is loud but says nothing about the cause. Checked against whichever service the
         # producer resolved to, so a half-moved wiring (collector socket, receiver group) is a
@@ -551,6 +829,33 @@ in
     ];
 
     environment.systemPackages = [ collectCommand ];
+
+    # Makes chronyd's command socket reachable by its own group, which membership alone does NOT
+    # achieve. nixpkgs' chronyd unit sets `UMask=0027`, and that masks the group-write bit off
+    # both things chronyc needs:
+    #
+    #   /run/chrony             chrony asks for 0770 and gets 0750 -- but chronyc does not merely
+    #                           connect, it binds a reply socket of its own in this directory
+    #                           (client.c, `open_unix_socket`), which 0750 forbids.
+    #   /run/chrony/chronyd.sock  lands at 0750, and *connecting* to a unix datagram socket needs
+    #                           write permission on it, not read.
+    #
+    # `+` so the chmod runs as root rather than as the sandboxed service, and ExecStartPost so it
+    # runs after the socket has been bound -- chronyd is Type=notify and binds cmdmon before it
+    # signals readiness. Re-applied on every chronyd restart, which a tmpfiles rule would not be.
+    #
+    # Scoped to these two paths rather than relaxing the unit's UMask, which would also make
+    # chrony.keys and the drift file group-writable -- and this group now contains a producer that
+    # has no business writing either.
+    #
+    # Worth doing at all because the alternative is not read-only access, it is WRONG DATA: with
+    # the socket unreachable chronyc silently falls back to the UDP command port on 127.0.0.1,
+    # which chronyd serves with `full_access = 0` (cmdmon.c). `authdata` is not among the commands
+    # allowed there, so `sources` would keep working while every NTS field came back null --
+    # indistinguishable from a provider that has never established keys.
+    systemd.services.chronyd.serviceConfig.ExecStartPost = lib.mkIf (cfg.timeProviders != { }) [
+      "+${pkgs.coreutils}/bin/chmod g+w ${cfg.tools.chronyRuntimeDir} ${cfg.tools.chronySocket}"
+    ];
 
     systemd.services.system-metrics = {
       description = "Report host measurements to the local monitoring platform";
@@ -586,8 +891,14 @@ in
         # systemd-journal is the second: a DynamicUser unit sees only its own logs, so without
         # it `system.journal` would count this unit's own messages and nothing else -- zero on
         # every healthy run, which reads exactly like a quiet host.
+        # chrony is the third, and only where the time record is on: chronyc does not merely read
+        # /run/chrony/chronyd.sock, it creates its own reply socket in that directory (chrony's
+        # client.c binds one under `dirname(server_path)`), so it needs WRITE access there --
+        # which is why group membership is the mechanism and the directory is 0770 chrony:chrony.
         DynamicUser = true;
-        SupplementaryGroups = [ cfg.group "systemd-journal" ];
+        SupplementaryGroups =
+          [ cfg.group "systemd-journal" ]
+          ++ lib.optional (cfg.timeProviders != { }) cfg.tools.chronyGroup;
 
         # Generous next to a cpuSampleSeconds-long run: the point is to kill a run wedged on
         # an unresponsive socket before the next tick, not to police collection speed.
@@ -595,6 +906,11 @@ in
 
         NoNewPrivileges = true;
         ProtectSystem = "strict";
+        # chronyc binds a reply socket beside chronyd's, so this directory has to be writable --
+        # see tools.chronyRuntimeDir. Group membership alone is not enough: ProtectSystem=strict
+        # would leave it read-only, and the failure is silent, since a chronyc that cannot answer
+        # degrades to the same nulls as a chrony with nothing to say.
+        ReadWritePaths = lib.mkIf (cfg.timeProviders != { }) [ cfg.tools.chronyRuntimeDir ];
         # Reading the firewall's rule set is a privileged operation even though it changes
         # nothing; smartctl needs to issue device commands. Both are granted only when the
         # record that needs them is switched on, so the default sandbox is unchanged.
@@ -650,6 +966,67 @@ in
     systemd.timers.system-metrics = {
       wantedBy = [ "timers.target" ];
       timerConfig = cfg.timerConfig // { Unit = "system-metrics.service"; };
+    };
+
+    # The DoH half, on its own six-hourly schedule. A separate unit rather than a branch inside
+    # the one above, because the producer holds no state -- there is nowhere for it to remember
+    # "I last did the DoH read four hours ago", so the only thing that can run a subset on a
+    # slower cadence is a second timer.
+    systemd.services.system-metrics-dns = lib.mkIf (cfg.dnsProviders != { }) {
+      description = "Report DoH upstream health to the local monitoring platform";
+      after = [
+        "mp-collector.service"
+        "monitoring-platform.service"
+        "time-sync.target"
+      ];
+
+      # Same gate as the main collector, and it matters more here: every field this record carries
+      # is an age, so a pre-sync run would date them against a clock reading somewhere near the
+      # epoch.
+      unitConfig.ConditionPathExists = lib.mkIf cfg.requireClockSync cfg.syncedMarker;
+
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ dnsCollectArgs);
+
+        DynamicUser = true;
+        SupplementaryGroups = [ cfg.group "systemd-journal" ];
+
+        # No CPU sample to wait out; this is one journalctl read and one post.
+        TimeoutStartSec = "60s";
+
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        CapabilityBoundingSet = "";
+        # Stricter than the main collector on all four counts, because this one reads exactly two
+        # things -- a journal and a unix socket -- and none of the reasons that unit has to relax
+        # them apply. It walks no mount table, so /home can be gone entirely; it scans no block
+        # devices; and ProcSubset can hide everything, since unlike the main collector it reads no
+        # /proc files at all.
+        ProtectHome = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        ProcSubset = "pid";
+        ProtectProc = "invisible";
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        SystemCallFilter = [ "@system-service" ];
+        SystemCallArchitectures = "native";
+        RestrictAddressFamilies = [ "AF_UNIX" ];
+      };
+    };
+
+    systemd.timers.system-metrics-dns = lib.mkIf (cfg.dnsProviders != { }) {
+      wantedBy = [ "timers.target" ];
+      timerConfig = cfg.dns.timerConfig // { Unit = "system-metrics-dns.service"; };
     };
   };
 }

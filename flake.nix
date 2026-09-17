@@ -1070,6 +1070,13 @@
         rpi5-x86-system-metrics = rpi5X86Test ./tests/system-metrics.nix {
           machineModule = rpi5X86SystemModule;
         };
+        # The two upstream-health producers. Its own node rather than more subtests in the one
+        # above, because it needs chrony -- which forces timesyncd off, and that test drives its
+        # clock with timesyncd. x86 only: the chronyc CSV layout and the dnscrypt-proxy log
+        # format are neither arch- nor kernel-dependent, and this is the set that gets KVM.
+        rpi5-x86-time-dns-providers = rpi5X86Test ./tests/time-dns-providers.nix {
+          machineModule = rpi5X86SystemModule;
+        };
         # The devices producer. `iw` and the BlueZ pair are faked -- a guest has no wireless phy
         # and no Bluetooth controller at all -- so this runs the same on either arch, and runs
         # here because this is the set that gets KVM.
