@@ -163,3 +163,45 @@ journal for every systemd unit that logged >= warning since (now - interval)
     * err: number of 3 priority messages in the last period
     * crit: number of <=2 priority messages in the last period
     * window_seconds: the interval of the monitoring runs
+
+#### time_provider
+
+* considers the providers that are configured for Chrony
+* queries Chrony for which time server is healthy
+
+* attributes:
+    * provider: the provider configured
+    * operator: the operator
+* body:
+    * reachable: reach != 0
+    * reach
+    * state
+    * stratum
+    * poll_seconds
+    * last_rx_seconds
+    * offset_seconds
+    * auth_mode
+    * nts_ke_count
+    * nts_ke_attempts
+    * nts_last_ke_seconds
+    * nts_cookies
+    * nts_naks
+
+#### dns_provider
+
+* runs every 6 hours (rarer than the dnscrypt-proxy refresh interval)
+* evaluates all the providers that are configured for dnscrypt-proxy
+* parses the journal for dnscrypt-proxy reports
+
+* attributes:
+    * provider: the provider name
+    * family: ipv4 | ipv6
+* body:
+    * ok: was there an OK for that provider
+    * rtt_ms
+    * error
+    * probe_age_seconds
+    * last_ok_seconds
+    * last_fail_seconds
+    * window_seconds
+
