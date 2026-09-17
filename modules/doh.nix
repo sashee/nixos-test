@@ -51,6 +51,13 @@ in
       ipv6_servers = true;
       dnscrypt_servers = false;
       doh_servers = true;
+      # dnscrypt-proxy's own default, restated because something now depends on it. This refresh
+      # is the only thing that probes every configured server, and `system.dns_provider`
+      # (modules/system-metrics.nix) reads the result out of the journal over a window that must
+      # span it -- an assertion there compares the two numbers. Left implicit, a version bump that
+      # changed the upstream default would silently empty that record with no error anywhere,
+      # which is the exact failure mode the record exists to catch.
+      cert_refresh_delay = 240;
       require_dnssec = false;
       require_nolog = false;
       require_nofilter = true;

@@ -11,7 +11,9 @@
 //! batch -- meant an unreadable `flake.lock` could cost a tick's CPU, memory and filesystem
 //! samples, letting the least important field destroy the most important data.
 
+mod chrony;
 mod collect;
+mod dnscrypt;
 mod otlp;
 mod sensors;
 mod smart;
@@ -48,11 +50,53 @@ struct Options {
     journal_window: Duration,
     iroh_failsafe_marker: Option<PathBuf>,
     failsafe_rule_tag: String,
+    nts_providers: Vec<chrony::Provider>,
+    doh_providers: Vec<DohProvider>,
+    dnscrypt_unit: String,
+    dns_window: Duration,
+    only: Vec<String>,
     systemctl: Option<PathBuf>,
     busctl: Option<PathBuf>,
     journalctl: Option<PathBuf>,
     smartctl: Option<PathBuf>,
     nft: Option<PathBuf>,
+    chronyc: Option<PathBuf>,
+}
+
+/// A configured DoH provider: the stamp key dnscrypt-proxy knows it by, and the address family it
+/// is stamped for.
+///
+/// The name needs no translation, unlike the NTS side -- `server_names` is
+/// `builtins.attrNames doh.stamps`, so what lib/doh-stamps.nix calls a provider is literally what
+/// turns up in the journal. `family` is not a dnscrypt-proxy concept at all; it comes from the
+/// same file, and is what makes "how many v6-capable upstreams are left" a question the store can
+/// answer.
+#[derive(Debug, Clone, PartialEq)]
+struct DohProvider {
+    name: String,
+    family: String,
+}
+
+fn parse_doh_provider(spec: &str) -> Result<DohProvider, String> {
+    let (name, family) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("doh provider {spec:?} is not NAME=FAMILY"))?;
+    if name.is_empty() || family.is_empty() {
+        return Err(format!("doh provider {spec:?} has an empty component"));
+    }
+    Ok(DohProvider { name: name.to_owned(), family: family.to_owned() })
+}
+
+impl Options {
+    /// Whether a measurement type belongs in this run's batch.
+    ///
+    /// Empty `--only` means everything, which is what the fifteen-minute collection wants. The
+    /// six-hourly DoH collection is the same binary with a different flag set, and needs this so
+    /// it does not re-sample CPU, filesystems and sensors four more times a day -- records that
+    /// would be indistinguishable from the ones the main timer already produces.
+    fn wants(&self, kind: &str) -> bool {
+        self.only.is_empty() || self.only.iter().any(|only| only == kind)
+    }
 }
 
 const USAGE: &str = "\
@@ -78,13 +122,27 @@ usage: system-metrics [options]
   --iroh-failsafe-marker PATH  last-engaged marker; its presence enables the failsafe record
   --failsafe-rule-tag TAG   nft rule comment marking an engaged failsafe
                             (default: iroh-ssh-failsafe)
+  --nts-provider NAME=HOSTNAME@OPERATOR
+                            an NTS time provider, as lib/nts-servers.nix describes it;
+                            repeatable. None of the three comes out of chrony: it knows the
+                            hostname, and nothing at all about the operator
+  --doh-provider NAME=FAMILY  a DoH provider stamp and its address family, as
+                            lib/doh-stamps.nix describes it; repeatable
+  --dnscrypt-unit NAME      unit whose journal the DoH reports are read from
+                            (default: dnscrypt-proxy.service)
+  --dns-window-seconds N    how far back the DoH journal read reaches (default: 21600). MUST
+                            span dnscrypt-proxy's cert_refresh_delay, or no refresh pass falls
+                            inside it and every provider reports unknown
+  --only TYPE               restrict the batch to this measurement type; repeatable. Without it
+                            every collector this run is configured for contributes
   --systemctl PATH          systemctl binary; without it no unit records
   --busctl PATH             busctl binary; without it no timer records. Separate from
                             systemctl because timer elapse properties are only machine-readable
                             over the bus
-  --journalctl PATH         journalctl binary; without it no journal records
+  --journalctl PATH         journalctl binary; without it no journal or dns_provider records
   --smartctl PATH           smartctl binary; without it no drive records
   --nft PATH                nft binary; without it port_22_open is null
+  --chronyc PATH            chronyc binary; without it no time_provider records
   --dry-run                 print the batch instead of posting it
   --help                    this text
 ";
@@ -107,11 +165,20 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
         journal_window: Duration::from_secs(900),
         iroh_failsafe_marker: None,
         failsafe_rule_tag: "iroh-ssh-failsafe".to_owned(),
+        nts_providers: Vec::new(),
+        doh_providers: Vec::new(),
+        dnscrypt_unit: "dnscrypt-proxy.service".to_owned(),
+        // Six hours, against dnscrypt-proxy's four-hour cert_refresh_delay, so a full refresh
+        // pass always falls inside the window. The two numbers are coupled and the NixOS module
+        // asserts on them; see modules/system-metrics.nix.
+        dns_window: Duration::from_secs(21600),
+        only: Vec::new(),
         systemctl: None,
         busctl: None,
         journalctl: None,
         smartctl: None,
         nft: None,
+        chronyc: None,
     };
 
     let mut args = args;
@@ -162,11 +229,30 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
                 options.iroh_failsafe_marker = Some(PathBuf::from(value("--iroh-failsafe-marker")?))
             }
             "--failsafe-rule-tag" => options.failsafe_rule_tag = value("--failsafe-rule-tag")?,
+            "--nts-provider" => {
+                options.nts_providers.push(chrony::parse_provider(&value("--nts-provider")?)?)
+            }
+            "--doh-provider" => {
+                options.doh_providers.push(parse_doh_provider(&value("--doh-provider")?)?)
+            }
+            "--dnscrypt-unit" => options.dnscrypt_unit = value("--dnscrypt-unit")?,
+            "--dns-window-seconds" => {
+                let raw = value("--dns-window-seconds")?;
+                let seconds: u64 = raw.parse().map_err(|_| {
+                    format!("--dns-window-seconds expects a whole number, got {raw:?}")
+                })?;
+                if seconds == 0 {
+                    return Err("--dns-window-seconds must be positive".to_owned());
+                }
+                options.dns_window = Duration::from_secs(seconds);
+            }
+            "--only" => options.only.push(value("--only")?),
             "--systemctl" => options.systemctl = Some(PathBuf::from(value("--systemctl")?)),
             "--busctl" => options.busctl = Some(PathBuf::from(value("--busctl")?)),
             "--journalctl" => options.journalctl = Some(PathBuf::from(value("--journalctl")?)),
             "--smartctl" => options.smartctl = Some(PathBuf::from(value("--smartctl")?)),
             "--nft" => options.nft = Some(PathBuf::from(value("--nft")?)),
+            "--chronyc" => options.chronyc = Some(PathBuf::from(value("--chronyc")?)),
             "--dry-run" => options.dry_run = true,
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -673,6 +759,105 @@ fn timer_records(
         .collect()
 }
 
+/// One record per configured NTS provider, whatever chrony has to say about it.
+///
+/// Both reads are `-N` (names, not the resolved address, which is anycast for two of the four
+/// providers) and `-a` (including sources whose hostname has not resolved, which are absent
+/// otherwise -- so the record would vanish exactly when the provider is most broken). See
+/// `chrony.rs` for why each of those is load-bearing.
+///
+/// A chronyc that cannot be run at all leaves both reads empty, which produces a record per
+/// provider with every field null rather than no records: "chrony did not answer" is a different
+/// fact from "this provider is unreachable", and only one of them is about the provider.
+fn time_provider_records(chronyc: &Path, providers: &[chrony::Provider]) -> Vec<Record> {
+    let sources = output(chronyc, &["-c", "-N", "sources", "-a"]).unwrap_or_default();
+    let authdata = output(chronyc, &["-c", "-N", "authdata", "-a"]).unwrap_or_default();
+
+    chrony::statuses(providers, &sources, &authdata)
+        .into_iter()
+        .zip(providers)
+        .map(|(status, provider)| {
+            Record::new("system.time_provider")
+                .with_attr("provider", Value::str(&provider.name))
+                .with_attr("operator", Value::str(&provider.operator))
+                .with_field("reachable", status.reachable.map(Value::Bool))
+                .with_field("reach", status.reach.map(|reach| Value::Int(reach as i64)))
+                .with_field("state", status.state.map(Value::str))
+                .with_field("stratum", status.stratum.map(Value::Int))
+                .with_field("poll_seconds", status.poll_seconds.map(Value::Double))
+                .with_field(
+                    "last_rx_seconds",
+                    status.last_rx_seconds.map(|seconds| Value::Int(seconds as i64)),
+                )
+                .with_field("offset_seconds", status.offset_seconds.map(Value::Double))
+                .with_field("auth_mode", status.auth_mode.map(Value::str))
+                .with_field("nts_ke_count", status.nts_ke_count.map(Value::Int))
+                .with_field("nts_ke_attempts", status.nts_ke_attempts.map(Value::Int))
+                .with_field(
+                    "nts_last_ke_seconds",
+                    status.nts_last_ke_seconds.map(|seconds| Value::Int(seconds as i64)),
+                )
+                .with_field("nts_cookies", status.nts_cookies.map(Value::Int))
+                .with_field("nts_naks", status.nts_naks.map(Value::Int))
+        })
+        .collect()
+}
+
+/// One record per configured DoH provider, derived from dnscrypt-proxy's own journal.
+///
+/// The window has to span `cert_refresh_delay` or no refresh pass falls inside it and every
+/// provider reports unknown; the NixOS module asserts that it does. See `dnscrypt.rs` for why
+/// `ok` is an absence rule rather than something read off a failure line.
+fn dns_provider_records(
+    journalctl: &Path,
+    unit: &str,
+    providers: &[DohProvider],
+    window: Duration,
+    now_unix_micros: Option<u64>,
+) -> Vec<Record> {
+    let since = format!("-{}s", window.as_secs());
+    // No `--priority` filter, and that is not an oversight: dlog writes to stderr with no level
+    // prefix and the unit passes no `-syslog`, so systemd stamps NOTICE, INFO and WARNING alike
+    // with SyslogLevel=, which defaults to info. Narrowing by priority here would drop every line
+    // this reads or none of them, depending on where the threshold fell.
+    let text = output(
+        journalctl,
+        &[
+            "--unit",
+            unit,
+            "--since",
+            &since,
+            "--output=json",
+            "--output-fields=MESSAGE,__REALTIME_TIMESTAMP",
+            "--no-pager",
+        ],
+    )
+    .unwrap_or_default();
+
+    let entries = dnscrypt::parse_entries(&text);
+    let names: Vec<String> = providers.iter().map(|p| p.name.clone()).collect();
+
+    dnscrypt::statuses(&names, &entries, now_unix_micros)
+        .into_iter()
+        .zip(providers)
+        .map(|(status, provider)| {
+            Record::new("system.dns_provider")
+                .with_attr("provider", Value::str(&provider.name))
+                .with_attr("family", Value::str(&provider.family))
+                .with_field("ok", status.ok.map(Value::Bool))
+                .with_field("rtt_ms", status.rtt_ms.map(Value::Int))
+                .with_field("error", status.error.map(Value::Str))
+                .with_field("probe_age_seconds", status.probe_age_seconds.map(Value::Double))
+                .with_field("last_ok_seconds", status.last_ok_seconds.map(Value::Double))
+                .with_field("last_fail_seconds", status.last_fail_seconds.map(Value::Double))
+                // In the body rather than the attributes, for the reason system.journal gives:
+                // changing the window would otherwise re-key every provider's series. It is also
+                // the only thing that says what an absent `ok` covers.
+                .with_field("window_seconds", Value::Int(window.as_secs() as i64))
+        })
+        .collect()
+}
+
 /// One record per unit that logged at warning or worse in the window; none for a quiet host.
 ///
 /// The window is `now - interval` rather than a journal cursor, because a cursor is state and
@@ -745,45 +930,88 @@ fn run(options: Options) -> Result<(), String> {
     }
     resource_attributes.extend(options.resource_attributes.iter().cloned());
 
-    let mut records = vec![cpu_record(options.cpu_sample), memory_record(&options.sysfs_root)];
-    records.extend(filesystem_records(&options.exclude_fstypes));
+    // Each group is gated on `wants` before it runs, not filtered afterwards: the six-hourly DoH
+    // collection is this same binary with `--only`, and a filter at the end would still have slept
+    // through the CPU sample and stat'd every mount to throw the results away.
+    let mut records = Vec::new();
+    if options.wants("system.cpu") {
+        records.push(cpu_record(options.cpu_sample));
+    }
+    if options.wants("system.memory") {
+        records.push(memory_record(&options.sysfs_root));
+    }
+    if options.wants("system.filesystem") {
+        records.extend(filesystem_records(&options.exclude_fstypes));
+    }
     if let Some(smartctl) = &options.smartctl {
-        records.extend(drive_records(smartctl));
+        if options.wants("system.drive") {
+            records.extend(drive_records(smartctl));
+        }
     }
-    records.push(generation_record(&options.profiles_dir));
-    records.push(host_record(options.flake_lock.as_ref(), &options.flake_input));
+    if options.wants("system.generation") {
+        records.push(generation_record(&options.profiles_dir));
+    }
+    if options.wants("system.host") {
+        records.push(host_record(options.flake_lock.as_ref(), &options.flake_input));
+    }
     if let Some(marker) = &options.iroh_failsafe_marker {
-        records.push(iroh_failsafe_record(
-            marker,
-            &options.failsafe_rule_tag,
-            options.nft.as_ref(),
-            now_unix_micros,
-        ));
+        if options.wants("system.iroh_failsafe") {
+            records.push(iroh_failsafe_record(
+                marker,
+                &options.failsafe_rule_tag,
+                options.nft.as_ref(),
+                now_unix_micros,
+            ));
+        }
     }
-    let hwmon_root = options
-        .hwmon_root
-        .clone()
-        .unwrap_or_else(|| options.sysfs_root.join("class/hwmon"));
-    records.extend(sensor_records(&hwmon_root));
+    if options.wants("system.sensor") {
+        let hwmon_root = options
+            .hwmon_root
+            .clone()
+            .unwrap_or_else(|| options.sysfs_root.join("class/hwmon"));
+        records.extend(sensor_records(&hwmon_root));
+    }
     if let Some(systemctl) = &options.systemctl {
-        records.extend(unit_records(
-            systemctl,
-            &options.units,
-            &options.success_dir,
-            now_monotonic_micros,
-            now_unix_micros,
-        ));
+        if options.wants("system.unit") {
+            records.extend(unit_records(
+                systemctl,
+                &options.units,
+                &options.success_dir,
+                now_monotonic_micros,
+                now_unix_micros,
+            ));
+        }
     }
     if let Some(busctl) = &options.busctl {
-        records.extend(timer_records(
-            busctl,
-            &options.timers,
-            now_monotonic_micros,
-            now_unix_micros,
-        ));
+        if options.wants("system.timer") {
+            records.extend(timer_records(
+                busctl,
+                &options.timers,
+                now_monotonic_micros,
+                now_unix_micros,
+            ));
+        }
     }
     if let Some(journalctl) = &options.journalctl {
-        records.extend(journal_records(journalctl, options.journal_window));
+        if options.wants("system.journal") {
+            records.extend(journal_records(journalctl, options.journal_window));
+        }
+    }
+    if let Some(chronyc) = &options.chronyc {
+        if options.wants("system.time_provider") && !options.nts_providers.is_empty() {
+            records.extend(time_provider_records(chronyc, &options.nts_providers));
+        }
+    }
+    if let Some(journalctl) = &options.journalctl {
+        if options.wants("system.dns_provider") && !options.doh_providers.is_empty() {
+            records.extend(dns_provider_records(
+                journalctl,
+                &options.dnscrypt_unit,
+                &options.doh_providers,
+                options.dns_window,
+                now_unix_micros,
+            ));
+        }
     }
 
     if options.dry_run {
