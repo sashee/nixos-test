@@ -93,24 +93,45 @@ rec {
   # CDN-hosted hostname -- and if one ever does move, DNS breaks outright rather than
   # silently, because these are the box's only resolvers.
   #
-  # The first four were verified reachable over HTTPS from the rpi5 on 2026-07-27: all
-  # answered a DoH query with 200 in 62-128 ms. The four single-family ones were verified
-  # over IPv4 on 2026-08-11 (200 in 121-250 ms, and each resolved doubleclick.net, i.e.
-  # unfiltered -- which modules/doh.nix's require_nofilter and the props = 4 in
-  # lib/doh-stamp-encode.nix both assert). Their IPv6 addresses are current AAAA records
-  # as of the same date but NOT reachability-verified: neither a GitHub runner nor the
-  # machine that added them has IPv6 egress. If one of them is wrong, the v6-only
-  # guarantee below is the thing that quietly is not there, so re-check them from a
-  # v6-capable host and record the date here.
+  # Verification is per-entry and dated, because an address here is trusted blind -- there
+  # is no second resolver to notice it is wrong:
+  #
+  #   * cloudflare/quad9/google, over HTTPS from the rpi5 on 2026-07-27 (200 in 62-128 ms).
+  #   * dns4eu/odvr/digitalgesellschaft/wikimedia, over IPv4 on 2026-08-11 (200 in
+  #     121-250 ms).
+  #   * uncensoreddns/ffmuc, over IPv4 on 2026-09-17, with the address pinned and the
+  #     certificate checked against the entry's hostname -- `kdig @<v4> +https=/dns-query
+  #     +tls-hostname=<hostname>`, which is the shape dnscrypt-proxy dials a stamp in, so a
+  #     provider whose cert does not cover the name fails here rather than in production.
+  #
+  # Every check above also resolved doubleclick.net, i.e. the resolver does not filter --
+  # which modules/doh.nix's require_nofilter and the props = 4 in lib/doh-stamp-encode.nix
+  # both assert, and where a filtered upstream is dropped from the pool rather than
+  # reported.
+  #
+  # NO IPv6 ADDRESS HERE HAS EVER BEEN DIALLED. Each is its provider's current AAAA record
+  # as of the date that entry was added, and nothing beyond that: no GitHub runner, neither
+  # laptop and not the rpi5 has IPv6 egress. So the per-family guarantee below is verified
+  # for v4 and merely asserted for v6 -- and a wrong literal there surfaces not as an error
+  # but as the v6 half of the guarantee quietly not being there. When a v6-capable host
+  # exists, dial every v6 entry the way the 2026-09-17 check dialled v4, and record it here.
+  #
+  # mullvad (base.dns.mullvad.net, 194.242.2.2 / 2a07:e340::2) was dropped on 2026-09-17:
+  # Mullvad shuts its public encrypted DNS down on 2026-11-02 and sponsors Quad9 instead,
+  # which this list already carries, so the migration they recommend is a no-op here. It was
+  # stamped in both families and so contributed nothing to the guarantee below;
+  # uncensoreddns and ffmuc replace it with one sole-family entry each, which takes both
+  # per-family floors from 2 to 3.
   #
   # `stampFamilies` -- which families reach dnscrypt-proxy, per the header. The split is
   # the whole point of the list's shape and not a preference:
   #
-  #   * cloudflare/mullvad/quad9/google are stamped in BOTH families and so collide, one
-  #     address slot per hostname. They are kept dual anyway: on a dual-stack network
-  #     either address works, and if upstream ever implements DNSCrypt/dnscrypt-proxy#2913
-  #     they become eight usable entries with no change here.
-  #   * dns4eu/odvr are stamped v4 ONLY and digitalgesellschaft/wikimedia v6 ONLY, so each
+  #   * cloudflare/quad9/google are stamped in BOTH families and so collide, one address
+  #     slot per hostname. They are kept dual anyway: on a dual-stack network either
+  #     address works, and if upstream ever implements DNSCrypt/dnscrypt-proxy#2913 they
+  #     become six usable entries with no change here.
+  #   * dns4eu/odvr/uncensoreddns are stamped v4 ONLY and
+  #     digitalgesellschaft/wikimedia/ffmuc v6 ONLY, so each
   #     of those hostnames appears in exactly one stamp and nothing can overwrite its
   #     pinned address. That is what makes "at least two upstreams work on a single-family
   #     network" true rather than probable, and it is what stops the pool reaching zero --
@@ -122,15 +143,6 @@ rec {
       hostname = "cloudflare-dns.com";
       v4 = "1.1.1.1";
       v6 = "2606:4700:4700::1111";
-      stampFamilies = [
-        "ipv4"
-        "ipv6"
-      ];
-    };
-    mullvad = {
-      hostname = "base.dns.mullvad.net";
-      v4 = "194.242.2.2";
-      v6 = "2a07:e340::2";
       stampFamilies = [
         "ipv4"
         "ipv6"
@@ -169,6 +181,21 @@ rec {
       v6 = "2001:148f:ffff::1";
       stampFamilies = [ "ipv4" ];
     };
+    # UncensoredDNS (DK), anycast from the operator's own provider-independent RIPE range
+    # -- so the address survives a change of transit, which is the property this list picks
+    # addresses for in the first place.
+    #
+    # v4 ONLY because the v4 floor is the one that has actually been tested: a single
+    # upstream answering NXDOMAIN is not a failover event, it is an answer, and
+    # dnscrypt-proxy caches it -- the same negative-caching trap documented at length in
+    # modules/iroh-ssh.nix. Three sole-v4 providers means a bad one can be dropped without
+    # the guarantee below going with it.
+    uncensoreddns = {
+      hostname = "anycast.uncensoreddns.org";
+      v4 = "91.239.100.100";
+      v6 = "2001:67c:28a4::";
+      stampFamilies = [ "ipv4" ];
+    };
     # Digitale Gesellschaft (CH).
     digitalgesellschaft = {
       hostname = "dns.digitale-gesellschaft.ch";
@@ -184,6 +211,17 @@ rec {
       hostname = "wikimedia-dns.org";
       v4 = "185.71.138.138";
       v6 = "2001:67c:930::1";
+      stampFamilies = [ "ipv6" ];
+    };
+    # Freifunk München (DE), on its own /48. A community ISP rather than a DNS operator,
+    # which is the point: its network carries v6-native clients as a matter of course, and
+    # that is the nearest thing to evidence obtainable for an address nothing in this repo
+    # can currently dial (see the IPv6 paragraph above). Third sole-v6 entry, so the v6
+    # floor matches v4's.
+    ffmuc = {
+      hostname = "doh.ffmuc.net";
+      v4 = "5.1.66.255";
+      v6 = "2001:678:e68:f000::";
       stampFamilies = [ "ipv6" ];
     };
   };

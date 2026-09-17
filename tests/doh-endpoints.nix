@@ -87,7 +87,7 @@ let
   # other stamp claims its hostname -- and what the shape of the provider list buys is
   # that enough such endpoints exist in each family.
   #
-  # Deliberately NOT "every hostname is unique": cloudflare/mullvad/quad9/google are
+  # Deliberately NOT "every hostname is unique": cloudflare/quad9/google are
   # stamped in both families on purpose, as upside for the day upstream implements
   # DNSCrypt/dnscrypt-proxy#2913. Asserting uniqueness would forbid that; asserting the
   # count below permits it while keeping the property the duals cannot provide.
