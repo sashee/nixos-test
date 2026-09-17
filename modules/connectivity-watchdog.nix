@@ -26,7 +26,7 @@ let
     text = ''
       # Resolve one name through this host's own resolver. A DoH answer proves the whole
       # path the box depends on -- dnscrypt-proxy, TCP 443 egress, TLS, and a live upstream
-      # -- and dnscrypt already spreads its queries over the four independent operators in
+      # -- and dnscrypt already spreads its queries over the independent operators in
       # lib/doh-stamps.nix, so no single provider's outage can drive a reboot.
       #
       # Deliberately NOT the trigger for wifi setup mode: that decision is local-only (see
