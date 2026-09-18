@@ -96,7 +96,18 @@ let
       "mp-collector.service"
     ++ lib.optional
       (config.services ? monitoring-platform && config.services.monitoring-platform.enable)
-      "monitoring-platform.service";
+      "monitoring-platform.service"
+    # The DoH producer, which belongs here even though `system-metrics.service` deliberately does
+    # not: that exclusion is about a oneshot observing ITSELF, always mid-run and so always
+    # `activating`. This one is observed by the fifteen-minute unit while it sits idle between
+    # six-hourly runs, so `active_enter_seconds_ago` means what it says.
+    #
+    # That is the fact nothing else carries. A failed run is reported with or without this entry,
+    # because failing units always are -- but a timer that has quietly stopped firing produces no
+    # failure at all, and at four runs a day the records thinning out is not something anyone
+    # notices. Gated on the same condition that creates the unit, so a host with no DoH providers
+    # does not watch a name that matches nothing.
+    ++ lib.optional (cfg.dnsProviders != { }) "system-metrics-dns.service";
 
   # Timers where a stopped schedule is invisible until something else goes wrong. Deliberately
   # not every timer on the host: 11 of them at this cadence would be more rows per year than the
@@ -464,6 +475,13 @@ in
         until its ExecStart exits, so the producer observing itself would report `activating` on
         every single run -- and its real failure mode, not running at all, is already visible as
         a gap in the timestamps.
+
+        `system-metrics-dns.service` **is** present, and the difference is which unit does the
+        observing. The DoH collection is a different oneshot on a six-hourly timer, so the
+        fifteen-minute producer sees it idle and `active_enter_seconds_ago` reports when it last
+        ran. Nor is its absence self-evident the way the main producer's is: at four runs a day,
+        `system.dns_provider` rows quietly ceasing looks much like the cadence they were always
+        arriving at.
       '';
     };
 
