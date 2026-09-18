@@ -860,6 +860,16 @@ in
     # runs after the socket has been bound -- chronyd is Type=notify and binds cmdmon before it
     # signals readiness. Re-applied on every chronyd restart, which a tmpfiles rule would not be.
     #
+    # `-` as well, and it is the more important half. Without it systemd treats a non-zero exit
+    # here as a failure of the START JOB and stops chronyd: a chmod that exists only so a
+    # monitoring record can be read would take the host's only time source down with it, on a Pi
+    # whose clock has no RTC battery to fall back on. That is the same inversion the `-` on
+    # `ReadWritePaths` below is there to prevent, and the blast radius is larger here. Everything
+    # this command touches is outside this module's control -- the compiled-in socket path, whether
+    # a future chronyd still binds cmdmon before READY=1, whatever a host has overridden
+    # `tools.chronySocket` to -- so the failure it must not cause is exactly the one it cannot
+    # rule out. Ignored, a failed chmod costs the time record its NTS fields and nothing else.
+    #
     # Scoped to these two paths rather than relaxing the unit's UMask, which would also make
     # chrony.keys and the drift file group-writable -- and this group now contains a producer that
     # has no business writing either.
@@ -878,7 +888,7 @@ in
     # refuses to load such a unit. Silent, because nothing pulls it in.
     systemd.services.chronyd = lib.mkIf (cfg.timeProviders != { }) {
       serviceConfig.ExecStartPost = [
-        "+${pkgs.coreutils}/bin/chmod g+w ${cfg.tools.chronyRuntimeDir} ${cfg.tools.chronySocket}"
+        "-+${pkgs.coreutils}/bin/chmod g+w ${cfg.tools.chronyRuntimeDir} ${cfg.tools.chronySocket}"
       ];
     };
 
