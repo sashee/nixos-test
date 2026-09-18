@@ -41,11 +41,11 @@ let
   # top-level `pkgs` with the rpi5-x86 checks that already build it.
   systemMetrics = pkgs.callPackage ../packages/system-metrics/package.nix { };
 
-  # Every configured DoH provider, as `--doh-provider NAME=FAMILY`. Taken from
+  # Every configured DoH provider, as `--doh-provider NAME=HOSTNAME`. Taken from
   # lib/doh-stamps.nix, which is also where modules/doh.nix takes `server_names` from -- so
   # these are exactly the names dnscrypt-proxy logs under, with no second list to drift.
   dohProviderArgs = pkgs.lib.concatStringsSep " " (
-    pkgs.lib.mapAttrsToList (name: e: "--doh-provider ${name}=${e.family}") dohStamps.endpoints
+    pkgs.lib.mapAttrsToList (name: e: "--doh-provider ${name}=${e.hostname}") dohStamps.endpoints
   );
 
   # DoH interception (shared harness). This test additionally verifies the

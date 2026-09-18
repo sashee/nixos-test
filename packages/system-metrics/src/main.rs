@@ -63,28 +63,39 @@ struct Options {
     chronyc: Option<PathBuf>,
 }
 
-/// A configured DoH provider: the stamp key dnscrypt-proxy knows it by, and the address family it
-/// is stamped for.
+/// A configured DoH provider: the stamp key dnscrypt-proxy knows it by, and the hostname that
+/// stamp dials.
 ///
 /// The name needs no translation, unlike the NTS side -- `server_names` is
 /// `builtins.attrNames doh.stamps`, so what lib/doh-stamps.nix calls a provider is literally what
-/// turns up in the journal. `family` is not a dnscrypt-proxy concept at all; it comes from the
-/// same file, and is what makes "how many v6-capable upstreams are left" a question the store can
-/// answer.
+/// turns up in the journal.
+///
+/// `hostname` is here and the stamp's address family is NOT, which is the opposite of the obvious
+/// choice and is the whole point. dnscrypt-proxy pins a stamp's address in a map keyed by hostname
+/// -- one slot, last writer wins -- so two stamps sharing a hostname both dial whichever address
+/// won, and a `-ipv6` entry can answer over v4 (lib/doh-stamps.nix documents the race;
+/// tests/doh-upstream.nix has observed it in both directions). The family in a provider's name is
+/// therefore a label, not a promise, and reporting it as an attribute would only have dressed a
+/// coin flip up as a fact -- it is already a suffix of `provider` for anyone who wants the label.
+///
+/// The hostname is the fact underneath it. Two records sharing one are one dial target and so one
+/// failure, which is what `operator` says for the NTS providers one level up; it also makes "is
+/// this entry's family suffix trustworthy" answerable from the records alone -- it is exactly when
+/// no other configured record shares its hostname.
 #[derive(Debug, Clone, PartialEq)]
 struct DohProvider {
     name: String,
-    family: String,
+    hostname: String,
 }
 
 fn parse_doh_provider(spec: &str) -> Result<DohProvider, String> {
-    let (name, family) = spec
+    let (name, hostname) = spec
         .split_once('=')
-        .ok_or_else(|| format!("doh provider {spec:?} is not NAME=FAMILY"))?;
-    if name.is_empty() || family.is_empty() {
+        .ok_or_else(|| format!("doh provider {spec:?} is not NAME=HOSTNAME"))?;
+    if name.is_empty() || hostname.is_empty() {
         return Err(format!("doh provider {spec:?} has an empty component"));
     }
-    Ok(DohProvider { name: name.to_owned(), family: family.to_owned() })
+    Ok(DohProvider { name: name.to_owned(), hostname: hostname.to_owned() })
 }
 
 impl Options {
@@ -126,8 +137,11 @@ usage: system-metrics [options]
                             an NTS time provider, as lib/nts-servers.nix describes it;
                             repeatable. None of the three comes out of chrony: it knows the
                             hostname, and nothing at all about the operator
-  --doh-provider NAME=FAMILY  a DoH provider stamp and its address family, as
-                            lib/doh-stamps.nix describes it; repeatable
+  --doh-provider NAME=HOSTNAME
+                            a DoH provider stamp and the hostname it dials, as
+                            lib/doh-stamps.nix describes it; repeatable. The hostname and not
+                            the stamp's address family: two stamps sharing one share a dial
+                            target, so the family in a name is a label, not a promise
   --dnscrypt-unit NAME      unit whose journal the DoH reports are read from
                             (default: dnscrypt-proxy.service)
   --dns-window-seconds N    how far back the DoH journal read reaches (default: 21600). MUST
@@ -843,7 +857,7 @@ fn dns_provider_records(
         .map(|(status, provider)| {
             Record::new("system.dns_provider")
                 .with_attr("provider", Value::str(&provider.name))
-                .with_attr("family", Value::str(&provider.family))
+                .with_attr("hostname", Value::str(&provider.hostname))
                 .with_field("ok", status.ok.map(Value::Bool))
                 .with_field("rtt_ms", status.rtt_ms.map(Value::Int))
                 .with_field("error", status.error.map(Value::Str))
@@ -1155,9 +1169,56 @@ mod tests {
         assert_eq!(options.resource_attributes, vec![("note".to_owned(), Value::str("a=b"))]);
     }
 
+    /// The DoH spec is NAME=HOSTNAME, and the hostname half is load-bearing rather than
+    /// decorative: it is what says which records share dnscrypt-proxy's one pinned-address slot
+    /// per host. A spec that lost it would still parse if the separator were optional, and the
+    /// records would come back naming a dial target nothing dials.
+    #[test]
+    fn doh_provider_specs_name_the_stamp_and_its_hostname() {
+        let options = parse_args(
+            args(&[
+                "--doh-provider",
+                "cloudflare-ipv4=cloudflare-dns.com",
+                "--doh-provider",
+                "cloudflare-ipv6=cloudflare-dns.com",
+                "--doh-provider",
+                "odvr-ipv4=odvr.nic.cz",
+            ])
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+
+        // The first two share a hostname and differ only in the family suffix of their name,
+        // which is the shape the attribute exists to make visible: one dial target, two records,
+        // and so one failure rather than two independent ones.
+        assert_eq!(
+            options.doh_providers,
+            vec![
+                DohProvider {
+                    name: "cloudflare-ipv4".to_owned(),
+                    hostname: "cloudflare-dns.com".to_owned(),
+                },
+                DohProvider {
+                    name: "cloudflare-ipv6".to_owned(),
+                    hostname: "cloudflare-dns.com".to_owned(),
+                },
+                DohProvider {
+                    name: "odvr-ipv4".to_owned(),
+                    hostname: "odvr.nic.cz".to_owned(),
+                },
+            ]
+        );
+
+        assert!(parse_doh_provider("cloudflare-ipv4").is_err());
+        assert!(parse_doh_provider("=cloudflare-dns.com").is_err());
+        assert!(parse_doh_provider("cloudflare-ipv4=").is_err());
+    }
+
     #[test]
     fn malformed_arguments_are_refused_rather_than_guessed() {
         assert!(parse_args(args(&["--resource-attr", "nokey"]).into_iter()).is_err());
+        assert!(parse_args(args(&["--doh-provider", "no-separator"]).into_iter()).is_err());
         assert!(parse_args(args(&["--socket"]).into_iter()).is_err());
         assert!(parse_args(args(&["--cpu-sample-seconds", "0"]).into_iter()).is_err());
         assert!(parse_args(args(&["--cpu-sample-seconds", "-1"]).into_iter()).is_err());
