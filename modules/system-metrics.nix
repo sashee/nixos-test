@@ -967,7 +967,11 @@ in
         ProtectClock = true;
         ProtectHostname = true;
         # Hides other processes, which this unit never reads. NOT ProcSubset = "pid": that would
-        # hide /proc/meminfo, /proc/stat and /proc/loadavg, i.e. every input it has.
+        # hide /proc/meminfo, /proc/stat and /proc/loadavg, i.e. every input it has -- and, less
+        # obviously, /proc/sys/kernel/hostname and /proc/sys/kernel/random/boot_id, which every
+        # batch carries as resource attributes whatever collectors it ran. The second half is
+        # the one to remember: it applies to ANY invocation of this binary, including one that
+        # collects nothing this unit collects. See system-metrics-dns below.
         ProtectProc = "invisible";
         RestrictNamespaces = true;
         RestrictRealtime = true;
@@ -1019,15 +1023,22 @@ in
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         CapabilityBoundingSet = "";
-        # Stricter than the main collector on all four counts, because this one reads exactly two
-        # things -- a journal and a unix socket -- and none of the reasons that unit has to relax
-        # them apply. It walks no mount table, so /home can be gone entirely; it scans no block
-        # devices; and ProcSubset can hide everything, since unlike the main collector it reads no
-        # /proc files at all.
+        # Stricter than the main collector where it can be, because this one reads exactly two
+        # things -- a journal and a unix socket -- and most of the reasons that unit has to relax
+        # them do not apply: it walks no mount table, so /home can be gone entirely, and it scans
+        # no block devices.
         ProtectHome = true;
         PrivateTmp = true;
         PrivateDevices = true;
-        ProcSubset = "pid";
+        # NOT ProcSubset = "pid", and the reason is not about the collectors this run selects.
+        # `subset=pid` hides every non-process file in /proc, /proc/sys included, and the
+        # producer reads /proc/sys/kernel/hostname and /proc/sys/kernel/random/boot_id
+        # UNCONDITIONALLY -- before `--only` is consulted, because they are resource attributes
+        # rather than a measurement. With them hidden this unit still posts a batch in which
+        # every body field is right and every record is anonymous: no host.name, no boot_id. On
+        # a fleet that is not a degraded record, it is a record attributed to nobody, and it
+        # fails silently because the reads are already Option-valued for the case where /proc is
+        # not there at all. tests/time-dns-providers.nix asserts the envelope for exactly this.
         ProtectProc = "invisible";
         ProtectKernelTunables = true;
         ProtectKernelModules = true;

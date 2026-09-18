@@ -352,6 +352,32 @@ nixpkgs.lib.nixos.runTest {
         # The family comes from lib/doh-stamps.nix, not from dnscrypt-proxy.
         assert rows[-1]["attributes"]["record.attributes.family"] in ("ipv4", "ipv6")
 
+    with subtest("every record identifies the host and the boot that produced it"):
+        # The same invariant tests/system-metrics.nix asserts for the fifteen-minute producer,
+        # restated here rather than assumed, because these two records come from units with
+        # sandboxes of their own -- and the envelope is exactly the half every assertion above
+        # cannot see. A producer that cannot read /proc/sys still posts a well-formed batch with
+        # every body field right; it just posts it anonymously, which on a fleet is
+        # indistinguishable from some other host's.
+        #
+        # Both record types, because the two run under DIFFERENT sandboxes: the time half rides
+        # the main collector and the DoH half is its own unit, so one of them holding does not
+        # make the other hold.
+        boot_id = machine.succeed("cat /proc/sys/kernel/random/boot_id").strip()
+        for kind in ("system.time_provider", "system.dns_provider"):
+            rows = query(f"type={kind}&limit=500")
+            assert rows, f"no {kind} records to check the envelope of"
+            for m in rows:
+                attributes = m["attributes"]
+                # .get rather than [], so a missing attribute fails on the assertion with the
+                # record attached instead of a KeyError several frames away from the cause.
+                assert attributes.get("resource.attributes.host.name") == "provider-test", m
+                assert attributes.get("resource.attributes.service.name") == "system-metrics", m
+                assert attributes.get("scope.name") == "system-metrics", m
+                # Grouping samples by boot is otherwise arithmetic on uptime across a sampling
+                # grid, which cannot tell a reboot from a gap in collection.
+                assert attributes.get("resource.attributes.boot_id") == boot_id, m
+
     with subtest("a window with no refresh pass reports unknown, not failed"):
         # Nothing has been replayed into this unit's journal, so no pass is witnessed. Every
         # provider must come back absent: reporting them as failed would turn a quiet window into
@@ -383,6 +409,26 @@ nixpkgs.lib.nixos.runTest {
         # runs a day that would be four extra copies of every host record.
         unit = machine.succeed("systemctl cat system-metrics-dns.service")
         assert "--only system.dns_provider" in unit, unit
+
+        # That the flag is PRESENT, above; that it WORKED, here. The two are not the same
+        # assertion, and only the second one fails if `--only` stops being honoured -- at which
+        # point this unit quietly resumes posting cpu, memory, filesystem and sensor records four
+        # times a day, which is the entire reason the flag exists.
+        #
+        # The unit's own rendered ExecStart with --dry-run appended, rather than a hand-written
+        # argument list: a list spelled out here would pass while the deployed one regressed.
+        exec_start = next(
+            line.split("=", 1)[1]
+            for line in unit.splitlines()
+            if line.startswith("ExecStart=")
+        )
+        planned = machine.succeed(f"{exec_start} --dry-run")
+        types = {
+            line.split()[1] for line in planned.splitlines() if line.startswith("record ")
+        }
+        assert types == {"system.dns_provider"}, (
+            f"--only did not hold, the run planned {sorted(types)}:\n{planned}"
+        )
 
     with subtest("nothing was rejected on the way in"):
         receiver_log = machine.succeed("journalctl -u monitoring-platform.service -o cat")
