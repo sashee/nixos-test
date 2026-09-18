@@ -25,9 +25,29 @@
 # -- a "-ipv6" entry dialling v4 and a "-ipv4" entry answering over v6, in one refresh. The
 # leg passed on wikimedia-ipv6 and digitalgesellschaft-ipv6, i.e. on the two entries whose
 # hostname nothing else claims.
+#
+# This file also carries the format pin for `system.dns_provider`, for a reason that is about
+# where a real refresh happens and not about DoH selection: this is the only test in the suite
+# where a REAL dnscrypt-proxy completes one. See check_refresh_is_readable below.
 { nixpkgs, pkgs, commonDesktopModule, stateVersion, dohStamps }:
 
 let
+  # The producer, for the format pin. The raw binary rather than the `system-metrics` wrapper
+  # the module puts on PATH: two of the three configurations this test is instantiated for do
+  # not enable common.systemMetrics at all, so on those nodes there is no wrapper to reach.
+  #
+  # Identical to the module's own `package` default, so this adds no derivation anywhere: the
+  # aarch64 node builds it by way of hosts/rpi5, and the two x86 instantiations share the
+  # top-level `pkgs` with the rpi5-x86 checks that already build it.
+  systemMetrics = pkgs.callPackage ../packages/system-metrics/package.nix { };
+
+  # Every configured DoH provider, as `--doh-provider NAME=FAMILY`. Taken from
+  # lib/doh-stamps.nix, which is also where modules/doh.nix takes `server_names` from -- so
+  # these are exactly the names dnscrypt-proxy logs under, with no second list to drift.
+  dohProviderArgs = pkgs.lib.concatStringsSep " " (
+    pkgs.lib.mapAttrsToList (name: e: "--doh-provider ${name}=${e.family}") dohStamps.endpoints
+  );
+
   # DoH interception (shared harness). This test additionally verifies the
   # request shape (method/path/host/family) and single-family selection, so its
   # respond() also logs every request to files the testScript asserts on.
@@ -143,6 +163,7 @@ nixpkgs.lib.nixos.runTest {
 
   testScript = ''
     import json
+    import re
     import time
 
     doh_ipv4 = json.loads("""${dohIpv4Json}""")
@@ -269,6 +290,54 @@ nixpkgs.lib.nixos.runTest {
         print_peer_diagnostics()
         raise Exception(f"{label} did not resolve {question} to {expected}")
 
+    def check_refresh_is_readable(node, label):
+        # The one thing no fixture can pin: that the lines a REAL dnscrypt-proxy writes are the
+        # lines packages/system-metrics/src/dnscrypt.rs reads.
+        #
+        # tests/time-dns-providers.nix covers the derivation -- `ok: false` as an absence, the
+        # pass grouping, the three time fields -- against hand-written journal lines. That is the
+        # right shape for testing the logic and it is no test of the format at all: the fixture
+        # asserts the parser agrees with the test author. This is the other half, and it is the
+        # half that fails SILENTLY. A changed log line sends every provider to `ok` absent, which
+        # by design reads identically to a window in which no refresh was due -- no error, no
+        # rejection, nothing anywhere to notice, on every host, indefinitely.
+        #
+        # It lives here because this is the only node in the suite where a real dnscrypt-proxy
+        # completes a refresh against a server that answers. wait_for_answer has already proved
+        # this client resolves, so its journal necessarily holds at least one success.
+        #
+        # --dry-run, so the pin needs no receiver, no collector and no socket: it reads the
+        # journal the resolver already wrote and prints what it would have sent.
+        planned = node.succeed(
+            "${systemMetrics}/bin/system-metrics --dry-run --only system.dns_provider "
+            "--journalctl ${pkgs.systemd}/bin/journalctl ${dohProviderArgs}"
+        )
+        rows = [line for line in planned.splitlines() if line.startswith("record ")]
+        assert rows, f"{label}: the producer planned no dns_provider records at all:\n{planned}"
+
+        # WHICH providers answered is deliberately not asserted -- per this file's header the
+        # dual-stamped entries may dial either family here, so the live set is not deterministic.
+        # That at least one was read back IS deterministic, and it is the whole claim: an OK line
+        # the parser cannot read leaves every provider absent rather than failed.
+        live = [row for row in rows if "ok=true" in row]
+        assert live, (
+            f"{label}: a real refresh succeeded, but the producer read no OK line out of it --"
+            " dnscrypt-proxy's log format has moved away from what"
+            " packages/system-metrics/src/dnscrypt.rs parses.\nplanned:\n" + planned
+            + "\nwhat the resolver actually logged:\n"
+            + node.succeed(
+                "${pkgs.systemd}/bin/journalctl -u dnscrypt-proxy.service -o cat --no-pager"
+                " | tail -40"
+            )
+        )
+        # The numeric tail of that same line. `parse_ok` reads it by stripping the "ms" suffix,
+        # i.e. it requires the line to END there -- so a line that merely gained something after
+        # it parses as no success at all rather than as a success with a null round-trip time.
+        # The sibling format string in the same binary is "OK (DNSCrypt) - rtt: %dms%s", so a
+        # suffix on this one is not a hypothetical shape.
+        for row in live:
+            assert re.search(r"rtt_ms=[0-9]+", row), f"{label}: no round-trip time parsed:\n{row}"
+
     # Bring up the heavy (Plasma) clients ONE AT A TIME, shutting each down before
     # the next boots: booting both full desktops at once starved a client's initrd
     # store mount past its timeout on the small CI runner (kernel panic). dns_peer
@@ -287,6 +356,7 @@ nixpkgs.lib.nixos.runTest {
     wait_for_answer(ipv4_client, "doh-upstream-ipv4", "127.0.0.1", "ipv4.upstream-test.example", "A", "203.0.113.5")
     dns_peer.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-requests/ipv4_upstream-test_example-1.json; do sleep 0.2; done'")
     check_request("/tmp/fake-doh-requests/ipv4_upstream-test_example-1.json", "ipv4", "ipv4.upstream-test.example", 1)
+    check_refresh_is_readable(ipv4_client, "doh-upstream-ipv4")
     ipv4_client.shutdown()
 
     # IPv6 client: force the v6 DoH path (v4 upstreams unreachable).
@@ -303,6 +373,10 @@ nixpkgs.lib.nixos.runTest {
     wait_for_answer(ipv6_client, "doh-upstream-ipv6", "::1", "ipv6.upstream-test.example", "AAAA", "2001:db8::5")
     dns_peer.succeed("${pkgs.coreutils}/bin/timeout 60 ${pkgs.bash}/bin/bash -c 'until test -e /tmp/fake-doh-requests/ipv6_upstream-test_example-28.json; do sleep 0.2; done'")
     check_request("/tmp/fake-doh-requests/ipv6_upstream-test_example-28.json", "ipv6", "ipv6.upstream-test.example", 28)
+    # Both legs, cheap as it is: the two reach their upstreams over different families and so
+    # succeed on different providers, which is the closest this suite gets to asking whether the
+    # parse depends on WHICH server answered.
+    check_refresh_is_readable(ipv6_client, "doh-upstream-ipv6")
     ipv6_client.shutdown()
   '';
 }
