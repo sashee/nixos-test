@@ -153,7 +153,7 @@ let
       cfg.timeProviders
   );
   dohProviderArgs = lib.concatLists (
-    lib.mapAttrsToList (name: family: [ "--doh-provider" "${name}=${family}" ]) cfg.dnsProviders
+    lib.mapAttrsToList (name: hostname: [ "--doh-provider" "${name}=${hostname}" ]) cfg.dnsProviders
   );
 
   collectArgs = [
@@ -515,19 +515,35 @@ in
 
     dnsProviders = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
-      default = lib.mapAttrs (_: e: e.family) configuredDohProviders;
+      default = lib.mapAttrs (_: e: e.hostname) configuredDohProviders;
       defaultText = lib.literalMD
-        "the `lib/doh-stamps.nix` endpoints this host gives dnscrypt-proxy, mapped to their family";
+        "the `lib/doh-stamps.nix` endpoints this host gives dnscrypt-proxy, mapped to their hostname";
       description = ''
-        DoH providers reported as `system.dns_provider`, one record each, mapped to the address
-        family the stamp is pinned to.
+        DoH providers reported as `system.dns_provider`, one record each, mapped to the hostname
+        that stamp dials.
 
         The names need no translation, unlike the NTS side: `server_names` is
         `builtins.attrNames doh.stamps`, so what `lib/doh-stamps.nix` calls a provider is literally
-        what turns up in dnscrypt-proxy's journal. `family` is not a dnscrypt-proxy concept at all
-        and comes from the same file -- it is what makes "how many v6-capable upstreams are left"
-        a question the store can answer, which matters here because
-        `tests/doh-endpoints.nix` requires at least two single-family providers per family.
+        what turns up in dnscrypt-proxy's journal.
+
+        The hostname and **not** the stamp's address family, which is the opposite of the obvious
+        choice. dnscrypt-proxy pins a stamp's address in a map keyed by hostname -- one slot, last
+        writer wins -- so two stamps sharing a hostname both dial whichever address won, and a
+        `-ipv6` entry can answer over v4. `lib/doh-stamps.nix` documents the race and
+        `tests/doh-upstream.nix` has observed it in both directions, which is why six of the twelve
+        endpoints are stamped in one family alone and `tests/doh-endpoints.nix` puts a floor under
+        that count.
+
+        So the family in a provider's name is a label, not a promise, and reporting it as an
+        attribute would have dressed a coin flip up as a fact. It is also already a suffix of the
+        `provider` attribute, so nothing is lost -- and beware that the suffix carries exactly the
+        same caveat there.
+
+        The hostname is the fact underneath it. Two records sharing one are one dial target and so
+        one failure, which is what [](#opt-common.systemMetrics.timeProviders)'s `operator` says
+        for the NTS side. It also makes "is this entry's family suffix trustworthy" answerable from
+        the records alone: it is trustworthy exactly when no other configured record shares its
+        hostname.
 
         Empty disables the record and its timer.
       '';

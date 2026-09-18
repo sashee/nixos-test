@@ -195,7 +195,7 @@ journal for every systemd unit that logged >= warning since (now - interval)
 
 * attributes:
     * provider: the provider name
-    * family: ipv4 | ipv6
+    * hostname
 * body:
     * ok: was there an OK for that provider
     * rtt_ms

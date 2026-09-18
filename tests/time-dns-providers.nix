@@ -138,7 +138,7 @@ nixpkgs.lib.nixos.runTest {
     # Three of the twelve stamps. The producer reports exactly what it is given, so a subset is
     # the honest way to make "this one is missing from the pass" mean something.
     common.systemMetrics.dnsProviders = lib.mkForce (
-      lib.genAttrs (dohWorking ++ [ dohBroken ]) (name: dohStamps.endpoints.${name}.family)
+      lib.genAttrs (dohWorking ++ [ dohBroken ]) (name: dohStamps.endpoints.${name}.hostname)
     );
 
     systemd.services.fake-dnscrypt-refresh = {
@@ -349,8 +349,16 @@ nixpkgs.lib.nixos.runTest {
         )
         assert body["window_seconds"] == 21600, f"window_seconds={body['window_seconds']}"
 
-        # The family comes from lib/doh-stamps.nix, not from dnscrypt-proxy.
-        assert rows[-1]["attributes"]["record.attributes.family"] in ("ipv4", "ipv6")
+        # The hostname comes from lib/doh-stamps.nix, not from dnscrypt-proxy -- which logs the
+        # stamp NAME and never the host behind it.
+        #
+        # Deliberately the hostname and not the stamp's address family: two stamps sharing a
+        # hostname share dnscrypt-proxy's single pinned-address slot, so the family in a name is
+        # a label rather than a promise. This is the attribute that says which records are one
+        # dial target, and it is a fact rather than the winner of a race.
+        assert rows[-1]["attributes"]["record.attributes.hostname"] == (
+            "${dohStamps.endpoints.${dohBroken}.hostname}"
+        ), rows[-1]["attributes"]
 
     with subtest("every record identifies the host and the boot that produced it"):
         # The same invariant tests/system-metrics.nix asserts for the fifteen-minute producer,
@@ -387,8 +395,10 @@ nixpkgs.lib.nixos.runTest {
             "--journalctl ${pkgs.systemd}/bin/journalctl "
             "--dnscrypt-unit fake-dnscrypt-quiet.service "
             + " ".join(
-                f"--doh-provider {name}=ipv4"
-                for name in ${builtins.toJSON (dohWorking ++ [ dohBroken ])}
+                f"--doh-provider {name}={host}"
+                for name, host in ${builtins.toJSON (
+                  map (n: [ n dohStamps.endpoints.${n}.hostname ]) (dohWorking ++ [ dohBroken ])
+                )}
             )
         )
         rows = [line for line in planned.splitlines() if "system.dns_provider" in line]
