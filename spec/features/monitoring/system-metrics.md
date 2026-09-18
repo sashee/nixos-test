@@ -131,7 +131,7 @@ for each /sys/class/hwmon/hwmon*/<prefix><num>_input and <prefix><num>_<threshol
 #### unit
 
 for every failing systemd unit plus [chronyd, dnscrypt-proxy, iroh-ssh, iroh-ssh-failsafe, connectivity-fallback-*, connectivity-watchdog,
-  time-correction, restic-*, nix-gc, nixos-upgrade, mp-collector, system-metrics]
+  time-correction, restic-*, nix-gc, nixos-upgrade, mp-collector, system-metrics, system-metrics-dns]
 
 * attributes:
     * unit: name
