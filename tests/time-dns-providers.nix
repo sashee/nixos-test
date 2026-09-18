@@ -176,6 +176,11 @@ nixpkgs.lib.nixos.runTest {
 
 
     def by_attr(kind, attribute, wanted):
+        # NEWEST FIRST. The read API orders `event_time DESC, id DESC`
+        # (monitoring-platform's store/read.rs), which tests/system-metrics.nix already relies on
+        # to take its batch as a head delta. So `rows[0]` is the record the run under test just
+        # produced and `rows[-1]` is the OLDEST one in the store -- the reverse, and silently
+        # right on a store holding exactly one run.
         return [
             m for m in query(f"type={kind}&limit=500")
             if m["attributes"].get(f"record.attributes.{attribute}") == wanted
@@ -218,6 +223,17 @@ nixpkgs.lib.nixos.runTest {
     machine.wait_for_unit("mp-collector.service")
     machine.wait_for_unit("chronyd.service")
 
+    # The driver owns every run from here. Both producers are armed -- system-metrics.timer at
+    # OnBootSec=5m and system-metrics-dns.timer at 10m -- and a tick landing between run()'s
+    # `before` count and the batch it is waiting for would satisfy that wait with rows this test
+    # did not ask for.
+    #
+    # For the DoH half that is not merely noise. A tick before fake-dnscrypt-refresh has replayed
+    # anything reads a journal with no refresh pass in it and stores a batch in which every
+    # provider is legitimately unknown; the ok=true/ok=false assertions below would then be
+    # racing it for which batch they read.
+    machine.succeed("systemctl stop system-metrics.timer system-metrics-dns.timer")
+
     # Before anything has been posted: issuing a key restarts the collector, and a restart
     # discards whatever is in its outbox.
     authenticate(machine)
@@ -248,11 +264,11 @@ nixpkgs.lib.nixos.runTest {
         for key in ${builtins.toJSON providerKeys}:
             rows = by_attr("system.time_provider", "provider", key)
             assert rows, f"no system.time_provider record for {key}"
-            body = rows[-1]["body"]
+            body = rows[0]["body"]
 
             # The operator is not a chrony concept at any level; it can only have come from
             # lib/nts-servers.nix by way of the module.
-            operator = rows[-1]["attributes"]["record.attributes.operator"]
+            operator = rows[0]["attributes"]["record.attributes.operator"]
             assert operator, f"{key} carries no operator"
 
             # Unreachable from a test net, so this is the shape under test: chrony knows the
@@ -329,14 +345,14 @@ nixpkgs.lib.nixos.runTest {
         for name in ${builtins.toJSON dohWorking}:
             rows = by_attr("system.dns_provider", "provider", name)
             assert rows, f"no system.dns_provider record for {name}"
-            body = rows[-1]["body"]
+            body = rows[0]["body"]
             assert body["ok"] is True, f"{name} ok={body['ok']}"
             assert body["rtt_ms"] == 23, f"{name} rtt_ms={body['rtt_ms']}"
             assert body["last_fail_seconds"] is None, f"{name} was never absent from a pass"
 
         rows = by_attr("system.dns_provider", "provider", "${dohBroken}")
         assert rows, "no system.dns_provider record for the broken provider"
-        body = rows[-1]["body"]
+        body = rows[0]["body"]
         # Nothing in the journal says this provider failed. It is false because the pass that
         # the other two appeared in did not include it.
         assert body["ok"] is False, f"ok={body['ok']}"
@@ -356,9 +372,9 @@ nixpkgs.lib.nixos.runTest {
         # hostname share dnscrypt-proxy's single pinned-address slot, so the family in a name is
         # a label rather than a promise. This is the attribute that says which records are one
         # dial target, and it is a fact rather than the winner of a race.
-        assert rows[-1]["attributes"]["record.attributes.hostname"] == (
+        assert rows[0]["attributes"]["record.attributes.hostname"] == (
             "${dohStamps.endpoints.${dohBroken}.hostname}"
-        ), rows[-1]["attributes"]
+        ), rows[0]["attributes"]
 
     with subtest("every record identifies the host and the boot that produced it"):
         # The same invariant tests/system-metrics.nix asserts for the fifteen-minute producer,

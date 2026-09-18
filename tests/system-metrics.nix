@@ -440,7 +440,17 @@ nixpkgs.lib.nixos.runTest {
         assert "Persistent=" not in timer, timer
         # From here the driver owns every run: left armed, a timer tick landing mid-test would
         # break the batch counting at the end.
-        machine.succeed("systemctl stop system-metrics.timer")
+        #
+        # BOTH timers, and the second one is not this file's subject at all. The DoH producer is
+        # armed on this node too -- hosts/rpi5 enables dnscrypt-proxy, so
+        # common.systemMetrics.dnsProviders defaults to the twelve stamps and
+        # modules/system-metrics.nix emits system-metrics-dns.timer -- and it fires at
+        # OnBootSec=10m, which is well inside this file's TCG globalTimeout. Its twelve
+        # system.dns_provider rows would land in whichever collect_batch() delta happened to be
+        # open, and the exact measurement-type assertion below would fail on a type this file
+        # does not test and cannot see coming. Muted here rather than switched off in the node,
+        # so the node stays the configuration the Pi actually deploys.
+        machine.succeed("systemctl stop system-metrics.timer system-metrics-dns.timer")
 
     with subtest("the producer reaches the socket without being root"):
         assert machine.succeed(
