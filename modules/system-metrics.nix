@@ -853,9 +853,18 @@ in
     # which chronyd serves with `full_access = 0` (cmdmon.c). `authdata` is not among the commands
     # allowed there, so `sources` would keep working while every NTS field came back null --
     # indistinguishable from a provider that has never established keys.
-    systemd.services.chronyd.serviceConfig.ExecStartPost = lib.mkIf (cfg.timeProviders != { }) [
-      "+${pkgs.coreutils}/bin/chmod g+w ${cfg.tools.chronyRuntimeDir} ${cfg.tools.chronySocket}"
-    ];
+    # The condition sits on the SERVICE rather than on `ExecStartPost`, which is not a style
+    # choice: `types.attrsOf` drops a member whose whole definition discharges to nothing, but an
+    # `mkIf` deeper than that leaves the attribute name behind with the rest of the submodule at
+    # its defaults. Written as `systemd.services.chronyd.serviceConfig.ExecStartPost = mkIf ...`
+    # this module would emit a `chronyd.service` carrying no ExecStart on every host that has no
+    # chrony -- which per `configuredNtsProviders` above is every VM test node -- and systemd
+    # refuses to load such a unit. Silent, because nothing pulls it in.
+    systemd.services.chronyd = lib.mkIf (cfg.timeProviders != { }) {
+      serviceConfig.ExecStartPost = [
+        "+${pkgs.coreutils}/bin/chmod g+w ${cfg.tools.chronyRuntimeDir} ${cfg.tools.chronySocket}"
+      ];
+    };
 
     systemd.services.system-metrics = {
       description = "Report host measurements to the local monitoring platform";
@@ -910,7 +919,19 @@ in
         # see tools.chronyRuntimeDir. Group membership alone is not enough: ProtectSystem=strict
         # would leave it read-only, and the failure is silent, since a chronyc that cannot answer
         # degrades to the same nulls as a chrony with nothing to say.
-        ReadWritePaths = lib.mkIf (cfg.timeProviders != { }) [ cfg.tools.chronyRuntimeDir ];
+        #
+        # `-` because NOTHING ELSE CREATES THIS DIRECTORY: chronyd mkdirs it itself at startup
+        # (chrony's conf.c, `UTI_CreateDirAndParents`), and nixpkgs' chrony module declares
+        # neither a RuntimeDirectory nor a tmpfiles rule for it -- its rules cover the state
+        # directory only. So on a boot where chronyd never started, /run/chrony does not exist,
+        # and an unprefixed entry here fails namespace setup (226/NAMESPACE) rather than being
+        # ignored, taking the ENTIRE run with it: cpu, memory, filesystem, drive, sensor, unit,
+        # timer and journal records all lost because the time daemon is down. That is the
+        # inversion this crate's header warns about -- the least important field destroying the
+        # most important data -- and it is worst exactly when the host is already in trouble.
+        # Prefixed, a missing directory costs the time record its fields and nothing else, which
+        # is also the honest reading: chronyd is not running, so chrony has nothing to say.
+        ReadWritePaths = lib.mkIf (cfg.timeProviders != { }) [ "-${cfg.tools.chronyRuntimeDir}" ];
         # Reading the firewall's rule set is a privileged operation even though it changes
         # nothing; smartctl needs to issue device commands. Both are granted only when the
         # record that needs them is switched on, so the default sandbox is unchanged.
