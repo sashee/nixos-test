@@ -307,6 +307,10 @@ nixpkgs.lib.nixos.runTest {
     # query and make the delta below come out empty.
     ALL = "limit=5000"
 
+    # The resource attribute every record this producer emits carries, spelled as the read API
+    # exposes it. packages/system-metrics sets service.name once for the whole batch.
+    PRODUCER = "system-metrics"
+
 
     def collect_batch(params=ALL):
         # One run, and the records it put in the store.
@@ -318,13 +322,25 @@ nixpkgs.lib.nixos.runTest {
         # assertions start -- the pre-sync batch is already in it -- so "the batch" has to be a
         # delta rather than everything.
         #
-        # Taking the head is sound because the read API orders event_time DESC, id DESC and the
-        # records that just landed are both the newest and the highest-id ones.
-        before = len(query(params))
+        # The delta is taken by id and by producer, not by counting rows and slicing the head.
+        # A positional slice is only correct while this producer is the store's sole writer,
+        # and that holds only for as long as the timer stops further down stay in step with
+        # every producer the node gains -- an enumeration that has now fallen behind twice.
+        # Filtering makes a foreign row harmless instead of fatal. The stops still matter: a
+        # second run of THIS producer, or any run of system-metrics-dns, carries the same
+        # service.name and passes the filter, so it has to be prevented rather than filtered.
+        before = {m["id"] for m in query(params)}
+
+        def mine(rows):
+            return [
+                m for m in rows
+                if m["id"] not in before
+                and m["attributes"].get("resource.attributes.service.name") == PRODUCER
+            ]
+
         collect()
-        retry(lambda _: len(query(params)) > before)
-        rows = query(params)
-        return rows[: len(rows) - before]
+        retry(lambda _: bool(mine(query(params))))
+        return mine(query(params))
 
 
     def bodies(measurements, kind):
@@ -441,16 +457,31 @@ nixpkgs.lib.nixos.runTest {
         # From here the driver owns every run: left armed, a timer tick landing mid-test would
         # break the batch counting at the end.
         #
-        # BOTH timers, and the second one is not this file's subject at all. The DoH producer is
-        # armed on this node too -- hosts/rpi5 enables dnscrypt-proxy, so
+        # ALL THREE timers, and only the first is this file's subject. Every producer armed on
+        # this node posts to the same store, so a tick inside a collect_batch() delta lands rows
+        # in it that the exact measurement-type assertion below has no way to expect.
+        #
+        # The DoH producer is armed here because hosts/rpi5 enables dnscrypt-proxy, so
         # common.systemMetrics.dnsProviders defaults to the twelve stamps and
         # modules/system-metrics.nix emits system-metrics-dns.timer -- and it fires at
-        # OnBootSec=10m, which is well inside this file's TCG globalTimeout. Its twelve
-        # system.dns_provider rows would land in whichever collect_batch() delta happened to be
-        # open, and the exact measurement-type assertion below would fail on a type this file
-        # does not test and cannot see coming. Muted here rather than switched off in the node,
-        # so the node stays the configuration the Pi actually deploys.
-        machine.succeed("systemctl stop system-metrics.timer system-metrics-dns.timer")
+        # OnBootSec=10m, well inside this file's TCG globalTimeout. It runs the SAME binary as
+        # the main producer, so its twelve system.dns_provider rows carry
+        # service.name=system-metrics and collect_batch's producer filter cannot tell them
+        # apart: stopping the timer is the only thing that keeps them out.
+        #
+        # detected-devices.timer comes from a different module entirely
+        # (modules/detected-devices.nix, enabled by common.detectedDevices in hosts/rpi5) and
+        # shares this producer's schedule to the second -- OnBootSec=5m, OnUnitActiveSec=15m --
+        # which is why all of them start on the same second on the Pi. Missing it is what broke
+        # this file on 2026-09-19: its tick at uptime 300.4s put five detected-devices.* types
+        # into a delta that had opened 1.4s earlier, and both CI attempts failed identically
+        # because the run reaches this subtest at a reproducible ~299s.
+        #
+        # Muted here rather than switched off in the node, so the node stays the configuration
+        # the Pi actually deploys.
+        machine.succeed(
+            "systemctl stop system-metrics.timer system-metrics-dns.timer detected-devices.timer"
+        )
 
     with subtest("the producer reaches the socket without being root"):
         assert machine.succeed(

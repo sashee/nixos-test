@@ -180,6 +180,21 @@ nixpkgs.lib.nixos.runTest {
     machine.wait_for_unit("mp-collector.service")
     machine.wait_for_unit("monitoring-platform.service")
 
+    # From here the driver owns every run. This producer's own timer is armed on the node at
+    # OnBootSec=5m, and `measurements` below is the WHOLE store rather than a delta -- so a
+    # single tick landing before the snapshot is read puts a second batch in it and turns every
+    # `len(...) == 1` uniqueness assertion below into a 2. The window is not theoretical: the
+    # clock wait immediately after this is allowed 180s on its own.
+    #
+    # Only this one timer, because it is the only producer on this node: common.systemMetrics is
+    # mkForce false further up, and the collector's own health event is off via
+    # services.mp-collector.healthIntervalSecs (flake.nix, testNodeCollectorHealthOff) for
+    # exactly this reason. Anything added here later has to be muted here too.
+    #
+    # Muted rather than switched off in the node, so the node stays the configuration the Pi
+    # actually deploys. tests/system-metrics.nix does the same for its own set of producers.
+    machine.succeed("systemctl stop detected-devices.timer")
+
     # Before the clock wait below, not after: this restarts the collector, and a restart resets
     # `ever_synchronized` to unset -- so authenticating afterwards would throw away the very state
     # that wait was there to establish and make it wait a second time.
