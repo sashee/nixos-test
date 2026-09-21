@@ -103,10 +103,31 @@ let
         min_free=${toString cfg.minFreeBytes}
         check_seconds=${toString cfg.diskCheckSeconds}
 
+        # How many consecutive unreadable samples the watchdog tolerates before it treats the
+        # build as untrackable and terminates it. Not one: `df` here reads a filesystem that
+        # is being hammered by the very build it is measuring, and a single transient failure
+        # is not a reason to abandon a multi-hour upgrade. Not unbounded either: a guard that
+        # cannot measure the disk is not guarding it, and letting the build run on is exactly
+        # the unmonitored state the 2026-09-21 outage happened in.
+        max_read_failures=3
+
         # `--output=avail` is the *available* figure, excluding the root reserve -- see the
         # minFreeBytes description. -B1 makes it bytes; the header line is dropped by tail.
+        #
+        # Returns non-zero instead of printing on any failure, and validates the result, so
+        # every caller has to decide what an unreadable disk means. The alternative -- a bare
+        # `avail="$(free_bytes)"` -- is silently fatal under the `set -o errexit -o pipefail`
+        # that writeShellApplication puts at the top of this script: see disk_watchdog.
         free_bytes() {
-          df -B1 --output=avail /nix/store | tail -n 1 | tr -d ' '
+          local out
+          out="$(df -B1 --output=avail /nix/store 2>/dev/null | tail -n 1 | tr -d ' ')" || return 1
+          # A df that "succeeds" with no rows, or with something that is not a byte count,
+          # is just as unusable as one that exits non-zero, and `[ "$out" -lt ... ]` on it
+          # would abort the caller rather than report anything.
+          case "$out" in
+            "" | *[!0-9]*) return 1 ;;
+          esac
+          printf '%s\n' "$out"
         }
 
         # Runs beside a build and kills it if the floor is crossed. Killing the *client* is
@@ -121,10 +142,32 @@ let
         # fsync for 20-150s under writeback, so a short escalation timer would mostly fire
         # during a stall and convert a clean shutdown into a leaked build tree.
         disk_watchdog() {
-          local bpid="$1" name="$2" avail
+          local bpid="$1" name="$2" avail failures=0
           while kill -0 "$bpid" 2>/dev/null; do
             sleep "$check_seconds"
-            avail="$(free_bytes)"
+
+            # A failed reading must not take the watchdog down with it. This runs in a
+            # background subshell that inherited errexit and pipefail, so an unguarded
+            # `avail="$(free_bytes)"` would exit the subshell on the first transient df
+            # failure -- and do it *silently*: the parent never waits on this job for its
+            # status, it only reads "$guard", so a dead watchdog and a quiet one are
+            # indistinguishable. The rest of the build, possibly hours of it, would then run
+            # with no guard at all, which is precisely the failure this whole feature exists
+            # to prevent. So: log every failed sample, and terminate rather than keep
+            # pretending to guard once they stop looking transient.
+            if ! avail="$(free_bytes)"; then
+              failures=$((failures + 1))
+              echo "auto-upgrade: disk guard: cannot read available space on /nix/store while building $name ($failures/$max_read_failures)" >&2
+              if [ "$failures" -lt "$max_read_failures" ]; then
+                continue
+              fi
+              printf 'auto-upgrade: disk guard: available space unreadable %s times in a row while building %s; terminating the upgrade rather than building on unguarded\n' \
+                "$failures" "$name" > "$guard"
+              kill -TERM "$bpid" 2>/dev/null || true
+              return 0
+            fi
+            failures=0
+
             if [ "$avail" -lt "$min_free" ]; then
               printf 'auto-upgrade: disk guard: %s bytes available while building %s, below %s; terminating the upgrade\n' \
                 "$avail" "$name" "$min_free" > "$guard"
@@ -140,8 +183,13 @@ let
           name="$(basename "$drv" .drv)"
 
           # Before starting, so an upgrade that begins under the floor stops immediately
-          # rather than making things worse first.
-          avail="$(free_bytes)"
+          # rather than making things worse first. An unreadable disk stops it too -- same
+          # rule as the watchdog -- but it has to say why: left to errexit this aborted the
+          # whole upgrade with nothing in the journal but a non-zero exit.
+          if ! avail="$(free_bytes)"; then
+            echo "auto-upgrade: disk guard: cannot read available space on /nix/store before building $name; terminating the upgrade" >&2
+            return 1
+          fi
           if [ "$avail" -lt "$min_free" ]; then
             echo "auto-upgrade: disk guard: $avail bytes available before building $name, below $min_free; terminating the upgrade" >&2
             return 1

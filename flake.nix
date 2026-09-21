@@ -511,29 +511,35 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiSystemModule;
       };
-      # The three upgrade/GC-plumbing checks. They build their own minimal node rather than
-      # taking rpiSystemModule -- the subject is the prebuild loop and the GC guard, not the
-      # host config -- but they run on both arches like every other test here, because this
-      # is the leg that decides: the constraints they encode are the Pi's, and the x86 twin
-      # is only the fast KVM preview of it.
+      # The four upgrade/GC-plumbing checks. Three of them build their own minimal node
+      # rather than taking rpiSystemModule -- their subject is the prebuild loop and the GC
+      # guard, not the host config -- but they run on both arches like every other test
+      # here, because this is the leg that decides: the constraints they encode are the
+      # Pi's, and the x86 twin is only the fast KVM preview of it.
       #
-      # TCG ceilings, not the files' KVM defaults. auto-upgrade-prebuild gets the largest
-      # because it is the one that runs real `nix build` invocations in the guest -- four of
-      # them, plus an eval and two store queries, each paying emulated process startup.
+      # TCG ceilings, not the files' KVM defaults. The two that run real `nix build`
+      # invocations in the guest -- each paying emulated process startup -- get the largest:
+      # auto-upgrade-prebuild for four of them plus an eval and two store queries, and
+      # auto-upgrade-disk-guard for the same shape on the deployed config, which it boots.
       autoUpgradePrebuildTestRpi = import ./tests/auto-upgrade-prebuild.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
         globalTimeout = 2400;
       };
-      # The disk guard on that same loop. Shares the prebuild test's shape and therefore its
-      # timeout, plus room for the greedy derivation to write its way down to the floor --
-      # synchronously, on an emulated disk.
+      # The disk guard on that same loop -- and the exception to the paragraph above: the
+      # guard reads `df /nix/store`, so the store's filesystem and nix.settings are part of
+      # what it measures and the node has to be the real host config. Only the flake it
+      # upgrades is fake. Boot cost of that config on top of the prebuild test's shape, plus
+      # room for the greedy derivation to write its way down to the floor -- synchronously,
+      # on an emulated disk -- hence the largest ceiling here.
       autoUpgradeDiskGuardTestRpi = import ./tests/auto-upgrade-disk-guard.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
-        globalTimeout = 3000;
+        nodeModule = rpiSystemModule;
+        flakeRef = "/etc/nixos#rpi5";
+        globalTimeout = 3600;
       };
       nixGcUpgradeExclusionTestRpi = import ./tests/nix-gc-upgrade-exclusion.nix {
         nixpkgs = nixrpi;
@@ -1061,12 +1067,16 @@
           machineModule = rpi5X86SystemModule;
           keptAfterGc = 1;  # --delete-old keeps only the current generation
         };
-        # All three build their own minimal node rather than taking a host module, but they
-        # belong to the Pi: a 4 GB host cannot survive one monolithic `nix build` of a large
-        # plan, and its SD cannot survive a GC racing that build. Twins of the aarch64
-        # entries of the same name -- this is the KVM preview, that is the deciding run.
+        # All four belong to the Pi: a 4 GB host cannot survive one monolithic `nix build`
+        # of a large plan, and its SD cannot survive a GC racing that build. Twins of the
+        # aarch64 entries of the same name -- this is the KVM preview, that is the deciding
+        # run. Three build their own minimal node rather than taking a host module; the disk
+        # guard takes one, because the filesystem under its `df` is part of its subject.
         rpi5-x86-auto-upgrade-prebuild = rpi5X86Test ./tests/auto-upgrade-prebuild.nix { };
-        rpi5-x86-auto-upgrade-disk-guard = rpi5X86Test ./tests/auto-upgrade-disk-guard.nix { };
+        rpi5-x86-auto-upgrade-disk-guard = rpi5X86Test ./tests/auto-upgrade-disk-guard.nix {
+          nodeModule = rpi5X86SystemModule;
+          flakeRef = "/etc/nixos#rpi5";
+        };
         rpi5-x86-nix-gc-upgrade-exclusion = rpi5X86Test ./tests/nix-gc-upgrade-exclusion.nix { };
         rpi5-x86-nix-gc-boot-trigger = rpi5X86Test ./tests/nix-gc-boot-trigger.nix { };
         rpi5-x86-nix-build-dir-cleanup = rpi5X86Test ./tests/nix-build-dir-cleanup.nix {
