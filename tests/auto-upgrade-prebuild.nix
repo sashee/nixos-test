@@ -85,6 +85,11 @@ nixpkgs.lib.nixos.runTest {
     common.autoUpgrade = {
       enable = true;
       flake = "/etc/nixos#testhost";
+      # Off: this node's writable store is a RAM-backed tmpfs of ~500 MB, so the deployed
+      # 1 GiB floor is already crossed before the first derivation and the guard would
+      # terminate every run here. tests/auto-upgrade-disk-guard.nix owns that behaviour,
+      # on a node given a real disk to fill.
+      minFreeBytes = 0;
     };
 
     # The upgrade drags a GC in ahead of itself. Make it a complete no-op here, not merely

@@ -29,6 +29,11 @@ nixpkgs.lib.nixos.runTest {
     # mkDefault so a full system config (e.g. the rpi one) can set its own flake.
     common.autoUpgrade.flake = lib.mkDefault flakeRef;
 
+    # Off: a test node's writable store is a RAM-backed tmpfs of a few hundred MB, below the
+    # deployed 1 GiB floor, so the guard would terminate the run before the command shape
+    # this test asserts on is ever reached. tests/auto-upgrade-disk-guard.nix owns the guard.
+    common.autoUpgrade.minFreeBytes = 0;
+
     # This test covers timer + command shape; reboot behavior is covered by the
     # auto-upgrade-reboot test. Force both reboot paths off so the mocked rebuild (which never
     # updates the system profile) never reboots mid-test. (nodeModule is the rpi config, which
