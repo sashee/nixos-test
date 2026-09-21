@@ -65,7 +65,11 @@ let
         todo="$(mktemp)"
         topo="$(mktemp)"
         ordered="$(mktemp)"
-        trap 'rm -f "$plan" "$todo" "$topo" "$ordered"' EXIT
+        # Written by the watchdog when it trips, read by the parent. A file rather than a
+        # variable because the watchdog runs in a background subshell, whose assignments
+        # the parent never sees.
+        guard="$(mktemp)"
+        trap 'rm -f "$plan" "$todo" "$topo" "$ordered" "$guard"' EXIT
 
         # Reads the .drv, so this costs no second evaluation.
         nix build --dry-run "$drv^*" >/dev/null 2>"$plan"
@@ -94,16 +98,108 @@ let
           exit 1
         fi
 
-        echo "auto-upgrade: building $count derivations, one per nix process"
-        i=0
-        while read -r d; do
-          i=$((i + 1))
-          echo "auto-upgrade: [$i/$count] $(basename "$d" .drv)"
+        # The disk guard (spec/features/auto-upgrade.md: "during the upgrade, monitor the
+        # available disk space / if it goes below 1GB then terminate the upgrade").
+        min_free=${toString cfg.minFreeBytes}
+        check_seconds=${toString cfg.diskCheckSeconds}
+
+        # `--output=avail` is the *available* figure, excluding the root reserve -- see the
+        # minFreeBytes description. -B1 makes it bytes; the header line is dropped by tail.
+        free_bytes() {
+          df -B1 --output=avail /nix/store | tail -n 1 | tr -d ' '
+        }
+
+        # Runs beside a build and kills it if the floor is crossed. Killing the *client* is
+        # what stops the work: the builder is a child of nix-daemon, not of this script, and
+        # the daemon tears its worker down when the client disconnects. SIGTERM rather than
+        # SIGKILL deliberately -- nix cleans up its build directory on a graceful shutdown
+        # but leaks the whole tree when killed outright, which on a nearly-full disk is the
+        # opposite of helpful (tests/nix-build-dir-cleanup.nix documents that leak).
+        #
+        # No escalation to SIGKILL if TERM is slow, for the same reason: nix does handle
+        # TERM (it unwinds and reports "interrupted by the user"), and this host stalls in
+        # fsync for 20-150s under writeback, so a short escalation timer would mostly fire
+        # during a stall and convert a clean shutdown into a leaked build tree.
+        disk_watchdog() {
+          local bpid="$1" name="$2" avail
+          while kill -0 "$bpid" 2>/dev/null; do
+            sleep "$check_seconds"
+            avail="$(free_bytes)"
+            if [ "$avail" -lt "$min_free" ]; then
+              printf 'auto-upgrade: disk guard: %s bytes available while building %s, below %s; terminating the upgrade\n' \
+                "$avail" "$name" "$min_free" > "$guard"
+              kill -TERM "$bpid" 2>/dev/null || true
+              return 0
+            fi
+          done
+        }
+
+        guarded_build() {
+          local drv="$1"
+          local name avail rc=0 build_pid watch_pid outs o
+          name="$(basename "$drv" .drv)"
+
+          # Before starting, so an upgrade that begins under the floor stops immediately
+          # rather than making things worse first.
+          avail="$(free_bytes)"
+          if [ "$avail" -lt "$min_free" ]; then
+            echo "auto-upgrade: disk guard: $avail bytes available before building $name, below $min_free; terminating the upgrade" >&2
+            return 1
+          fi
+
+          : > "$guard"
+
           # ^* -- ALL outputs, not just the default one. The kernel derivation has three
           # (out, dev, modules) and an out-only build leaves the derivation unbuilt as far
           # as nix is concerned, so the nixos-rebuild that follows would recompile the whole
           # thing and defeat the loop. Same trap the Makefile's export-rpi-kernel documents.
-          nix build "$d^*" --no-link --max-jobs 1 --cores 1
+          nix build "$drv^*" --no-link --max-jobs 1 --cores 1 &
+          build_pid=$!
+
+          disk_watchdog "$build_pid" "$name" &
+          watch_pid=$!
+
+          # Waiting on the build directly, with the watchdog as the background job, rather
+          # than polling the build from the foreground: a foreground poll would not notice
+          # a finished build until its next tick, and at one tick per derivation that is
+          # hours added to a 1500-derivation plan.
+          wait "$build_pid" || rc=$?
+
+          kill "$watch_pid" 2>/dev/null || true
+          wait "$watch_pid" 2>/dev/null || true
+
+          if [ -s "$guard" ]; then
+            cat "$guard" >&2
+
+            # Reclaim what the killed build wrote. Nix deletes a partial output when a build
+            # *fails*, but not when its client is interrupted: verified outside the VM, a
+            # SIGTERMed `nix build` leaves an invalid, nobody-owned output path of whatever
+            # size it had reached (356 MB in the probe). Leaving that behind would hold the
+            # filesystem at the floor until the next GC -- precisely the state the guard
+            # exists to escape, and it would make the next night's trip come sooner.
+            #
+            # `nix-store --delete` works on invalid paths and refuses anything still
+            # reachable from a GC root, so it cannot remove a genuinely built output.
+            outs="$(nix-store --query --outputs "$drv" 2>/dev/null || true)"
+            for o in $outs; do
+              [ -e "$o" ] || continue
+              if nix-store --delete "$o" >/dev/null 2>&1; then
+                echo "auto-upgrade: disk guard: reclaimed partial output $o" >&2
+              fi
+            done
+
+            return 1
+          fi
+          return "$rc"
+        }
+
+        echo "auto-upgrade: building $count derivations, one per nix process"
+
+        i=0
+        while read -r d; do
+          i=$((i + 1))
+          echo "auto-upgrade: [$i/$count] $(basename "$d" .drv)"
+          guarded_build "$d"
         done < "$ordered"
 
         echo "auto-upgrade: all $count derivations built"
@@ -152,6 +248,59 @@ in
         generation differs from the currently running system -- i.e. on ANY change, not only
         kernel/initrd/kernel-modules changes (which is all `system.autoUpgrade.allowReboot`
         covers). Enable only one of the two reboot paths.
+      '';
+    };
+
+    minFreeBytes = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 1073741824; # 1 GiB
+      description = ''
+        spec/features/auto-upgrade.md: "if it goes below 1GB then terminate the upgrade".
+        Terminate the upgrade when available space on the filesystem holding /nix/store
+        drops below this, killing the in-flight `nix build` rather than letting it run to
+        ENOSPC.
+
+        0 disables the guard, which is what VM tests that drive the upgrade but are not
+        about the guard want: a test node's writable store is a RAM-backed tmpfs of a few
+        hundred MB, so the default floor is below it from the first second and every such
+        test would abort before building anything.
+
+        *Available*, not free: this is `df`'s figure, which excludes the ext4 root reserve
+        (1.27 GB on the Pi -- larger than this threshold). `nix-daemon` builds as root and
+        can spend that reserve, so tripping here leaves it intact as headroom for the
+        cleanup that follows, rather than stopping at a cliff edge. A full store filesystem
+        has corrupted this host's nix database before.
+
+        Measured against 50 days of the Pi's own `system.filesystem` records: the one kernel
+        compile in that window (6.18.39 -> 6.18.42, 8.25 h) bottomed out at 5.33 GB
+        available, and the fastest fill ever recorded was 348 MB/min. 1 GiB clears both
+        comfortably; the only excursion below it was the 2026-09-21 dotnet source build that
+        this guard exists for.
+
+        Deliberately not nix's own `min-free`. That setting garbage-collects instead of
+        aborting, and here it would collect the very outputs the one-derivation-per-process
+        loop just built (they are unrooted between invocations -- `--no-link`), bypassing
+        the `nix-gc` ExecCondition in modules/nix-settings.nix that exists to keep a GC out
+        of a running upgrade.
+      '';
+    };
+
+    diskCheckSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 5;
+      description = ''
+        How often to sample available space while a derivation builds.
+
+        The check has to run *during* a build, not only between them: the build that
+        exhausted the Pi on 2026-09-21 started with 9.3 GB available and consumed all of it
+        by itself, so a per-derivation precheck alone would have waved it through.
+
+        Five seconds rather than one because the measurements say the interval is not where
+        the margin comes from. At the fastest fill ever observed on this host (348 MB/min),
+        five seconds costs 29 MB of overshoot against a 1 GiB floor -- 2.9% -- and going to
+        one second would recover 23 MB of that. Raising minFreeBytes is roughly 20x more
+        effective per unit of cost, and the dominant lag is the daemon's teardown after the
+        kill, not the sampling.
       '';
     };
 

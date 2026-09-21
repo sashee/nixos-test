@@ -526,6 +526,15 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         globalTimeout = 2400;
       };
+      # The disk guard on that same loop. Shares the prebuild test's shape and therefore its
+      # timeout, plus room for the greedy derivation to write its way down to the floor --
+      # synchronously, on an emulated disk.
+      autoUpgradeDiskGuardTestRpi = import ./tests/auto-upgrade-disk-guard.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        globalTimeout = 3000;
+      };
       nixGcUpgradeExclusionTestRpi = import ./tests/nix-gc-upgrade-exclusion.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
@@ -839,6 +848,7 @@
         nix-settings = nixSettingsTestRpi;
         auto-upgrade-reboot = autoUpgradeRebootTestRpi;
         auto-upgrade-prebuild = autoUpgradePrebuildTestRpi;
+        auto-upgrade-disk-guard = autoUpgradeDiskGuardTestRpi;
         nix-gc-upgrade-exclusion = nixGcUpgradeExclusionTestRpi;
         nix-gc-boot-trigger = nixGcBootTriggerTestRpi;
         system = systemTestRpi;
@@ -1056,6 +1066,7 @@
         # plan, and its SD cannot survive a GC racing that build. Twins of the aarch64
         # entries of the same name -- this is the KVM preview, that is the deciding run.
         rpi5-x86-auto-upgrade-prebuild = rpi5X86Test ./tests/auto-upgrade-prebuild.nix { };
+        rpi5-x86-auto-upgrade-disk-guard = rpi5X86Test ./tests/auto-upgrade-disk-guard.nix { };
         rpi5-x86-nix-gc-upgrade-exclusion = rpi5X86Test ./tests/nix-gc-upgrade-exclusion.nix { };
         rpi5-x86-nix-gc-boot-trigger = rpi5X86Test ./tests/nix-gc-boot-trigger.nix { };
         rpi5-x86-nix-build-dir-cleanup = rpi5X86Test ./tests/nix-build-dir-cleanup.nix {

@@ -46,6 +46,10 @@ nixpkgs.lib.nixos.runTest {
     common.autoUpgrade = {
       enable = true;
       flake = "/etc/nixos#testhost";
+      # Off: a test node's writable store is a RAM-backed tmpfs of a few hundred MB, below
+      # the deployed 1 GiB floor, so the guard would terminate the upgrade before it could
+      # sit in `activating` long enough for the GC exclusion under test to be observed.
+      minFreeBytes = 0;
     };
 
     # The guest sees the host's whole /nix/store over 9p, so an unbounded collection sweeps
