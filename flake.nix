@@ -294,7 +294,12 @@
             # the unit at all, so an off switch here would make the case fail rather than skip --
             # and it is also the only one that can satisfy it, because its harness gives the node
             # a real NTP server.
-            services.monitoring-platform.clockGate.enable = nixpkgs.lib.mkForce true;
+            #
+            # Priority 80, not mkForce: it only has to beat testNodeClockGateOff's 90, and
+            # mkForce stays free for upstream cases that switch the gate off themselves
+            # (migration-timeout does, because the gate's ExecStartPre= would inherit its
+            # shortened TimeoutStartSec). Two mkForce values that disagree are an eval error.
+            services.monitoring-platform.clockGate.enable = nixpkgs.lib.mkOverride 80 true;
           }
         ];
       };
@@ -697,7 +702,10 @@
             # asserts the gate is on the unit at all, so an off switch here would make the
             # case fail rather than skip -- and it is also the only one that can satisfy the
             # gate, because its harness gives the node a real NTP server.
-            services.monitoring-platform.clockGate.enable = nixpkgs.lib.mkForce true;
+            #
+            # Priority 80 for the same reason as the x86 suite: beat testNodeClockGateOff's 90,
+            # but leave mkForce to upstream cases that switch the gate off (migration-timeout).
+            services.monitoring-platform.clockGate.enable = nixpkgs.lib.mkOverride 80 true;
           }
         ];
       };

@@ -120,6 +120,15 @@ let
 
         : > ${stoppedUnitsFile name}
         for unit in "''${units[@]}"; do
+          # A unit still starting is let finish first. `is-active` reports it as not running, so
+          # it would be neither stopped nor restarted while it came up and wrote under restic --
+          # the monitoring platform migrates its database before READY=1, for up to hours. Stopping
+          # it instead would roll a migration back only to restart it from scratch afterwards.
+          # `start` joins the pending job and returns when it does; a failed start leaves nothing
+          # running, which the check below then sees.
+          if [ "$(systemctl show --property=ActiveState --value "$unit")" = activating ]; then
+            systemctl start "$unit" || true
+          fi
           if systemctl is-active --quiet "$unit"; then
             printf '%s\n' "$unit" >> ${stoppedUnitsFile name}
           fi
@@ -261,8 +270,10 @@ in
             only consistent while they are down, such as a database with a write-ahead log.
 
             Only units that were running when the backup started are started again, so a
-            unit stopped for maintenance stays stopped. They are also started again when
-            the backup fails. Names are passed to systemctl verbatim, so "foo" means
+            unit stopped for maintenance stays stopped. A unit still starting counts as
+            running: the backup waits for it to finish starting, then stops it. They are
+            also started again when the backup fails. Names are passed to systemctl
+            verbatim, so "foo" means
             "foo.service".
           '';
         };

@@ -917,12 +917,13 @@ in
       # forked". A run with nothing listening should fail loudly on the timer rather than drag
       # a service in.
       #
-      # Both hops are named regardless of which one this host posts to. Ordering against a unit
-      # that does not exist is a no-op -- the same idiom the collector module uses for the time
-      # daemons it must precede -- so naming both costs nothing and misses neither topology.
+      # Only the hop this host posts to, never both. Naming the receiver is not free on a host
+      # that posts through the collector: a schema migration can hold the receiver in `activating`
+      # for hours (it extends its own start timeout, monitoring-platform SPEC.md §9.2), every run
+      # in that window would queue behind it, and buffering through exactly that is the
+      # collector's job.
       after = [
-        "mp-collector.service"
-        "monitoring-platform.service"
+        (if cfg.viaCollector then "mp-collector.service" else "monitoring-platform.service")
         "time-sync.target"
       ];
 
@@ -1043,9 +1044,9 @@ in
     # slower cadence is a second timer.
     systemd.services.system-metrics-dns = lib.mkIf (cfg.dnsProviders != { }) {
       description = "Report DoH upstream health to the local monitoring platform";
+      # Same ordering as the main unit, for the same reason.
       after = [
-        "mp-collector.service"
-        "monitoring-platform.service"
+        (if cfg.viaCollector then "mp-collector.service" else "monitoring-platform.service")
         "time-sync.target"
       ];
 

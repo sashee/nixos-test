@@ -36,6 +36,30 @@ let
       script = record "running";
       postStop = record "stopped";
     };
+
+  # A quiesced service that can be held mid-start while /run/quiesce-hold exists, the way the
+  # monitoring platform is held in `activating` by a schema migration before READY=1. It appends
+  # rather than overwrites, so a snapshot shows whether the start it was caught in ran to the end
+  # before the backup stopped it, rather than being killed halfway or not stopped at all.
+  startingService = unit:
+    let
+      log = state: ''
+        install -d -m 0755 -o backup-user -g users /home/backup-user/quiesce
+        printf '%s\n' '${state}' >> /home/backup-user/quiesce/${unit}
+        chown backup-user:users /home/backup-user/quiesce/${unit}
+      '';
+    in
+    {
+      wantedBy = [ "multi-user.target" ];
+      unitConfig.StartLimitIntervalSec = 0;
+      serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+      script = ''
+        ${log "starting"}
+        while [ -e /run/quiesce-hold ]; do sleep 0.2; done
+        ${log "running"}
+      '';
+      postStop = log "stopped";
+    };
 in
 nixpkgs.lib.nixos.runTest {
   name = "restic";
@@ -85,6 +109,7 @@ nixpkgs.lib.nixos.runTest {
 
     systemd.services.quiesced-one = quiescedService "quiesced-one";
     systemd.services.quiesced-two = quiescedService "quiesced-two";
+    systemd.services.quiesced-starting = startingService "quiesced-starting";
 
     virtualisation.qemu.options = [
       "-rtc"
@@ -148,7 +173,7 @@ nixpkgs.lib.nixos.runTest {
       user = "backup-user";
       credentialDirectory = "/etc/credentials/restic/quiesce";
       paths = [ "/home/backup-user/quiesce" ];
-      stopServices = [ "quiesced-one.service" "quiesced-two.service" ];
+      stopServices = [ "quiesced-one.service" "quiesced-two.service" "quiesced-starting.service" ];
       prune.opts = [ "--keep-last 99" ];
       timerConfig = null;
     };
@@ -489,6 +514,32 @@ nixpkgs.lib.nixos.runTest {
     restarted = max(i for i, line in enumerate(quiesce_log) if "Finished" in line and "quiesced-one" in line)
     checked = max(i for i, line in enumerate(quiesce_log) if "no errors were found" in line)
     assert restarted < checked, quiesce_log[min(restarted, checked):]
+
+    # A unit still starting when the backup begins is waited for, then stopped like the rest. The
+    # monitoring platform migrates its database before READY=1: a backup that took it for stopped
+    # would read the files under the migration, one that stopped it would roll the migration back.
+    client.succeed("systemctl stop quiesced-starting.service")
+    client.succeed("truncate -s 0 /home/backup-user/quiesce/quiesced-starting")
+    client.succeed("touch /run/quiesce-hold")
+    client.succeed("systemctl start --no-block quiesced-starting.service")
+    client.wait_until_succeeds("grep -Fqx starting /home/backup-user/quiesce/quiesced-starting")
+    client.succeed("systemctl start --no-block restic-backups-quiesce.service")
+    # The bracket keeps pgrep from matching the shell running this very command.
+    client.wait_until_succeeds("pgrep -f '[r]estic-quiesce-stop-services'")
+    # Without the wait, the stop script returns at once and restic is backing up within a second.
+    # With it, nothing moves until the start finishes, so the margin cannot make this flaky.
+    client.sleep(5)
+    assert client.succeed("systemctl show restic-backups-quiesce.service -p SubState --value").strip() == "start-pre"
+    assert client.succeed("systemctl show quiesced-starting.service -p ActiveState --value").strip() == "activating"
+
+    client.succeed("rm /run/quiesce-hold")
+    client.wait_until_succeeds("systemctl show restic-backups-quiesce.service -p ActiveState --value | grep -Fqx inactive")
+    assert service_result("quiesce") == "success"
+    client.succeed("systemctl is-active --quiet quiesced-starting.service")
+    client.succeed("mkdir -p /tmp/restic-quiesce-starting-restore")
+    client.succeed(f"RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY={REPOS['quiesce']} ${pkgs.restic}/bin/restic restore latest --target /tmp/restic-quiesce-starting-restore")
+    snapshotted = client.succeed("cat /tmp/restic-quiesce-starting-restore/home/backup-user/quiesce/quiesced-starting").split()
+    assert snapshotted == ["starting", "running", "stopped"], snapshotted
 
     backend.succeed("set -- /var/lib/restic-normal/check-damaged/data/*/*; rm \"$1\"")
     client.fail("systemctl start restic-backups-check-damaged.service")
