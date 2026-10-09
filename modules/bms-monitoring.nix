@@ -23,6 +23,15 @@
 let
   cfg = config.common.bmsMonitoring;
 
+  # The hop this producer posts to, and so the only one it waits for. Same reason as
+  # inverter-monitoring: a schema migration can hold the receiver in `activating` for hours, and
+  # buffering through exactly that is the collector's job.
+  postsTo =
+    if config.services ? mp-collector && config.services.mp-collector.enable
+      && cfg.socketPath == config.services.mp-collector.socketPath
+    then "mp-collector.service"
+    else "monitoring-platform.service";
+
   listenArgs = [
     "--socket"
     cfg.socketPath
@@ -332,14 +341,14 @@ in
       description = "Listen to the USB-attached BMS and report it to the local monitoring platform";
       wantedBy = [ "multi-user.target" ];
 
-      # Ordering only. Both hops are named whichever one this host posts to -- ordering against a
-      # unit that does not exist is a no-op -- and neither is a Requires: a receiver that is down is
-      # a transient the producer logs and rides out, not a reason to refuse to start.
+      # Ordering only, and only against the hop it posts to (see postsTo). Not a Requires: a
+      # receiver that is down is a transient the producer logs and rides out, not a reason to
+      # refuse to start.
       #
       # Deliberately NOT ordered against inverter-monitoring. The two contend for the same ports and
       # the flock is what resolves that; an ordering would only make the loser's wait deterministic
       # without making it shorter, and it would tie two units together that have no dependency.
-      after = [ "mp-collector.service" "monitoring-platform.service" ];
+      after = [ postsTo ];
 
       # A [Unit] setting, NOT [Service] -- systemd parses the file per-section and silently ignores
       # an unknown key, which on the sibling produced "Unknown key 'StartLimitIntervalSec' in

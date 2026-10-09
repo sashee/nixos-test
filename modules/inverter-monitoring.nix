@@ -19,6 +19,15 @@
 let
   cfg = config.common.inverterMonitoring;
 
+  # The hop this producer posts to, and so the only one it waits for. Not both: a schema
+  # migration can hold the receiver in `activating` for hours (it extends its own start timeout,
+  # monitoring-platform SPEC.md §9.2), and buffering through exactly that is the collector's job.
+  postsTo =
+    if config.services ? mp-collector && config.services.mp-collector.enable
+      && cfg.socketPath == config.services.mp-collector.socketPath
+    then "mp-collector.service"
+    else "monitoring-platform.service";
+
   pollArgs = [
     "--socket"
     cfg.socketPath
@@ -319,10 +328,10 @@ in
       description = "Poll the USB-attached inverter and report it to the local monitoring platform";
       wantedBy = [ "multi-user.target" ];
 
-      # Ordering only. Both hops are named whichever one this host posts to -- ordering against
-      # a unit that does not exist is a no-op -- and neither is a Requires: a receiver that is
-      # down is a transient the producer logs and rides out, not a reason to refuse to start.
-      after = [ "mp-collector.service" "monitoring-platform.service" ];
+      # Ordering only, and only against the hop it posts to (see postsTo). Not a Requires: a
+      # receiver that is down is a transient the producer logs and rides out, not a reason to
+      # refuse to start.
+      after = [ postsTo ];
 
       # A [Unit] setting, NOT [Service] -- systemd parses the file per-section and silently
       # ignores an unknown key, so putting it below logged
