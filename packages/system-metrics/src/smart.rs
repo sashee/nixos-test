@@ -44,10 +44,15 @@ pub fn parse_scan(text: &str) -> Vec<ScanDevice> {
         .unwrap_or_default()
 }
 
+/// The `kind` attribute of `system.drive`. SMART only ever tells nvme from sata; the rest come
+/// from where the block layer has the disk attached (see `block::drive_kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveKind {
     Nvme,
     Sata,
+    Usb,
+    Sd,
+    Emmc,
 }
 
 impl DriveKind {
@@ -55,6 +60,9 @@ impl DriveKind {
         match self {
             DriveKind::Nvme => "nvme",
             DriveKind::Sata => "sata",
+            DriveKind::Usb => "usb",
+            DriveKind::Sd => "sd",
+            DriveKind::Emmc => "emmc",
         }
     }
 }
