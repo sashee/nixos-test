@@ -159,13 +159,30 @@
         "type": "github"
       }
     },
+    "pw-mgr": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791644180,
+        "narHash": "sha256-sEUJv0/6srgPCzWoxn2bD/AmifEJg3FmotMqBaUZhT0=",
+        "owner": "sashee",
+        "repo": "pw-mgr",
+        "rev": "bed8e5567fbbc3aec048515eb1816d736937d92d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sashee",
+        "repo": "pw-mgr",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "dotfiles": "dotfiles",
         "monitoring-platform": "monitoring-platform",
         "nixos-raspberrypi": "nixos-raspberrypi",
         "nixpkgs": "nixpkgs_2",
-        "nixpkgs-unstable": "nixpkgs-unstable"
+        "nixpkgs-unstable": "nixpkgs-unstable",
+        "pw-mgr": "pw-mgr"
       }
     }
   },
