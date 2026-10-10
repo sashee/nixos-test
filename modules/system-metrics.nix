@@ -97,6 +97,11 @@ let
     ++ lib.optional
       (config.services ? monitoring-platform && config.services.monitoring-platform.enable)
       "monitoring-platform.service"
+    # The password manager's backend and the tunnel that is its only way in. The tunnel is here
+    # for thingspeak-tunnel's reason -- skipped rather than failed with no secret -- and the
+    # backend because a dead vault is otherwise noticed only by whoever next needs a password.
+    ++ lib.optional (config.services ? pw-mgr && config.services.pw-mgr.enable) "pw-mgr.service"
+    ++ lib.optional (commonFeature [ "pwMgrTunnel" "enable" ] false) "pw-mgr-tunnel.service"
     # The DoH producer, which belongs here even though `system-metrics.service` deliberately does
     # not: that exclusion is about a oneshot observing ITSELF, always mid-run and so always
     # `activating`. This one is observed by the fifteen-minute unit while it sits idle between

@@ -17,9 +17,16 @@
       url = "github:sashee/monitoring-platform";
       flake = false;
     };
+    # The password manager's backend for the Pi (unix socket only), consumed exactly like
+    # monitoring-platform: no flake, nix/module.nix a plain module that builds the backend and
+    # the frontend's static files with the target system's own nixpkgs.
+    pw-mgr = {
+      url = "github:sashee/pw-mgr";
+      flake = false;
+    };
   };
 
-  outputs = { nixpkgs, nixpkgs-unstable, dotfiles, nixos-raspberrypi, monitoring-platform, ... }:
+  outputs = { nixpkgs, nixpkgs-unstable, dotfiles, nixos-raspberrypi, monitoring-platform, pw-mgr, ... }:
     let
       system = "x86_64-linux";
       stateVersion = nixpkgs.lib.trivial.release;
@@ -303,6 +310,23 @@
           }
         ];
       };
+      # pw-mgr's own VM test on x86, against the same node and for the same reasons as
+      # monitoringPlatformTestsX86 above: the fast companion of the aarch64 run, which decides.
+      pwMgrTestX86 = import "${pw-mgr}/nix/tests/lib.nix" {
+        inherit pkgs;
+        machineModules = [
+          rpi5X86QuiescedModule
+          {
+            # The harness sets no node hostName, so without one the rpi config's mkDefault
+            # ties with the framework's.
+            networking.hostName = "pw-mgr-test";
+            system.stateVersion = rpi5StateVersion;
+            virtualisation.memorySize = nixpkgs.lib.mkDefault 2048;
+            # Nothing here is about remote access.
+            common.irohSsh.enable = nixpkgs.lib.mkForce false;
+          }
+        ];
+      };
       dohStamps = import ./lib/doh-stamps.nix { lib = nixpkgs.lib; };
       ntsServers = import ./lib/nts-servers.nix { lib = nixpkgs.lib; };
       resticLib = import ./lib/restic.nix { lib = nixpkgs.lib; };
@@ -320,6 +344,9 @@
         # until the clock is good, the collector must be running BEFORE anything can step it
         # -- and this host runs both.
         "${monitoring-platform}/nix/collector-module.nix"
+        # The password manager's backend. Composed here for the same reason as the receiver:
+        # hosts/rpi5 sets its options, and an `imports` entry cannot name an input.
+        "${pw-mgr}/nix/module.nix"
         timeSyncSettings
         ./hosts/rpi5/configuration.nix
       ];
@@ -709,6 +736,25 @@
           }
         ];
       };
+      # pw-mgr's own VM test against the REAL rpi config, for the reason given on
+      # monitoringPlatformTestsRpi: its sandbox assertions only decide anything against the
+      # systemd the Pi boots, so this consumer-side run is the one that counts. One test, not
+      # a suite of cases, so it maps to one check of the same name.
+      pwMgrTestRpi = import "${pw-mgr}/nix/tests/lib.nix" {
+        pkgs = pkgsRpi;
+        machineModules = [
+          rpiQuiescedSystemModule
+          {
+            # Same reason as rpiNixUtilsTests: the harness sets no node hostName, so
+            # without one the rpi config's mkDefault ties with the framework's.
+            networking.hostName = "pw-mgr-test";
+            system.stateVersion = rpi5Base.config.system.stateVersion;
+            virtualisation.memorySize = nixpkgs.lib.mkDefault 2048;
+            # Nothing here is about remote access.
+            common.irohSsh.enable = nixpkgs.lib.mkForce false;
+          }
+        ];
+      };
       # The trigger-semantics regression test for the 2026-07-27 outage, on the REAL rpi
       # config (exact Pi kernel, live doh egress rules, live firewall -- so the setup
       # script's runtime nixos-fw openings are on the path here too). The decision logic
@@ -832,6 +878,14 @@
         machineModule = rpiSystemModule;
         inherit dohStamps;
       };
+      # The password manager's iroh path end to end, with a relay and a discovery domain.
+      pwMgrTunnelTestRpi = import ./tests/pw-mgr-tunnel.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+        inherit dohStamps;
+      };
       bootClockTestRpi = import ./tests/boot-clock.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
@@ -882,6 +936,9 @@
         # Not "monitoring-platform-tunnel": the monitoring-platform-* names in this
         # set are upstream's own suite, mapped in below, and this is not one of them.
         mp-tunnel = mpTunnelTestRpi;
+        # Upstream's VM test, and our end-to-end run of the iroh path in front of it.
+        pw-mgr = pwMgrTestRpi;
+        pw-mgr-tunnel = pwMgrTunnelTestRpi;
         restic = resticTestRpi;
         boot-clock = bootClockTestRpi;
         system-metrics = systemMetricsTestRpi;
@@ -1145,6 +1202,10 @@
           machineModule = rpi5X86SystemModule;
           inherit dohStamps;
         };
+        rpi5-x86-pw-mgr-tunnel = rpi5X86Test ./tests/pw-mgr-tunnel.nix {
+          machineModule = rpi5X86SystemModule;
+          inherit dohStamps;
+        };
         # The ThingSpeak reporter. Several of its subtests have to wait out an interval
         # boundary -- a run reads the *previous* whole interval -- so this is the leg that
         # matters for iterating on it, and its aarch64 twin gets the longer ceiling.
@@ -1185,9 +1246,9 @@
       # monitoring-nix-gc and monitoring-iroh-ssh are host-input-free module unit tests
       # (tests/monitoring/{nix-gc,iroh-ssh}.nix build their own node and take no host
       # module); anya enables common.monitoring and common.irohSsh too, so they are here
-      # for scheduling, not ownership. connectivity-fallback-timing and monitoring-platform-*
-      # do belong to the Pi: it is the only host that deploys either. All four have an
-      # aarch64 twin in the rpi5 set, which evaluates a different nixpkgs; these are the
+      # for scheduling, not ownership. connectivity-fallback-timing, monitoring-platform-* and
+      # pw-mgr do belong to the Pi: it is the only host that deploys any of them. All of them
+      # have an aarch64 twin in the rpi5 set, which evaluates a different nixpkgs; these are the
       # fast x86 runs.
       // {
         monitoring-nix-gc = monitoringNixGcTest;
@@ -1202,7 +1263,9 @@
         (name: test: nixpkgs.lib.nameValuePair
           (if name == "platform" then "monitoring-platform" else "monitoring-platform-${name}")
           test)
-        monitoringPlatformTestsX86));
+        monitoringPlatformTestsX86)
+      # Upstream's one pw-mgr test, under its aarch64 twin's name for the same reason.
+      // { pw-mgr = pwMgrTestX86; });
 
       # NOT CI COVERAGE. Everything from here down that runs on commonDesktopModule exists
       # only to back a <name>-driver / -driver-interactive package below: they are the
