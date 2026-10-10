@@ -49,19 +49,33 @@ filtered for only the useful drives
     * total_bytes: f_blocks * f_frsize
     * free_bytes: f_bfree * f_frsize
     * available_bytes: f_bavail * f_frsize
+    * lifetime_written_bytes: /sys/fs/<fstype>/<dev>/lifetime_write_kbytes * 1024,
+      ext4 and f2fs only; persists across reboots; <dev> is the block device the mount
+      sits on (mmcblk0p2, dm-0 under LUKS)
 
 #### drive
 
-for every SMART-capable drives
+for every physical block device: whole disks under /sys/block with a `device` link
 
 * attributes:
     * sn: drive serial number
     * model
-    * kind: nvme | sata
+    * kind: nvme | sata | usb | sd | emmc
 * body:
-    * passed
-    * power_on_hours
-* sub measurements:
+    * device: kernel name (nvme0n1, sda, mmcblk0) -- a body field, not an attribute,
+      because the name is not stable across boots
+    * read_bytes: /sys/block/<dev>/stat sectors read * 512
+    * written_bytes: sectors written * 512
+    * discarded_bytes: sectors discarded * 512
+    * reads: reads completed
+    * writes: writes completed
+    * flushes: flush requests completed
+    * read_time_ms: time spent reading
+    * write_time_ms: time spent writing
+    * io_time_ms: time the device had I/O in flight
+    * passed: SMART, when enabled
+    * power_on_hours: SMART, when enabled
+* sub measurements: (only if drive has SMART)
     * nvme: if the drive is nvme
         * attributes:
             * sn: drive serial number
