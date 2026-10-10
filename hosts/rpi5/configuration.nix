@@ -57,6 +57,7 @@ in
     ../../modules/connectivity-watchdog.nix
     ../../modules/iroh-ssh.nix
     ../../modules/monitoring-platform-tunnel.nix
+    ../../modules/pw-mgr-tunnel.nix
     ../../modules/thingspeak.nix
     ../../modules/required-kernel-modules.nix
     # Same default-deny inbound firewall as the laptops (nftables backend,
@@ -423,6 +424,49 @@ in
       RandomizedDelaySec = "1h";
     };
   };
+
+  # The password manager's backend (github:sashee/pw-mgr): passkey users and per-user blob
+  # storage in one SQLite file under /var/lib/pw-mgr, serving the frontend from the same socket.
+  # Every vault is encrypted in the browser, so this host stores opaque bytes. Like the receiver
+  # above, the module comes from its input via rpi5HostModules (see flake.nix), and it listens
+  # on a unix socket only -- no port for the firewall to open, access gated by membership of
+  # the `pw-mgr` group. Browsers reach it through the tunnel below and nothing else.
+  services.pw-mgr.enable = true;
+
+  # The "iroh path" of pw-mgr's backend/SPEC.md §3.1 (see modules/pw-mgr-tunnel.nix): an
+  # iroh endpoint forwarding to the backend's socket. Its own secret, not the ssh tunnel's or
+  # the receiver's, because all three listeners answer the same ALPN (the module asserts this).
+  #
+  # Provision out-of-band, ON THIS HOST -- a missing blob leaves the unit *skipped* by
+  # ConditionPathExists rather than failed (common.systemMetrics watches it for that reason):
+  #   install -d -m 0700 /etc/credentials/pw-mgr-tunnel
+  #   iroh-ssh-generate-secret \
+  #   | systemd-creds encrypt --name=iroh-secret - /etc/credentials/pw-mgr-tunnel/iroh-secret
+  #
+  # The ticket every device saves is a pure function of the secret, so this re-prints it any
+  # time. Paste it into iroh-webview-app on Android; on a laptop run
+  # `iroh-uds-connect <sock> <ticket>` with `socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr
+  # UNIX-CONNECT:<sock>` in front of it, and point the browser at http://localhost:8080:
+  #   systemd-creds decrypt --name=iroh-secret /etc/credentials/pw-mgr-tunnel/iroh-secret - \
+  #   | iroh-ssh-ticket /dev/stdin
+  #
+  # Users come from the module's admin wrapper, run as root; it switches to the service user
+  # itself, for the WAL-ownership reason given on the receiver's create-api-key above. Each
+  # prints a setup token, valid for 15 minutes, to open as http://localhost:<port>/#setup=<token>
+  # through the shim (or paste on the app's start screen):
+  #   pw-mgr user create <name>           # a new user
+  #   pw-mgr setup-token create <name>    # another device for an existing one
+  common.pwMgrTunnel = {
+    enable = true;
+    credentialDirectory = "/etc/credentials/pw-mgr-tunnel";
+  };
+
+  # No backup of the vault yet: spec/features/pw-mgr/pw-mgr.md marks it PROVISIONAL until there
+  # is a repository. A defined backup without credentials would not just skip -- common.monitoring
+  # reports a backup with no recorded success as [FAIL] from its first run, failing the whole
+  # Healthchecks report. When it lands, it is the receiver's block above with this service's user,
+  # /var/lib/pw-mgr, stopServices = [ "pw-mgr.service" ] and its own credential directory -- and
+  # tests/monitoring/rpi.nix has to provision it too, since its OK run asserts every backup.
 
   networking.wireless.iwd.enable = true;
   common.connectivityFallback.enable = true;

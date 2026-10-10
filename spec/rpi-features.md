@@ -63,6 +63,10 @@
 
 * [monitoring platform](./features/monitoring-platform/monitoring-platform.md)
 
+## Pw-mgr
+
+* [pw-mgr](./features/pw-mgr/pw-mgr.md)
+
 ## Thingspeak solar reporting
 
 * a timer that fires every minute
