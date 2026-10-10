@@ -11,6 +11,7 @@
 //! batch -- meant an unreadable `flake.lock` could cost a tick's CPU, memory and filesystem
 //! samples, letting the least important field destroy the most important data.
 
+mod block;
 mod chrony;
 mod collect;
 mod dnscrypt;
@@ -119,7 +120,8 @@ usage: system-metrics [options]
                             default -- the list is owned by the NixOS module so there is only
                             one copy of it
   --cpu-sample-seconds N    seconds between the two /proc/stat samples (default: 1)
-  --sysfs-root PATH         root of sysfs, for the zram sweep (default: /sys)
+  --sysfs-root PATH         root of sysfs, for the zram sweep, the block devices and the
+                            filesystems' lifetime writes (default: /sys)
   --hwmon-root PATH         hwmon class directory (default: <sysfs-root>/class/hwmon)
   --profiles-dir PATH       nix profiles directory (default: /nix/var/nix/profiles)
   --flake-lock PATH         deployed flake.lock; without it the common_* fields are null
@@ -154,7 +156,7 @@ usage: system-metrics [options]
                             systemctl because timer elapse properties are only machine-readable
                             over the bus
   --journalctl PATH         journalctl binary; without it no journal or dns_provider records
-  --smartctl PATH           smartctl binary; without it no drive records
+  --smartctl PATH           smartctl binary; without it drive records carry no SMART data
   --nft PATH                nft binary; without it port_22_open is null
   --chronyc PATH            chronyc binary; without it no time_provider records
   --dry-run                 print the batch instead of posting it
@@ -384,7 +386,7 @@ fn memory_record(sysfs_root: &Path) -> Record {
 /// One record per distinct filesystem. Bind mounts and the NixOS read-only `/nix/store` remount
 /// report the same `f_fsid` as the filesystem they come from, so keeping only the first
 /// mountpoint per fsid stops one disk being counted several times over.
-fn filesystem_records(exclude_fstypes: &[String]) -> Vec<Record> {
+fn filesystem_records(exclude_fstypes: &[String], sysfs_root: &Path) -> Vec<Record> {
     let Some(mounts) = read("/proc/mounts") else {
         return Vec::new();
     };
@@ -414,10 +416,41 @@ fn filesystem_records(exclude_fstypes: &[String]) -> Vec<Record> {
                 .with_attr("fstype", Value::str(&mount.fstype))
                 .with_field("total_bytes", Value::Int(usage.total as i64))
                 .with_field("free_bytes", Value::Int(usage.free as i64))
-                .with_field("available_bytes", Value::Int(usage.available as i64)),
+                .with_field("available_bytes", Value::Int(usage.available as i64))
+                .with_field("lifetime_written_bytes", lifetime_written_bytes(sysfs_root, &mount)),
         );
     }
     records
+}
+
+/// What the filesystem itself has counted as written to its block device since it was created,
+/// kept in the superblock and so carried across reboots. ext4 and f2fs only.
+///
+/// The block device is found through the mountpoint's `st_dev`, not the `/proc/mounts` source,
+/// which may be a `/dev/disk/by-*` link or a `/dev/mapper` name: this unit's `/dev` is private, so
+/// neither would resolve, while `/sys/dev/block/<major>:<minor>` names the device either way
+/// (`mmcblk0p2`, or `dm-0` under LUKS).
+fn lifetime_written_bytes(sysfs_root: &Path, mount: &collect::Mount) -> Option<Value> {
+    if !matches!(mount.fstype.as_str(), "ext4" | "f2fs") {
+        return None;
+    }
+    let dev = rustix::fs::stat(Path::new(&mount.mountpoint)).ok()?.st_dev.into();
+    let device = fs::read_link(sysfs_root.join(format!(
+        "dev/block/{}:{}",
+        rustix::fs::major(dev),
+        rustix::fs::minor(dev)
+    )))
+    .ok()?;
+    let kib: u64 = read_trimmed(
+        sysfs_root
+            .join("fs")
+            .join(&mount.fstype)
+            .join(device.file_name()?)
+            .join("lifetime_write_kbytes"),
+    )?
+    .parse()
+    .ok()?;
+    Some(Value::Int(kib.saturating_mul(1024) as i64))
 }
 
 /// Every hwmon chip's readable attributes, one record per attribute.
@@ -493,52 +526,159 @@ fn sensor_records(hwmon_root: &Path) -> Vec<Record> {
     records
 }
 
-/// One `system.drive` per SMART-capable device, plus a family-specific sub measurement.
-///
-/// The families are separate measurement types rather than one record with a `kind` attribute
-/// because `type` is the only indexed column in the receiver's store: as `system.drive.nvme` a
-/// query for wear rides the index, while as an attribute it would scan every row ever written.
-fn drive_records(smartctl: &Path) -> Vec<Record> {
+/// Where udev keeps what it learned about each device, keyed `b<major>:<minor>` for block devices.
+const UDEV_DATA: &str = "/run/udev/data";
+
+/// A whole disk as the block layer sees it, before any SMART data is matched to it.
+struct Disk {
+    name: String,
+    kind: Option<smart::DriveKind>,
+    serial: Option<String>,
+    model: Option<String>,
+    stat: Option<block::Stat>,
+}
+
+/// Every physical block device: the entries of `/sys/block` with a `device` link. Partitions are
+/// not under `/sys/block` at all, and loop, ram, zram, dm and md devices are virtual, with no
+/// device behind them -- which is what keeps zram, already counted under `system.memory`, from
+/// being reported as a drive.
+fn block_disks(sysfs_root: &Path) -> Vec<Disk> {
+    let block_dir = sysfs_root.join("block");
+    let Ok(entries) = fs::read_dir(&block_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> =
+        entries.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    // Stable record order between runs, as for the sensors.
+    names.sort();
+
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let dir = block_dir.join(&name);
+            let device = dir.join("device");
+            fs::symlink_metadata(&device).ok()?;
+            let sysfs_path = fs::canonicalize(&dir)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let kind = block::drive_kind(&name, &sysfs_path, read_trimmed(device.join("type")).as_deref());
+            let (serial, model) = disk_identity(&name, &dir);
+            let stat = read(dir.join("stat")).as_deref().and_then(block::parse_stat);
+            Some(Disk { name, kind, serial, model, stat })
+        })
+        .collect()
+}
+
+/// Serial and model from wherever this kind of disk keeps them, for the drives SMART does not
+/// cover -- and the serial is also what SMART is matched on, for the ones it does.
+fn disk_identity(name: &str, dir: &Path) -> (Option<String>, Option<String>) {
+    if name.starts_with("sd") {
+        // A SCSI disk's sysfs model is the 16-character INQUIRY field and it has no serial file at
+        // all; udev's database has both whole.
+        let entry = read_trimmed(dir.join("dev")).and_then(|dev| read(Path::new(UDEV_DATA).join(format!("b{dev}"))));
+        let serial = entry.as_deref().and_then(|e| block::udev_property(e, "ID_SERIAL_SHORT"));
+        let model = entry
+            .as_deref()
+            .and_then(|e| block::udev_property(e, "ID_MODEL_ENC"))
+            .map(|m| block::decode_udev_enc(&m));
+        (block::identity(serial), block::identity(model))
+    } else {
+        // NVMe and MMC keep both on the device (the controller, the card: `model` on one, `name`
+        // on the other); virtio-blk keeps a serial on the disk itself and has no model.
+        let serial = read(dir.join("device/serial")).or_else(|| read(dir.join("serial")));
+        let model = read(dir.join("device/model")).or_else(|| read(dir.join("device/name")));
+        (block::identity(serial), block::identity(model))
+    }
+}
+
+/// What `smartctl` reports, one entry per device it can talk to.
+fn smart_drives(smartctl: &Path) -> Vec<smart::Drive> {
     let Some(scan) = output(smartctl, &["--scan-open", "--json"]) else {
         return Vec::new();
     };
 
-    let mut records = Vec::new();
-    for device in smart::parse_scan(&scan) {
-        let mut args = vec!["--json", "--health", "--all"];
-        if let Some(dev_type) = &device.dev_type {
-            args.push("-d");
-            args.push(dev_type);
+    smart::parse_scan(&scan)
+        .iter()
+        .filter_map(|device| {
+            let mut args = vec!["--json", "--health", "--all"];
+            if let Some(dev_type) = &device.dev_type {
+                args.push("-d");
+                args.push(dev_type);
+            }
+            args.push(&device.name);
+
+            // smartctl exits non-zero for conditions that are still perfectly readable (bit 2 is
+            // "some SMART command failed"), so the JSON is parsed regardless of status.
+            let text = Command::new(smartctl)
+                .args(&args)
+                .output()
+                .ok()
+                .and_then(|out| String::from_utf8(out.stdout).ok())?;
+            smart::parse_smart(&text)
+        })
+        .collect()
+}
+
+/// One `system.drive` per physical block device, plus a family-specific sub measurement for the
+/// ones SMART reports on.
+///
+/// SMART is matched to a disk by serial, not by name: smartctl addresses an NVMe drive by its
+/// controller (`/dev/nvme0`) while the block device is the namespace (`nvme0n1`), and the serial is
+/// what both agree on. A matched drive keeps SMART's serial and model as its identity -- the
+/// identity its records carried before the block counters were added -- and takes its `kind` from
+/// the block layer, which can say `usb` where SMART, looking through the bridge, says `sata`.
+///
+/// The families are separate measurement types rather than one record with a `kind` attribute
+/// because `type` is the only indexed column in the receiver's store: as `system.drive.nvme` a
+/// query for wear rides the index, while as an attribute it would scan every row ever written.
+fn drive_records(sysfs_root: &Path, smartctl: Option<&Path>) -> Vec<Record> {
+    let smart = smartctl.map(smart_drives).unwrap_or_default();
+    let disks = block_disks(sysfs_root);
+
+    let matches = |disk: &Disk, drive: &smart::Drive| drive.serial.is_some() && drive.serial == disk.serial;
+    for drive in &smart {
+        if !disks.iter().any(|disk| matches(disk, drive)) {
+            eprintln!(
+                "smartctl reports a drive no block device carries (serial {:?}); not reported",
+                drive.serial
+            );
         }
-        args.push(&device.name);
+    }
 
-        // smartctl exits non-zero for conditions that are still perfectly readable (bit 2 is
-        // "some SMART command failed"), so the JSON is parsed regardless of status.
-        let Some(text) = Command::new(smartctl)
-            .args(&args)
-            .output()
-            .ok()
-            .and_then(|out| String::from_utf8(out.stdout).ok())
-        else {
-            continue;
-        };
-        let Some(drive) = smart::parse_smart(&text) else {
-            continue;
-        };
-
+    let mut records = Vec::new();
+    for disk in &disks {
+        let drive = smart.iter().find(|drive| matches(disk, drive));
+        let serial = drive.and_then(|d| d.serial.clone()).or_else(|| disk.serial.clone());
+        let model = drive.and_then(|d| d.model.clone()).or_else(|| disk.model.clone());
         let identify = |record: Record| {
             record
-                .with_attr("sn", drive.serial.clone().map(Value::Str))
-                .with_attr("model", drive.model.clone().map(Value::Str))
+                .with_attr("sn", serial.clone().map(Value::Str))
+                .with_attr("model", model.clone().map(Value::Str))
         };
 
+        let stat = disk.stat;
+        let count = |n: u64| Value::Int(n as i64);
+        let bytes = |sectors: u64| count(sectors.saturating_mul(block::SECTOR_BYTES));
         records.push(
             identify(Record::new("system.drive"))
-                .with_attr("kind", drive.kind.map(|k| Value::str(k.as_str())))
-                .with_field("passed", drive.passed.map(Value::Bool))
-                .with_field("power_on_hours", drive.power_on_hours.map(Value::Int)),
+                .with_attr("kind", disk.kind.or(drive.and_then(|d| d.kind)).map(|k| Value::str(k.as_str())))
+                .with_field("device", Value::str(&disk.name))
+                .with_field("read_bytes", stat.map(|s| bytes(s.read_sectors)))
+                .with_field("written_bytes", stat.map(|s| bytes(s.write_sectors)))
+                .with_field("discarded_bytes", stat.and_then(|s| s.discard_sectors).map(bytes))
+                .with_field("reads", stat.map(|s| count(s.reads)))
+                .with_field("writes", stat.map(|s| count(s.writes)))
+                .with_field("flushes", stat.and_then(|s| s.flushes).map(count))
+                .with_field("read_time_ms", stat.map(|s| count(s.read_ms)))
+                .with_field("write_time_ms", stat.map(|s| count(s.write_ms)))
+                .with_field("io_time_ms", stat.map(|s| count(s.io_ms)))
+                .with_field("passed", drive.and_then(|d| d.passed).map(Value::Bool))
+                .with_field("power_on_hours", drive.and_then(|d| d.power_on_hours).map(Value::Int)),
         );
 
+        let Some(drive) = drive else {
+            continue;
+        };
         if let Some(nvme) = &drive.nvme {
             records.push(
                 identify(Record::new("system.drive.nvme"))
@@ -955,12 +1095,12 @@ fn run(options: Options) -> Result<(), String> {
         records.push(memory_record(&options.sysfs_root));
     }
     if options.wants("system.filesystem") {
-        records.extend(filesystem_records(&options.exclude_fstypes));
+        records.extend(filesystem_records(&options.exclude_fstypes, &options.sysfs_root));
     }
-    if let Some(smartctl) = &options.smartctl {
-        if options.wants("system.drive") {
-            records.extend(drive_records(smartctl));
-        }
+    // Every host, SMART or not: the block counters need no tool and no capability, and SMART only
+    // adds to the records of the drives it can talk to.
+    if options.wants("system.drive") {
+        records.extend(drive_records(&options.sysfs_root, options.smartctl.as_deref()));
     }
     if options.wants("system.generation") {
         records.push(generation_record(&options.profiles_dir));
@@ -1262,6 +1402,53 @@ mod tests {
     #[test]
     fn sensor_and_drive_sweeps_are_empty_rather_than_failing_without_hardware() {
         assert!(sensor_records(Path::new("/nonexistent")).is_empty());
-        assert!(drive_records(Path::new("/nonexistent/smartctl")).is_empty());
+        assert!(drive_records(Path::new("/nonexistent"), Some(Path::new("/nonexistent/smartctl"))).is_empty());
+        assert!(drive_records(Path::new("/nonexistent"), None).is_empty());
+    }
+
+    /// A disk is reported whether or not anything can talk SMART to it, and only what has a
+    /// device behind it is a disk. The tree is the shape of a test VM's: a virtio disk, which has
+    /// no spec'd kind and keeps its serial on the disk itself, next to a loop device.
+    #[test]
+    fn every_physical_disk_is_a_drive_with_its_counters() {
+        let root = std::env::temp_dir().join(format!("system-metrics-block-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let vda = root.join("block/vda");
+        fs::create_dir_all(root.join("devices/virtio1")).unwrap();
+        fs::create_dir_all(&vda).unwrap();
+        std::os::unix::fs::symlink(root.join("devices/virtio1"), vda.join("device")).unwrap();
+        fs::write(vda.join("serial"), "root\n").unwrap();
+        fs::write(vda.join("stat"), "10 0 80 5 20 0 160 7 0 9 12 0 0 4 0 3 1\n").unwrap();
+        fs::create_dir_all(root.join("block/loop0")).unwrap();
+        fs::write(root.join("block/loop0/stat"), "1 0 8 1 0 0 0 0 0 1 1\n").unwrap();
+
+        let records = drive_records(&root, None);
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(records.len(), 1, "{records:?}");
+        let drive = &records[0];
+        assert_eq!(drive.event_name, "system.drive");
+        assert_eq!(
+            drive.attributes,
+            vec![
+                ("sn".to_owned(), Value::str("root")),
+                ("model".to_owned(), Value::Null),
+                ("kind".to_owned(), Value::Null),
+            ]
+        );
+        let body: BTreeMap<&str, &Value> = drive.body.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        assert_eq!(body["device"], &Value::str("vda"));
+        assert_eq!(body["read_bytes"], &Value::Int(80 * 512));
+        assert_eq!(body["written_bytes"], &Value::Int(160 * 512));
+        assert_eq!(body["discarded_bytes"], &Value::Int(4 * 512));
+        assert_eq!(body["reads"], &Value::Int(10));
+        assert_eq!(body["writes"], &Value::Int(20));
+        assert_eq!(body["flushes"], &Value::Int(3));
+        assert_eq!(body["read_time_ms"], &Value::Int(5));
+        assert_eq!(body["write_time_ms"], &Value::Int(7));
+        assert_eq!(body["io_time_ms"], &Value::Int(9));
+        // No SMART: the keys stay, as nulls.
+        assert_eq!(body["passed"], &Value::Null);
+        assert_eq!(body["power_on_hours"], &Value::Null);
     }
 }

@@ -100,6 +100,16 @@ nixpkgs.lib.nixos.runTest {
     common.monitoring.enable = lib.mkForce false;
     common.irohSsh.enable = lib.mkForce false;
 
+    # The two drives the fake smartctl below reports, as block devices: SMART is matched to a disk
+    # by serial, and the guest otherwise has only its root disk (serial "root", no SMART -- the
+    # Pi's case). null-co reads zeroes and drops writes, so there is no image file to make.
+    virtualisation.qemu.options = [
+      "-blockdev driver=null-co,node-name=smart-nvme,size=1073741824,read-zeroes=on"
+      "-device virtio-blk-pci,drive=smart-nvme,serial=NVME-SERIAL-1"
+      "-blockdev driver=null-co,node-name=smart-sata,size=1073741824,read-zeroes=on"
+      "-device virtio-blk-pci,drive=smart-sata,serial=SATA-SERIAL-2"
+    ];
+
     # Restored, not overridden: qemu-vm.nix disables timesyncd on every test node. mkForce
     # because that definition is at normal priority, so a plain `true` fails to merge.
     #
@@ -916,6 +926,51 @@ nixpkgs.lib.nixos.runTest {
         # A drive family never contributes to the other's record.
         assert not by_attr(measurements, "system.drive.sata", "sn", "NVME-SERIAL-1")
         assert not by_attr(measurements, "system.drive.nvme", "sn", "SATA-SERIAL-2")
+
+    with subtest("every physical disk is a drive, with the kernel's counters"):
+        drives = [m for m in measurements if m["type"] == "system.drive"]
+        devices = {d["body"]["device"] for d in drives}
+        # The root disk and the two SMART ones. QEMU's empty floppy and CD drives (fd0, sr0) have a
+        # device behind them too, so the spec's rule counts them; nothing virtual does: no zram
+        # (system.memory counts it), no loop, no ram, no device-mapper or md.
+        assert {"vda", "vdb", "vdc"} <= devices, devices
+        virtual = {d for d in devices if d.startswith(("zram", "loop", "ram", "dm-", "md"))}
+        assert not virtual, f"virtual block devices reported as drives: {virtual}"
+
+        root = by_attr(measurements, "system.drive", "sn", "root")
+        assert len(root) == 1, root
+        root = root[0]
+        # A disk SMART cannot talk to still gets a record, as the Pi's SD card does: no SMART
+        # values, and no kind, because virtio is not one of the spec'd kinds.
+        assert root["body"]["passed"] is None and root["body"]["power_on_hours"] is None, root
+        assert root["attributes"]["record.attributes.kind"] is None, root
+        assert set(root["body"]) == {
+            "device", "read_bytes", "written_bytes", "discarded_bytes", "reads", "writes",
+            "flushes", "read_time_ms", "write_time_ms", "io_time_ms", "passed", "power_on_hours",
+        }, root
+
+        # Booting reads and writes the root disk, so all of these are real, nonzero counts...
+        for field in ["read_bytes", "written_bytes", "reads", "writes", "io_time_ms"]:
+            assert root["body"][field] > 0, (field, root)
+        # ...and they are the kernel's own, in bytes: never ahead of a fresh read of the same
+        # counters, which have only grown since the record was taken.
+        now = [int(f) for f in machine.succeed("cat /sys/block/vda/stat").split()]
+        assert root["body"]["read_bytes"] <= now[2] * 512, (root, now)
+        assert root["body"]["written_bytes"] <= now[6] * 512, (root, now)
+        assert root["body"]["writes"] <= now[4], (root, now)
+        assert root["body"]["written_bytes"] % 512 == 0, root
+
+        # The SMART ones carry both: the block counters of the disk the serial names.
+        nvme = by_attr(measurements, "system.drive", "sn", "NVME-SERIAL-1")[0]
+        assert nvme["body"]["device"] in {"vdb", "vdc"}, nvme
+        assert nvme["body"]["reads"] is not None, nvme
+
+    with subtest("the root filesystem reports its own lifetime writes"):
+        # ext4's count, found through the mountpoint's device number: the unit's /dev is private,
+        # so the /proc/mounts source would not resolve.
+        lifetime = roots[0]["body"]["lifetime_written_bytes"]
+        assert lifetime is not None and lifetime > 0, roots[0]
+        assert lifetime % 1024 == 0, roots[0]
 
     with subtest("port 22 is reported closed until the failsafe opens it"):
         failsafe = bodies(measurements, "system.iroh_failsafe")[0]
