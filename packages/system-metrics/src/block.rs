@@ -107,6 +107,52 @@ pub fn decode_udev_enc(encoded: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Whether smartctl's device name addresses this block device: the same node (`/dev/sda` is `sda`),
+/// or the NVMe controller (`/dev/nvme0`) of one of its namespaces (`nvme0n1`) -- which is how
+/// `--scan-open` names NVMe drives.
+pub fn smart_name_matches(scan_name: &str, disk: &str) -> bool {
+    let Some(node) = scan_name.strip_prefix("/dev/") else {
+        return false;
+    };
+    let namespace_of = |controller: &str| {
+        controller.starts_with("nvme")
+            && disk
+                .strip_prefix(controller)
+                .and_then(|rest| rest.strip_prefix('n'))
+                .is_some_and(|ns| !ns.is_empty() && ns.bytes().all(|b| b.is_ascii_digit()))
+    };
+    node == disk || namespace_of(node)
+}
+
+/// For each disk, which SMART report (by index) describes it, given `(name, serial)` for both.
+///
+/// By serial first: it is what the block layer and smartctl agree on even where their names do not.
+/// Then by name, for the reports no serial claimed -- the safety net for a serial the two sides
+/// spell differently (a USB bridge's own serial in udev, the drive's through SAT), which would
+/// otherwise drop that drive's SMART data with nothing but a log line to show for it. A report a
+/// serial already claimed is never handed to a second disk by name.
+pub fn match_smart(disks: &[(&str, Option<&str>)], smart: &[(&str, Option<&str>)]) -> Vec<Option<usize>> {
+    let by_serial: Vec<Option<usize>> = disks
+        .iter()
+        .map(|(_, serial)| serial.and_then(|s| smart.iter().position(|(_, sn)| *sn == Some(s))))
+        .collect();
+    disks
+        .iter()
+        .zip(&by_serial)
+        .map(|((disk, _), matched)| {
+            matched.or_else(|| {
+                smart
+                    .iter()
+                    .enumerate()
+                    .find(|(i, (scan_name, _))| {
+                        !by_serial.contains(&Some(*i)) && smart_name_matches(scan_name, disk)
+                    })
+                    .map(|(i, _)| i)
+            })
+        })
+        .collect()
+}
+
 /// Identity strings as smartctl reports them: trimmed, and nothing at all rather than an empty
 /// string. sysfs pads NVMe models with trailing spaces to the field width, so an untrimmed model
 /// would name the same drive differently from the SMART record of it.
@@ -187,6 +233,49 @@ mod tests {
         assert_eq!(decode_udev_enc("Samsung\\x20SSD\\x20860"), "Samsung SSD 860");
         // Not an escape: kept as it is.
         assert_eq!(decode_udev_enc("a\\xZZb\\"), "a\\xZZb\\");
+    }
+
+    #[test]
+    fn smart_names_address_the_node_or_the_nvme_controller() {
+        assert!(smart_name_matches("/dev/sda", "sda"));
+        assert!(smart_name_matches("/dev/nvme0", "nvme0n1"));
+        assert!(smart_name_matches("/dev/nvme0", "nvme0n12"));
+        assert!(smart_name_matches("/dev/nvme0n1", "nvme0n1"));
+        // nvme1 is not nvme10's controller, and a partition-shaped tail is not a namespace.
+        assert!(!smart_name_matches("/dev/nvme1", "nvme10n1"));
+        assert!(!smart_name_matches("/dev/nvme0", "nvme0n1p1"));
+        assert!(!smart_name_matches("/dev/sda", "sdb"));
+        assert!(!smart_name_matches("/dev/sd", "sda"));
+        assert!(!smart_name_matches("sda", "sda"));
+    }
+
+    #[test]
+    fn smart_is_matched_by_serial_first() {
+        // The test VM: virtio disks whose serials the fake smartctl reports under other names.
+        let disks = [("vda", Some("root")), ("vdb", Some("NVME-SERIAL-1")), ("vdc", Some("SATA-SERIAL-2"))];
+        let smart = [("/dev/nvme0", Some("NVME-SERIAL-1")), ("/dev/sda", Some("SATA-SERIAL-2"))];
+        assert_eq!(match_smart(&disks, &smart), vec![None, Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn a_serial_spelled_differently_falls_back_to_the_name() {
+        // A USB disk: udev has the bridge's serial, smartctl the drive's through SAT.
+        assert_eq!(match_smart(&[("sda", Some("BRIDGE-1"))], &[("/dev/sda", Some("ATA-123"))]), vec![Some(0)]);
+        // And an NVMe namespace with no serial readable at all.
+        assert_eq!(match_smart(&[("nvme0n1", None)], &[("/dev/nvme0", Some("X"))]), vec![Some(0)]);
+    }
+
+    #[test]
+    fn a_report_claimed_by_serial_is_not_handed_to_another_disk_by_name() {
+        // /dev/sda's report carries sdb's serial: it is sdb's, and sda gets none.
+        let disks = [("sda", Some("S2")), ("sdb", Some("S1"))];
+        assert_eq!(match_smart(&disks, &[("/dev/sda", Some("S1"))]), vec![None, Some(0)]);
+    }
+
+    #[test]
+    fn a_disk_with_no_report_has_none() {
+        assert_eq!(match_smart(&[("mmcblk0", Some("0x30645aea"))], &[]), vec![None]);
+        assert_eq!(match_smart(&[], &[("/dev/sda", Some("S1"))]), Vec::<Option<usize>>::new());
     }
 
     #[test]

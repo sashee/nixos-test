@@ -393,7 +393,10 @@ in
     sysfsRoot = lib.mkOption {
       type = lib.types.path;
       default = "/sys";
-      description = "Root of sysfs, under which the zram devices are found.";
+      description = ''
+        Root of sysfs: where the zram devices, the block devices behind `system.drive`, and the
+        filesystems' lifetime write counters are read.
+      '';
     };
 
     hwmonRoot = lib.mkOption {
@@ -633,7 +636,10 @@ in
 
     smart = {
       enable = lib.mkEnableOption ''
-        reporting SMART health as `system.drive`.
+        adding SMART health to the `system.drive` records -- `passed`, `power_on_hours`, and the
+        `system.drive.nvme` / `system.drive.sata` sub measurements. The drive records themselves,
+        with the block layer's I/O counters, are produced on every host either way: they come from
+        sysfs, which this unit can read as it stands.
 
         Off by default because it is the one collector that cannot run inside this unit's
         sandbox as it stands: smartctl needs raw access to the block device, so enabling this
@@ -773,8 +779,10 @@ in
         interval doubles both.
 
         If that becomes the binding constraint, the cheapest saving is per-record cadence rather
-        than a slower timer: `system.drive` changes on the scale of days and is sampled 96 times
-        a day purely because it shares this schedule.
+        than a slower timer: SMART health (`passed`, `power_on_hours`, the `system.drive.nvme` /
+        `.sata` sub measurements) changes on the scale of days and is sampled 96 times a day purely
+        because it shares this schedule. Not the drives' I/O counters, though: they are only worth
+        their resolution, and a slower cadence would hide exactly the bursts they exist to show.
 
         Deliberately no `Persistent`: a measurement describes the moment it was taken, so
         catching up on samples missed while the host was off would record the present under
