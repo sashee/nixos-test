@@ -591,8 +591,9 @@ fn disk_identity(name: &str, dir: &Path) -> (Option<String>, Option<String>) {
     }
 }
 
-/// What `smartctl` reports, one entry per device it can talk to.
-fn smart_drives(smartctl: &Path) -> Vec<smart::Drive> {
+/// What `smartctl` reports, one entry per device it can talk to, with the device name `--scan-open`
+/// gave it.
+fn smart_drives(smartctl: &Path) -> Vec<(String, smart::Drive)> {
     let Some(scan) = output(smartctl, &["--scan-open", "--json"]) else {
         return Vec::new();
     };
@@ -614,7 +615,7 @@ fn smart_drives(smartctl: &Path) -> Vec<smart::Drive> {
                 .output()
                 .ok()
                 .and_then(|out| String::from_utf8(out.stdout).ok())?;
-            smart::parse_smart(&text)
+            Some((device.name.clone(), smart::parse_smart(&text)?))
         })
         .collect()
 }
@@ -622,9 +623,10 @@ fn smart_drives(smartctl: &Path) -> Vec<smart::Drive> {
 /// One `system.drive` per physical block device, plus a family-specific sub measurement for the
 /// ones SMART reports on.
 ///
-/// SMART is matched to a disk by serial, not by name: smartctl addresses an NVMe drive by its
-/// controller (`/dev/nvme0`) while the block device is the namespace (`nvme0n1`), and the serial is
-/// what both agree on. A matched drive keeps SMART's serial and model as its identity -- the
+/// SMART is matched to a disk by serial first and by name only as a fallback (`block::match_smart`):
+/// smartctl addresses an NVMe drive by its controller (`/dev/nvme0`) while the block device is the
+/// namespace (`nvme0n1`), and the serial is what both agree on. A matched drive keeps SMART's serial
+/// and model as its identity -- the
 /// identity its records carried before the block counters were added -- and takes its `kind` from
 /// the block layer, which can say `usb` where SMART, looking through the bridge, says `sata`.
 ///
@@ -635,19 +637,22 @@ fn drive_records(sysfs_root: &Path, smartctl: Option<&Path>) -> Vec<Record> {
     let smart = smartctl.map(smart_drives).unwrap_or_default();
     let disks = block_disks(sysfs_root);
 
-    let matches = |disk: &Disk, drive: &smart::Drive| drive.serial.is_some() && drive.serial == disk.serial;
-    for drive in &smart {
-        if !disks.iter().any(|disk| matches(disk, drive)) {
+    let matched = block::match_smart(
+        &disks.iter().map(|d| (d.name.as_str(), d.serial.as_deref())).collect::<Vec<_>>(),
+        &smart.iter().map(|(name, d)| (name.as_str(), d.serial.as_deref())).collect::<Vec<_>>(),
+    );
+    for (i, (name, drive)) in smart.iter().enumerate() {
+        if !matched.contains(&Some(i)) {
             eprintln!(
-                "smartctl reports a drive no block device carries (serial {:?}); not reported",
+                "smartctl reports {name} (serial {:?}), which matches no block device; not reported",
                 drive.serial
             );
         }
     }
 
     let mut records = Vec::new();
-    for disk in &disks {
-        let drive = smart.iter().find(|drive| matches(disk, drive));
+    for (disk, matched) in disks.iter().zip(&matched) {
+        let drive = matched.map(|i| &smart[i].1);
         let serial = drive.and_then(|d| d.serial.clone()).or_else(|| disk.serial.clone());
         let model = drive.and_then(|d| d.model.clone()).or_else(|| disk.model.clone());
         let identify = |record: Record| {
