@@ -87,5 +87,13 @@ async fn handle_accept(accepting: Accepting, socket_path: PathBuf) -> Result<()>
         .await
         .std_context(format!("error connecting to {}", socket_path.display()))?;
     let (read, write) = uds.into_split();
-    forward_bidi(read, write, r, s).await
+    forward_bidi(read, write, r, s).await?;
+    // Let the dialing side close the connection, rather than closing it here by returning (the
+    // last handle's drop closes it). Our end of the stream may still be in flight: noq lets a
+    // peer drop data it has received but not yet delivered once a CONNECTION_CLOSE arrives, so
+    // closing now has the dialer's last read fail with "connection lost" -- an error logged for
+    // every request that went fine. The dialer closes once it has read that end, and a dialer
+    // that never does is bounded by the idle timeout.
+    connection.closed().await;
+    Ok(())
 }

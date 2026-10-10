@@ -331,6 +331,30 @@ nixpkgs.lib.nixos.runTest {
         types = {m["type"] for m in measurements()}
         assert "system.host" in types, f"no host record arrived through the tunnel: {types}"
 
+    with subtest("a request that went fine is not logged as an error"):
+        # One connection per request, closed by the client once it has the response: what the
+        # ThingSpeak reporter does every minute, unlike the collector's one kept connection.
+        # The server half used to close the QUIC connection as soon as its side was done, and
+        # noq lets a peer drop undelivered stream data on a CONNECTION_CLOSE -- so the client
+        # half's last read failed with "connection lost" on every request that had succeeded.
+        cursor = machine.succeed("journalctl -q -n 1 --show-cursor -o cat").splitlines()[-1].removeprefix(
+            "-- cursor: "
+        )
+        for _ in range(3):
+            machine.succeed(
+                f"curl -sS --fail-with-body --unix-socket {TUNNEL} {auth_header()}"
+                "'http://localhost/v1/measurements?limit=1'"
+            )
+        # An absence, so there is nothing to wait on. The error, when it happened, was logged the
+        # moment the server half returned; a few seconds covers a slow runner.
+        machine.sleep(5)
+        machine.succeed("journalctl --sync")
+        logged = machine.succeed(
+            "journalctl -q -u mp-tunnel-client.service -u mp-tunnel-server.service"
+            f" --after-cursor='{cursor}' -o cat"
+        )
+        assert "error handling connection" not in logged, f"a successful request logged:\n{logged}"
+
     with subtest("the far side going away costs no data"):
         # What a real split deployment does all the time. The collector's kept
         # HTTP/1.1 connection dies with the tunnel, delivery fails, and the batch

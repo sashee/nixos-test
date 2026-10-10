@@ -401,6 +401,29 @@ nixpkgs.lib.nixos.runTest {
     ).strip()
     assert hostname == "iroh-server", f"unexpected hostname: {hostname}"
 
+    # A session that went fine ends cleanly on both halves. The listener used to close the QUIC
+    # connection the moment sshd hung up, and noq lets a peer drop undelivered stream data on a
+    # CONNECTION_CLOSE, so the ProxyCommand's last read could fail with "connection lost" after a
+    # working session -- the bug tests/monitoring-platform-tunnel.nix pins for the uds pair. Now
+    # the listener waits for the dialer, and the dialer closes its endpoint before exiting, so the
+    # listener's wait ends with the session rather than at the idle timeout.
+    listener_cursor = server.succeed("journalctl -q -n 1 --show-cursor -o cat").splitlines()[-1].removeprefix(
+        "-- cursor: "
+    )
+    session = client.succeed(
+        "ssh -o StrictHostKeyChecking=no"
+        f" -o ProxyCommand='iroh-ssh-connect {published}' root@tunnel hostname 2>&1"
+    )
+    assert "connection lost" not in session, f"a working session reported:\n{session}"
+    # An absence: the error, when it happened, was logged as the session ended.
+    server.sleep(5)
+    server.succeed("journalctl --sync")
+    listener_log = server.succeed(
+        f"journalctl -q -u iroh-ssh.service --after-cursor='{listener_cursor}' -o cat"
+    )
+    assert "error handling connection" not in listener_log, \
+        f"the listener logged a working session as an error:\n{listener_log}"
+
     # Half a rotation is inert. The documented flow (docs/rpi5-rescue.md) stages a
     # new credential under a new directory and only then changes
     # credentialDirectory in the repo, so a host routinely holds a blob it is not

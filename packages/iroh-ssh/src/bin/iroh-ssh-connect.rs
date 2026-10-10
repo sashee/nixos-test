@@ -29,5 +29,10 @@ async fn connect() -> Result<()> {
     s.write_all(&HANDSHAKE).await.anyerr()?;
     forward_bidi(tokio::io::stdin(), tokio::io::stdout(), r, s).await?;
     tokio::io::stdout().flush().await.anyerr()?;
+    // The listener now waits for this side to close, and `run` exits the process the moment we
+    // return -- before the endpoint has sent the CONNECTION_CLOSE a dropped connection only
+    // queues. Without this the listener's connection would sit until the idle timeout. Quick
+    // normally; iroh bounds it at ~3s on a bad link.
+    endpoint.close().await;
     Ok(())
 }

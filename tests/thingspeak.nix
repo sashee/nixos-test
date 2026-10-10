@@ -141,6 +141,21 @@ nixpkgs.lib.nixos.runTest {
         return machine.execute("systemctl start thingspeak.service")[0]
 
 
+    def journal_cursor():
+        # -n 1 rather than -n 0: the cursor is printed after the last entry shown, so with none
+        # shown there is none to print.
+        return machine.succeed("journalctl -q -n 1 --show-cursor -o cat").splitlines()[-1].removeprefix(
+            "-- cursor: "
+        )
+
+
+    def reporter_journal_since(cursor):
+        machine.succeed("journalctl --sync")
+        return machine.succeed(
+            f"journalctl -q -u thingspeak.service --after-cursor='{cursor}' -o cat"
+        ).strip()
+
+
     def report():
         """Drive runs until one actually posts; return its query parameters and exit status.
 
@@ -238,8 +253,16 @@ nixpkgs.lib.nixos.runTest {
         )
         machine.succeed(f"mkdir -p $(dirname {MARKER}) && touch {MARKER}")
 
+        before_first_report = journal_cursor()
         sent, status = report()
         assert status == 0, "the reporter failed on an update the recorder accepted"
+
+    with subtest("a successful run leaves nothing in the journal"):
+        # Every run report() drove, the empty windows' no-ops as well as the one that posted.
+        # Covers systemd's own Starting/Finished/Consumed lines about the unit, not just the
+        # reporter's output: those were most of what a run used to log.
+        logged = reporter_journal_since(before_first_report)
+        assert logged == "", f"a successful run logged:\n{logged}"
 
     with subtest("the update carries the key, an aligned stamp and positional field numbers"):
         assert sent["api_key"] == CHANNEL_KEY, sent
@@ -270,13 +293,17 @@ nixpkgs.lib.nixos.runTest {
                 return False
             if len(sent_requests()) != before:
                 return False
-            # The reporter's own wording as well as the recorder's silence, so a run skipped
-            # for some unrelated reason cannot pass as a deliberate no-op.
-            # Ten lines rather than one: `-u` includes systemd's own Starting/Finished pair
-            # around the run, so the reporter's single line is not the last one.
-            return "nothing to send" in machine.succeed(
-                "journalctl -u thingspeak.service -o cat -n 10"
+            # The run's own state as well as the recorder's silence, so a run skipped for some
+            # unrelated reason cannot pass as a deliberate no-op. Not the reporter's "nothing to
+            # send" line, which a successful run no longer logs: a run whose conditions held and
+            # that exited 0 without posting has only one path through the script.
+            state = dict(
+                line.split("=", 1)
+                for line in machine.succeed(
+                    "systemctl show thingspeak.service -p ConditionResult -p Result"
+                ).splitlines()
             )
+            return state == {"ConditionResult": "yes", "Result": "success"}
 
         # Nothing is produced from here, so the previous whole interval empties out within two
         # boundaries. An empty update -- api_key and created_at and no fields -- would be a
