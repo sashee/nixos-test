@@ -46,11 +46,12 @@ in
       default = false;
       description = ''
         Expose the password manager's backend socket over an iroh endpoint: the
-        "iroh path" of pw-mgr's backend/SPEC.md §3.1, and the only way its browsers
-        reach it. The far end is a local shim on the device the browser runs on --
-        socat in front of `iroh-uds-connect` on a laptop, iroh-webview-app on Android
-        -- so the backend sees plain HTTP on `localhost` or `*.localhost`, which is a
-        secure context and so lets WebAuthn and WebCrypto work.
+        "iroh path" of backend/SPEC.md §3.1 in sashee/e2ee-store (the backend pw-mgr
+        runs on), and the only way its browsers reach it. The far end is a local shim
+        on the device the browser runs on -- socat in front of `iroh-uds-connect` on a
+        laptop, iroh-webview-app on Android -- so the backend sees plain HTTP on
+        `localhost` or `*.localhost`, which is a secure context and so lets WebAuthn
+        and WebCrypto work.
 
         This authenticates nobody: anyone holding the endpoint id can open the pipe.
         The backend does the authenticating (passkeys; setup tokens for a new

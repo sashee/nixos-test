@@ -433,9 +433,10 @@ in
   # the `pw-mgr` group. Browsers reach it through the tunnel below and nothing else.
   services.pw-mgr.enable = true;
 
-  # The "iroh path" of pw-mgr's backend/SPEC.md §3.1 (see modules/pw-mgr-tunnel.nix): an
-  # iroh endpoint forwarding to the backend's socket. Its own secret, not the ssh tunnel's or
-  # the receiver's, because all three listeners answer the same ALPN (the module asserts this).
+  # The "iroh path" of backend/SPEC.md §3.1 in sashee/e2ee-store, the backend pw-mgr runs on
+  # (see modules/pw-mgr-tunnel.nix): an iroh endpoint forwarding to the backend's socket. Its
+  # own secret, not the ssh tunnel's or the receiver's, because all three listeners answer the
+  # same ALPN (the module asserts this).
   #
   # Provision out-of-band, ON THIS HOST -- a missing blob leaves the unit *skipped* by
   # ConditionPathExists rather than failed (common.systemMetrics watches it for that reason):
