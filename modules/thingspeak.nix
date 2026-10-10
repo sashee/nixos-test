@@ -65,26 +65,41 @@ let
         echo "thingspeak: $*"
       }
 
+      # The unit runs with LogLevelMax=notice, which drops every line at info -- and a plain
+      # stdout line is info. So a failure says why at error priority instead: the `<3>` prefix
+      # is the sd-daemon convention journald turns into PRIORITY=3 and strips from the message.
+      # One line only, because the prefix applies to the line it starts.
+      fail() {
+        echo "<3>thingspeak: $*"
+        exit 1
+      }
+
       # Both keys come from systemd, decrypted in PID 1 before this sandbox existed. The
       # explicit unset/unreadable branches are not defensive noise: the unit is conditioned on
       # the blobs existing, so reaching either of these means the credential machinery itself
       # is misconfigured, and that has to read differently in the journal from "nothing to
       # send".
       if [ -z "''${CREDENTIALS_DIRECTORY:-}" ]; then
-        log "CREDENTIALS_DIRECTORY is not set"
-        exit 1
+        fail "CREDENTIALS_DIRECTORY is not set"
       fi
       platform_key_file="$CREDENTIALS_DIRECTORY/${cfg.platform.apiKeyCredential}"
       channel_key_file="$CREDENTIALS_DIRECTORY/${cfg.keyCredential}"
       for f in "$platform_key_file" "$channel_key_file"; do
         if [ ! -r "$f" ]; then
-          log "credential is missing or unreadable: $f"
-          exit 1
+          fail "credential is missing or unreadable: $f"
         fi
       done
 
       work="$(mktemp -d)"
       trap 'rm -rf "$work"' EXIT
+
+      # curl's own --show-error line goes to stderr at info, so it is captured here and carried
+      # in the failure's message rather than dropped with the rest. Flattened to one line, for
+      # the reason on fail().
+      curl_error="$work/curl-error"
+      curl_said() {
+        tr '\n' ' ' < "$curl_error"
+      }
 
       # Secrets go into curl config files, never argv. /proc/<pid>/cmdline is world-readable and
       # the ThingSpeak key would otherwise sit in it inside the URL, which is where the spec
@@ -117,9 +132,9 @@ let
              --config "$auth_conf" \
              --unix-socket "$socket" \
              --output "$work/read-$slot" \
-             "http://localhost/v1/measurements?type=$kind&from=''${start}000000000&to=''${end}000000000&limit=1"; then
-          log "reading $kind from the monitoring platform failed"
-          exit 1
+             "http://localhost/v1/measurements?type=$kind&from=''${start}000000000&to=''${end}000000000&limit=1" \
+             2> "$curl_error"; then
+          fail "reading $kind from the monitoring platform failed: $(curl_said)"
         fi
       done 3<<'READS'
       ${readTable}
@@ -173,20 +188,18 @@ let
       code="$(curl --silent --show-error --request POST --retry 3 \
         --config "$post_conf" \
         --output "$body" \
-        --write-out '%{http_code}' || true)"
+        --write-out '%{http_code}' 2> "$curl_error" || true)"
       response="$(cat "$body")"
 
       case "$code" in
         2??) ;;
         *)
-          log "update failed: HTTP $code (''${response:-no body})"
-          exit 1
+          fail "update failed: HTTP $code (''${response:-no body}) $(curl_said)"
           ;;
       esac
 
       if [ "$response" = "0" ]; then
-        log "update rejected by ThingSpeak (HTTP $code, body 0)"
-        exit 1
+        fail "update rejected by ThingSpeak (HTTP $code, body 0)"
       fi
 
       log "sent $count field(s) at $created_at (entry $response)"
@@ -544,6 +557,14 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = lib.getExe reportScript;
+        # A successful run leaves nothing in the journal. At one run a minute, systemd's own
+        # Starting/Deactivated/Finished/Consumed lines plus the reporter's "sent" were a third of
+        # this host's log entries, and journald writes ~180 KiB to the SD card per entry
+        # (measured on the Pi, 2026-10-10) -- each one updates pages all over its file. On
+        # systemd 260 the cap covers PID 1's messages about the unit too, and a failure stays
+        # visible: "Main process exited" is notice, "Failed with result" warning, and the
+        # reporter's own reason comes through fail() at error.
+        LogLevelMax = "notice";
 
         LoadCredentialEncrypted = [
           "${cfg.platform.apiKeyCredential}:${platformKeyPath}"

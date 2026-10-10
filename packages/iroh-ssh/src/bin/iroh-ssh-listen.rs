@@ -78,5 +78,10 @@ async fn handle_accept(accepting: Accepting, addrs: Vec<SocketAddr>) -> Result<(
         .await
         .std_context(format!("error connecting to {addrs:?}"))?;
     let (read, write) = tcp.into_split();
-    forward_bidi(read, write, r, s).await
+    forward_bidi(read, write, r, s).await?;
+    // Let the dialing side close the connection, for the reason iroh-uds-listen gives: closing
+    // it here, with our end of the stream possibly still in flight, has the dialer's last read
+    // fail with "connection lost" after a session that went fine.
+    connection.closed().await;
+    Ok(())
 }
