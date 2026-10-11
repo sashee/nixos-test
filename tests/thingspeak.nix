@@ -361,10 +361,11 @@ nixpkgs.lib.nixos.runTest {
         assert "User=thingspeak-tunnel" in unit, unit
         machine.fail("systemctl cat thingspeak-tunnel.service | grep -F 'DynamicUser=true'")
         # Independence, stated as an absence: nothing here names the collector's tunnel, so
-        # moving or revoking either one leaves the other alone.
-        assert "mp-tunnel" not in unit, unit
+        # moving or revoking either one leaves the other alone. (Its listener's unit is named,
+        # as an ordering: that is the far side on the deployed host, not a shared hop.)
+        assert "mp-tunnel-client" not in unit and "/run/mp-tunnel" not in unit, unit
 
-    with subtest("an unprovisioned tunnel skips, a provisioned one serves a group-only socket"):
+    with subtest("an unprovisioned tunnel skips; a provisioned one with no far side serves nothing"):
         result = machine.succeed(
             "systemctl show -p ConditionResult --value thingspeak-tunnel.service"
         ).strip()
@@ -382,23 +383,28 @@ nixpkgs.lib.nixos.runTest {
             f" {TUNNEL_CRED}/iroh-ticket"
         )
 
-        # It binds the local socket before it dials anything, so this holds with no relay in
-        # this test at all. What is on the far side of that socket is not asserted here -- that
-        # is tests/monitoring-platform-tunnel.nix, which builds an impersonated n0 for the same
-        # binary.
-        machine.succeed("systemctl start thingspeak-tunnel.service")
-        machine.wait_for_unit("thingspeak-tunnel.service", timeout=120)
-        machine.wait_until_succeeds(f"test -S {TUNNEL_SOCKET}", timeout=60)
-        owner = machine.succeed(f"stat -c '%U:%G %a' {TUNNEL_SOCKET}").strip()
-        assert owner == "thingspeak-tunnel:thingspeak-tunnel 660", f"socket is {owner}"
-        parent = machine.succeed("stat -c '%U:%G %a' /run/thingspeak-tunnel").strip()
-        assert parent == "thingspeak-tunnel:thingspeak-tunnel 750", f"directory is {parent}"
-        # The directory mode is the real access control, so prove it by reading rather than by
-        # trusting the bits.
-        machine.fail(
-            "${pkgs.util-linux}/bin/runuser -u nobody --"
-            f" ${pkgs.curl}/bin/curl -sS --unix-socket {TUNNEL_SOCKET} http://localhost/"
-        )
+        # Nothing answers that ticket -- this test has no relay and no listener -- so the
+        # tunnel's one dial fails, it exits, and systemd tries again. It binds its socket only
+        # once a dial has worked, so the socket never appears, and a reporter pointed at it
+        # would be refused at once rather than left waiting. That it does connect when there is
+        # a far side, and serves a group-only socket when it has, is
+        # tests/monitoring-platform-tunnel.nix, which builds an impersonated n0 for it.
+        machine.succeed("systemctl start --no-block thingspeak-tunnel.service")
+
+        def retrying(_):
+            assert machine.succeed(
+                "systemctl show -P ActiveState thingspeak-tunnel.service"
+            ).strip() != "active", "the tunnel reported ready with nothing to connect to"
+            machine.fail(f"test -e {TUNNEL_SOCKET}")
+            return int(machine.succeed(
+                "systemctl show -P NRestarts thingspeak-tunnel.service"
+            ).strip()) >= 1
+
+        retry(retrying, timeout_seconds=300)
+        result = machine.succeed(
+            "systemctl show -p ConditionResult --value thingspeak-tunnel.service"
+        ).strip()
+        assert result == "yes", f"the provisioned tunnel was skipped: {result}"
 
     with subtest("a reboot leaves nothing to do by hand"):
         # The operator's actual question: provision the blobs, let the nightly auto-upgrade
@@ -418,9 +424,17 @@ nixpkgs.lib.nixos.runTest {
         # Nobody started either of these. The tunnel is wantedBy=multi-user.target with a
         # ConditionPathExists the blob provisioned above now satisfies, and the timer is
         # wantedBy=timers.target -- so a host that was provisioned before the upgrade comes back
-        # reporting, with no start command anywhere.
-        machine.wait_for_unit("thingspeak-tunnel.service", timeout=180)
-        machine.wait_until_succeeds(f"test -S {TUNNEL_SOCKET}", timeout=60)
+        # reporting, with no start command anywhere. Here that shows as the tunnel trying: it
+        # ran (the condition held) and is restarting, there being nothing in this test for it
+        # to reach. Connecting is tests/monitoring-platform-tunnel.nix's to show.
+        machine.wait_until_succeeds(
+            "test \"$(systemctl show -P NRestarts thingspeak-tunnel.service)\" -ge 1", timeout=300
+        )
+        result = machine.succeed(
+            "systemctl show -p ConditionResult --value thingspeak-tunnel.service"
+        ).strip()
+        assert result == "yes", f"the tunnel was not started at boot: {result}"
+        machine.fail(f"test -e {TUNNEL_SOCKET}")
         machine.succeed("systemctl is-active --quiet thingspeak.timer")
         # Stopped again so what follows counts only the runs this test drives: OnBootSec is 60s,
         # which the rest of this subtest would otherwise race.

@@ -11,12 +11,32 @@
 //! against the operating system trust store instead of dumbpipe's compiled-in
 //! Mozilla roots. The latter lets the hermetic VM test impersonate the n0 relay
 //! hostnames with its own CA (and lets hosts trust self-hosted relays).
-use std::{io, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    ffi::OsStr,
+    io,
+    os::{
+        linux::net::SocketAddrExt,
+        unix::{
+            ffi::OsStrExt,
+            net::{SocketAddr, UnixDatagram},
+        },
+    },
+    path::PathBuf,
+    str::FromStr,
+    time::Duration,
+};
 
-use iroh::{endpoint::presets, tls::CaTlsConfig, Endpoint, EndpointAddr, SecretKey};
+use iroh::{
+    endpoint::{presets, ConnectionError},
+    tls::CaTlsConfig,
+    Endpoint, EndpointAddr, SecretKey,
+};
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_error::{bail_any, Result, StdResultExt};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    signal::unix::{signal, SignalKind},
+};
 use tokio_util::sync::CancellationToken;
 
 /// The dumbpipe ALPN, for wire compatibility with stock dumbpipe clients.
@@ -216,13 +236,60 @@ pub async fn forward_bidi(
             .await
             .map_err(cancel_token(token2))
     });
-    let _control_c = tokio::spawn(async move {
+    let control_c = tokio::spawn(async move {
         tokio::signal::ctrl_c().await?;
         token3.cancel();
         io::Result::Ok(())
     });
-    forward_in.await.anyerr()?.anyerr()?;
-    forward_out.await.anyerr()?.anyerr()?;
+    let forwarded = async {
+        forward_in.await.anyerr()?.anyerr()?;
+        forward_out.await.anyerr()?.anyerr()?;
+        Ok(())
+    }
+    .await;
+    // Dropping a JoinHandle detaches the task rather than stopping it, and this one only ends on
+    // ctrl-c -- so without the abort every forwarded stream would leave a task behind for the life
+    // of the process, which for iroh-uds-connect is one a minute for as long as it stays up.
+    control_c.abort();
+    forwarded
+}
+
+/// Whether a connection ended the way connections are meant to: closed by the application on
+/// either side -- a dialer stopping or restarting, a listener shutting down. Anything else (an
+/// idle timeout, a reset) means a peer went away without saying so.
+pub fn closed_normally(reason: &ConnectionError) -> bool {
+    matches!(
+        reason,
+        ConnectionError::ApplicationClosed(_) | ConnectionError::LocallyClosed
+    )
+}
+
+/// Resolves on the first SIGINT or SIGTERM: ctrl-c by hand, `systemctl stop` under the service
+/// manager. Lets a binary close its endpoint on the way out, so the far side learns of it from a
+/// CONNECTION_CLOSE straight away instead of from its idle timeout.
+pub async fn shutdown_signal() -> io::Result<()> {
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        res = tokio::signal::ctrl_c() => res,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+/// Send `state` to the service manager's notification socket, as sd_notify(3) does. A no-op when
+/// there is none, so the binaries stay usable by hand.
+///
+/// Hand-rolled rather than a crate: it is one datagram to one address, and `$NOTIFY_SOCKET` is
+/// either a path or, with a leading `@`, a name in the abstract namespace.
+pub fn notify(state: &str) -> io::Result<()> {
+    let Some(target) = std::env::var_os("NOTIFY_SOCKET") else {
+        return Ok(());
+    };
+    let target = target.as_bytes();
+    let addr = match target.strip_prefix(b"@") {
+        Some(name) => SocketAddr::from_abstract_name(name)?,
+        None => SocketAddr::from_pathname(OsStr::from_bytes(target))?,
+    };
+    UnixDatagram::unbound()?.send_to_addr(state.as_bytes(), &addr)?;
     Ok(())
 }
 

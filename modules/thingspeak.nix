@@ -535,10 +535,11 @@ in
 
     systemd.services.thingspeak = {
       description = "Report the latest solar and battery readings to ThingSpeak";
-      # Ordering only, never Requires. The tunnel is Type=simple, so After= means its process
-      # forked, not that its socket is bound -- the first run of a boot may well find nothing
-      # there. That is the right outcome: it fails, says so, and the next tick is one interval
-      # away. A wait loop would buy a few seconds of chart at the cost of a unit that can hang.
+      # Ordering only, never Requires. The tunnel is Type=notify and only reports ready once it is
+      # connected, so a run started while its start job is pending waits for the outcome. A tunnel
+      # that is down -- failed, or waiting out its restart delay -- has no socket at all, so a run
+      # then fails at once and says so, and the next tick is one interval away. A wait loop would
+      # buy a few seconds of chart at the cost of a unit that can hang.
       after = [
         "thingspeak-tunnel.service"
         "mp-collector.service"
@@ -640,10 +641,18 @@ in
       description = "Local socket forwarding to the monitoring platform over iroh, for ThingSpeak reporting";
       wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
-      after = [ "network-online.target" ];
+      # mp-tunnel-server is the far side on the deployed host. Ordering only, and a no-op where
+      # it does not exist: this dials once at start, so starting after the listener spares a boot
+      # or a switch one failed attempt and a restart delay.
+      after = [ "network-online.target" "mp-tunnel-server.service" ];
       # Skip (instead of crash-loop) until the operator provisions the blob.
       unitConfig.ConditionPathExists = [ ticketPath ];
+      # The restart policy is the reconnect loop: iroh-uds-connect keeps one connection, binds the
+      # socket only once it is up and exits when it closes. Type=notify, Restart and the backoff
+      # are lifted from modules/monitoring-platform-tunnel.nix (clientRestart), which explains
+      # each; same binary, same reasons.
       serviceConfig = tunnelHardening // {
+        Type = "notify";
         ExecStart = "${lib.getExe' pkg "iroh-uds-connect"} ${cfg.tunnel.socketPath}";
         LoadCredentialEncrypted = [ "iroh-ticket:${ticketPath}" ];
         User = tunnelUser;
@@ -652,6 +661,8 @@ in
         RuntimeDirectoryMode = "0750";
         Restart = "always";
         RestartSec = 5;
+        RestartSteps = 4;
+        RestartMaxDelaySec = 60;
       };
     };
   };

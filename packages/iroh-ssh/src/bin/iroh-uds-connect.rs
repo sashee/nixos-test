@@ -1,7 +1,23 @@
-//! Listen on a local unix socket and forward each accepted connection over iroh
-//! to the endpoint named by a ticket. The dialing half of a UDS-over-iroh
-//! tunnel: whatever connects here reaches the socket `iroh-uds-listen` fronts on
-//! the far side, and needs to know nothing about iroh.
+//! Listen on a local unix socket and forward each accepted connection, as a
+//! stream of its own, over one iroh connection to the endpoint named by a
+//! ticket. The dialing half of a UDS-over-iroh tunnel: whatever connects here
+//! reaches the socket `iroh-uds-listen` fronts on the far side, and needs to
+//! know nothing about iroh.
+//!
+//! One QUIC connection per process, and the process is the reconnect loop: it
+//! dials once, binds the local socket only once that dial has succeeded, and
+//! exits the moment the connection closes, for whatever reason. Restarting it
+//! is the service manager's job, which hands every attempt a fresh endpoint --
+//! nothing that went wrong inside the last one can outlive it. Dialing per local
+//! connection instead had this hold one iroh endpoint for days while cycling a
+//! connection a minute through it, and on 2026-10-11 that endpoint wedged: every
+//! dial from 04:50 on timed out without sending a packet, while a fresh process
+//! dialing the same ticket got straight through.
+//!
+//! Under systemd (`Type=notify`) the unit is active exactly while the connection
+//! is up and the socket is bound, and the socket's existence says the same thing
+//! to its clients: with the far side unreachable they are refused at once rather
+//! than left waiting on a dial.
 //!
 //! Usage: iroh-uds-connect <socket-path> [ticket]
 //! The ticket is read from $CREDENTIALS_DIRECTORY/iroh-ticket (set by systemd
@@ -13,19 +29,21 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use iroh::{Endpoint, EndpointAddr, SecretKey};
-use iroh_ssh::{create_endpoint, forward_bidi, load_ticket, ALPN, HANDSHAKE};
+use iroh::{endpoint::Connection, SecretKey};
+use iroh_ssh::{
+    closed_normally, create_endpoint, forward_bidi, load_ticket, notify, shutdown_signal, ALPN,
+    HANDSHAKE, ONLINE_TIMEOUT,
+};
 use n0_error::{bail_any, Result, StdResultExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::select;
+use tokio::{pin, select, time::timeout};
 
-/// How long one dial may take before the connection is given up on.
+/// How long the one dial may take before this process gives up and exits.
 ///
-/// Not the user-visible bound: whatever is talking to the local socket has its
-/// own timeout and, having started its clock first, always gives up before this
-/// does (mp-collector's is 30s, covering connect and exchange together). This is
-/// a leak guard, so that a far side which is unreachable for hours cannot
-/// accumulate one stuck task per reconnect attempt.
+/// Bounds how long the unit sits in `activating` against a far side that is not
+/// answering. Giving up is cheap -- the service manager starts a fresh attempt
+/// after its restart delay -- so this only needs to be comfortably longer than a
+/// dial that is merely slow: discovery plus a relayed handshake.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() -> ! {
@@ -38,24 +56,47 @@ async fn connect() -> Result<()> {
         bail_any!("usage: iroh-uds-connect <socket-path> [ticket]");
     };
     let addr = load_ticket(args.next())?.endpoint_addr().clone();
+    let remote = addr.id;
 
     // the connecting side needs no stable identity
     let endpoint = create_endpoint(SecretKey::generate(), vec![]).await?;
+    // As dumbpipe does before it dials: until the home relay is known, a far side
+    // reachable only through a relay has nowhere for the handshake to go. Bounded,
+    // because a direct path may well work without one.
+    if timeout(ONLINE_TIMEOUT, endpoint.online()).await.is_err() {
+        eprintln!("Warning: Failed to connect to the home relay");
+    }
+    let connection = match timeout(DIAL_TIMEOUT, endpoint.connect(addr, ALPN)).await {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(cause)) => bail_any!("error connecting to {remote}: {cause}"),
+        Err(_) => bail_any!("dial to {remote} timed out after {DIAL_TIMEOUT:?}"),
+    };
 
     let listener = bind(&socket_path).await?;
     eprintln!(
-        "Forwarding connections on '{}' to {}.",
-        socket_path.display(),
-        addr.id
+        "Connected to {remote}; forwarding connections on '{}'.",
+        socket_path.display()
     );
+    // READY: the connection is up and the socket bound, which is what `active`
+    // promises. RESTART_RESET: this attempt worked, so the restart backoff starts
+    // over -- the next outage begins at RestartSec rather than wherever the last
+    // one left the delay. Not fatal if it fails: the tunnel works either way.
+    if let Err(cause) = notify("READY=1\nRESTART_RESET=1") {
+        eprintln!("Warning: failed to notify the service manager: {cause}");
+    }
 
+    let closed = connection.closed();
+    pin!(closed);
+    let shutdown = shutdown_signal();
+    pin!(shutdown);
     loop {
         let accepted = select! {
             accepted = listener.accept() => accepted,
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("got ctrl-c, exiting");
-                break;
-            }
+            // Fatal by design: see the module comment. The reason goes in the
+            // message because it is what tells a far side that went away
+            // ("closed by peer") from a path that died ("timed out").
+            reason = &mut closed => bail_any!("connection to {remote} closed: {reason}"),
+            _ = &mut shutdown => break,
         };
         // Deliberately fatal rather than logged-and-retried: a listener that has
         // stopped accepting does not recover by being asked again, and spinning
@@ -63,20 +104,26 @@ async fn connect() -> Result<()> {
         // to the service manager, which restarts on a delay.
         let (uds, _) = accepted.std_context("error accepting a local connection")?;
 
-        // Cheap: Endpoint is an Arc handle, so every connection dials through
-        // the one bound socket rather than binding its own.
-        let endpoint = endpoint.clone();
-        let addr = addr.clone();
+        // Cheap: Connection is a handle, so every stream rides the one
+        // connection rather than dialing its own.
+        let connection = connection.clone();
         tokio::spawn(async move {
-            if let Err(cause) = handle_accept(uds, endpoint, addr).await {
-                // The local connection is dropped with this task, which is what
-                // tells the client to stop waiting and reconnect -- a socket
-                // held open after a failed dial reads as a healthy peer that
-                // has simply gone quiet.
-                eprintln!("error handling connection: {cause}");
+            // The local connection is dropped with this task, which is what tells
+            // the client to stop waiting -- a socket held open after a failed
+            // stream reads as a healthy peer that has simply gone quiet.
+            if let Err(cause) = handle_accept(uds, connection.clone()).await {
+                // Not when the connection ended normally under it: the accept loop
+                // reports that once, rather than once per client it cut off.
+                if !connection.close_reason().is_some_and(|reason| closed_normally(&reason)) {
+                    eprintln!("error handling connection: {cause}");
+                }
             }
         });
     }
+    // Stopped on purpose, so say so: without the CONNECTION_CLOSE this sends, the
+    // listener would only find out at its idle timeout, and would log that as an
+    // error.
+    endpoint.close().await;
     Ok(())
 }
 
@@ -113,16 +160,9 @@ fn finish_bind(result: std::io::Result<UnixListener>, path: &Path) -> Result<Uni
     Ok(listener)
 }
 
-async fn handle_accept(uds: UnixStream, endpoint: Endpoint, addr: EndpointAddr) -> Result<()> {
-    // One dial per accepted connection, with no connection kept between them.
-    // What talks to this socket holds its own connection open across requests
-    // (mp-collector keeps one HTTP/1.1 connection across flushes), so a dial is
-    // rare enough that caching one would buy a reconnect state machine and
-    // little else.
-    let connection = match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, ALPN)).await {
-        Ok(result) => result.anyerr()?,
-        Err(_) => bail_any!("dial timed out after {:?}", DIAL_TIMEOUT),
-    };
+async fn handle_accept(uds: UnixStream, connection: Connection) -> Result<()> {
+    // Fails only once the connection itself has, which the accept loop is about
+    // to act on too; this just releases the local client promptly.
     let (mut s, r) = connection.open_bi().await.anyerr()?;
     // the connecting side must write first
     s.write_all(&HANDSHAKE).await.anyerr()?;
