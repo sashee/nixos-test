@@ -86,6 +86,10 @@ let
     # rather than failed when its ticket is missing, and a skipped unit looks like nothing at
     # all. Its reporting oneshot is deliberately absent -- see the `units` option description --
     # so the timer below is what says the reporting still happens.
+    #
+    # Its `n_restarts` is per outage, not per boot: the tunnel exits whenever its connection
+    # closes and sends RESTART_RESET=1 each time it is back up (modules/thingspeak.nix), so the
+    # count returns to 0 on recovery. A reconnect shows as `active_enter_seconds_ago` starting over.
     ++ lib.optional (commonFeature [ "thingspeak" "enable" ] false
       && commonFeature [ "thingspeak" "tunnel" "enable" ] false)
       "thingspeak-tunnel.service"

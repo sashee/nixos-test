@@ -47,6 +47,31 @@ let
     KeyringMode = "private";
     UMask = "0077";
   };
+
+  # How the client half lives and dies. iroh-uds-connect dials once, binds its
+  # socket only once connected, and exits the moment the connection closes, so
+  # this restart policy *is* its reconnect loop -- and each attempt gets a fresh
+  # iroh endpoint, which is the point (see the binary's module comment).
+  #
+  # Type=notify: it reports ready once connected and bound, so `active` means the
+  # tunnel is up, not that a process forked. The same message carries
+  # RESTART_RESET=1, which is the only way the backoff below starts over short of
+  # a manual start: systemd otherwise counts automatic restarts for the unit's
+  # whole life.
+  #
+  # The backoff (5s growing to a minute over four restarts) is for outages, when
+  # every attempt fails: unchecked, a dial that fails fast would restart the unit
+  # every five seconds, at several journal lines a time, on an SD card. A minute is
+  # also the ThingSpeak reporter's cadence, so its tunnel coming back no later
+  # than that costs it at most one run. modules/thingspeak.nix uses the same
+  # policy for the same binary.
+  clientRestart = {
+    Type = "notify";
+    Restart = "always";
+    RestartSec = 5;
+    RestartSteps = 4;
+    RestartMaxDelaySec = 60;
+  };
 in
 {
   options.common.mpTunnel = {
@@ -233,9 +258,13 @@ in
         description = "Local socket forwarding to the monitoring platform over iroh";
         wantedBy = [ "multi-user.target" ];
         wants = [ "network-online.target" ];
-        after = [ "network-online.target" ];
+        # The server half too, when this host runs it: the client dials once at
+        # start, so a boot or a switch that starts both should dial a listener that
+        # is already up rather than spend a failed attempt and a restart delay on it.
+        after = [ "network-online.target" ]
+          ++ lib.optional cfg.server.enable "mp-tunnel-server.service";
         unitConfig.ConditionPathExists = [ ticketPath ];
-        serviceConfig = hardening // {
+        serviceConfig = hardening // clientRestart // {
           ExecStart = "${lib.getExe' pkg "iroh-uds-connect"} ${cfg.client.socketPath}";
           LoadCredentialEncrypted = [ "iroh-ticket:${ticketPath}" ];
           User = "mp-tunnel";
@@ -246,8 +275,6 @@ in
           # for the next start to reason about.
           RuntimeDirectory = clientRuntimeName;
           RuntimeDirectoryMode = "0750";
-          Restart = "always";
-          RestartSec = 5;
         };
       };
     })

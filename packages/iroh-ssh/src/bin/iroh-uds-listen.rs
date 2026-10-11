@@ -2,6 +2,11 @@
 //! connection to a local unix socket. The receiving half of a UDS-over-iroh
 //! tunnel; the ssh listener next door is the same thing over TCP.
 //!
+//! Every stream a connection carries is served, not just its first: the dialing
+//! half keeps one connection up and opens a stream per local client. A dialer
+//! that opens a connection per stream instead -- stock dumbpipe, or
+//! iroh-ssh-connect -- is the one-stream case of the same thing.
+//!
 //! Usage: iroh-uds-listen <socket-path>
 //! The secret key is read from $CREDENTIALS_DIRECTORY/iroh-secret (set by
 //! systemd via LoadCredentialEncrypted) or the IROH_SECRET env var.
@@ -11,13 +16,14 @@
 //! authenticating -- sshd there, the monitoring platform's API key here.
 use std::path::PathBuf;
 
-use iroh::endpoint::Accepting;
+use iroh::endpoint::{Accepting, RecvStream, SendStream};
 use iroh_ssh::{
-    create_endpoint, forward_bidi, load_secret, short_ticket, ALPN, HANDSHAKE, ONLINE_TIMEOUT,
+    closed_normally, create_endpoint, forward_bidi, load_secret, short_ticket, shutdown_signal,
+    ALPN, HANDSHAKE, ONLINE_TIMEOUT,
 };
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_error::{bail_any, ensure_any, Result, StdResultExt};
-use tokio::{select, time::timeout};
+use tokio::{pin, select, time::timeout};
 
 fn main() -> ! {
     iroh_ssh::run(listen())
@@ -47,13 +53,12 @@ async fn listen() -> Result<()> {
     eprintln!("iroh-uds-connect <local-socket> {ticket}");
     eprintln!("or:\niroh-uds-connect <local-socket> {short}");
 
+    let shutdown = shutdown_signal();
+    pin!(shutdown);
     loop {
         let incoming = select! {
             incoming = endpoint.accept() => incoming,
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("got ctrl-c, exiting");
-                break;
-            }
+            _ = &mut shutdown => break,
         };
         let Some(incoming) = incoming else {
             break;
@@ -63,20 +68,53 @@ async fn listen() -> Result<()> {
         };
         let socket_path = socket_path.clone();
         tokio::spawn(async move {
-            if let Err(cause) = handle_accept(accepting, socket_path).await {
-                eprintln!("error handling connection: {cause}");
+            if let Err(cause) = handle_connection(accepting, socket_path).await {
+                eprintln!("{cause}");
             }
         });
     }
+    // Close every connection with a CONNECTION_CLOSE on the way out. A dialer
+    // exits when its connection does, so this is what turns a restart here into
+    // an immediate reconnect there rather than one an idle timeout later.
+    endpoint.close().await;
     Ok(())
 }
 
-async fn handle_accept(accepting: Accepting, socket_path: PathBuf) -> Result<()> {
+/// Serve every stream one connection carries, until it closes.
+async fn handle_connection(accepting: Accepting, socket_path: PathBuf) -> Result<()> {
     let connection = accepting.await.std_context("error accepting connection")?;
-    let (s, mut r) = connection
-        .accept_bi()
-        .await
-        .std_context("error accepting stream")?;
+    let remote = connection.remote_id();
+    // Once per connection, which with a dialer that keeps one up is once per
+    // dialer start: rare enough to log, and what shows a dialer reconnecting.
+    eprintln!("Accepted connection from {remote}.");
+    loop {
+        let (s, r) = match connection.accept_bi().await {
+            Ok(streams) => streams,
+            // How a connection is meant to end: the dialer closed it, stopping or
+            // restarting, or this side is shutting down. Nothing to report.
+            Err(reason) if closed_normally(&reason) => return Ok(()),
+            // Anything else ended it without a goodbye -- typically the idle
+            // timeout after the dialer vanished.
+            Err(cause) => bail_any!("connection from {remote} lost: {cause}"),
+        };
+        let socket_path = socket_path.clone();
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            if let Err(cause) = handle_stream(s, r, socket_path).await {
+                // A stream cut short by its connection ending normally -- the
+                // collector's kept HTTP connection, whenever its dialer restarts --
+                // is that ending, which the loop above already deals with, and not
+                // a failure of the stream.
+                if !connection.close_reason().is_some_and(|reason| closed_normally(&reason)) {
+                    eprintln!("error handling connection: {cause}");
+                }
+            }
+        });
+    }
+}
+
+/// Forward one stream to a fresh connection to the local socket.
+async fn handle_stream(s: SendStream, mut r: RecvStream, socket_path: PathBuf) -> Result<()> {
     let mut buf = [0u8; HANDSHAKE.len()];
     r.read_exact(&mut buf).await.anyerr()?;
     ensure_any!(buf == HANDSHAKE, "invalid handshake");
@@ -87,13 +125,9 @@ async fn handle_accept(accepting: Accepting, socket_path: PathBuf) -> Result<()>
         .await
         .std_context(format!("error connecting to {}", socket_path.display()))?;
     let (read, write) = uds.into_split();
-    forward_bidi(read, write, r, s).await?;
-    // Let the dialing side close the connection, rather than closing it here by returning (the
-    // last handle's drop closes it). Our end of the stream may still be in flight: noq lets a
-    // peer drop data it has received but not yet delivered once a CONNECTION_CLOSE arrives, so
-    // closing now has the dialer's last read fail with "connection lost" -- an error logged for
-    // every request that went fine. The dialer closes once it has read that end, and a dialer
-    // that never does is bounded by the idle timeout.
-    connection.closed().await;
-    Ok(())
+    // Returning does not close anything beyond this stream: the connection stays
+    // up for the next one, so our end of the stream is delivered after we drop
+    // it. (Closing the connection per request instead is what used to lose that
+    // end, failing the dialer's last read with "connection lost".)
+    forward_bidi(read, write, r, s).await
 }
