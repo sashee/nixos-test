@@ -51,11 +51,11 @@
     "monitoring-platform": {
       "flake": false,
       "locked": {
-        "lastModified": 1791405096,
-        "narHash": "sha256-1PMsa8agD7vV+Ij749yaIbtxf8Mxz6r2Tio7NZSTbM4=",
+        "lastModified": 1791629097,
+        "narHash": "sha256-LYBAP4i+Iis+/v1WTpgw39AzSDHqfVpShMEMTTdTSbY=",
         "owner": "sashee",
         "repo": "monitoring-platform",
-        "rev": "3c3bb95dba8f345ec3c34bdc25bd543828588671",
+        "rev": "0bc7ac6605b1fffa410c29cadd353500ea5d17f4",
         "type": "github"
       },
       "original": {
@@ -98,11 +98,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1791112908,
-        "narHash": "sha256-M0bmonUUM3qJbPyisLNGq/0R9ryL9aSL+aGYzLwoKag=",
+        "lastModified": 1791643259,
+        "narHash": "sha256-92R98Uz6h0hDV/DnlTj1UgxM79bBmX8f3HzO+GZD6Hg=",
         "owner": "nvmd",
         "repo": "nixos-raspberrypi",
-        "rev": "fa1e8ce6fa2acc637e0ef58f0f9847fb8502c8d1",
+        "rev": "0fca6c208be1707c87113f0989644f73a2407897",
         "type": "github"
       },
       "original": {
@@ -129,11 +129,11 @@
     },
     "nixpkgs-unstable": {
       "locked": {
-        "lastModified": 1791456040,
-        "narHash": "sha256-H83yz/do+hjOO0uujHyH8RgtIQP2v7Mw+cLwcZK/xKc=",
+        "lastModified": 1791594108,
+        "narHash": "sha256-XK4KceonkwD8LuMAt/vNrz982mXJM5jeHAxMwsUXXAQ=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "e7439b6b14ad3cc35d05608ebca9bce01a25f5f8",
+        "rev": "6510408d147d8c5e6d76043e899e9251756f6a75",
         "type": "github"
       },
       "original": {
