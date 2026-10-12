@@ -446,8 +446,10 @@ in
   #
   # The ticket every device saves is a pure function of the secret, so this re-prints it any
   # time. Paste it into iroh-webview-app on Android; on a laptop run
-  # `iroh-uds-connect <sock> <ticket>` with `socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr
-  # UNIX-CONNECT:<sock>` in front of it, and point the browser at http://localhost:8080:
+  # `iroh-uds-connect <sock> <ticket>` under a restart policy -- it holds one connection and exits
+  # when that closes, e.g. `systemd-run --user -p Restart=always -p RestartSec=5 iroh-uds-connect
+  # ...` -- with `socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:<sock>` in
+  # front of it, and point the browser at http://localhost:8080:
   #   systemd-creds decrypt --name=iroh-secret /etc/credentials/pw-mgr-tunnel/iroh-secret - \
   #   | iroh-ssh-ticket /dev/stdin
   #
