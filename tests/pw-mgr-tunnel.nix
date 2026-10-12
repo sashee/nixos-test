@@ -216,18 +216,22 @@ nixpkgs.lib.nixos.runTest {
         assert ticket.startswith("endpoint"), f"unexpected ticket: {ticket}"
 
     with subtest("a browser on the laptop's loopback port reaches the backend over iroh"):
+        # iroh-uds-connect holds one connection, binds its socket only once that is up and
+        # exits when it closes, so the laptop runs it under a restart policy (hosts/rpi5).
         machine.succeed(
             "systemd-run --unit=pwm-laptop-connect -p RuntimeDirectory=pwm-laptop"
+            " -p Restart=always -p RestartSec=5"
             f" ${irohSsh}/bin/iroh-uds-connect {LAPTOP_SOCKET} {ticket}"
         )
-        machine.wait_until_succeeds(f"test -S {LAPTOP_SOCKET}", timeout=60)
+        # The dial pays for relay registration and discovery before the socket exists.
+        machine.wait_until_succeeds(f"test -S {LAPTOP_SOCKET}", timeout=300)
         machine.succeed(
             "systemd-run --unit=pwm-laptop-shim ${pkgs.socat}/bin/socat"
             f" TCP-LISTEN:{PORT},bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:{LAPTOP_SOCKET}"
         )
         machine.wait_for_open_port(PORT)
 
-        # The first stream pays for relay registration and discovery, so retry it.
+        # Retried for TCG's sake only: the connection under it is already up.
         machine.wait_until_succeeds(
             f"curl -sS --fail -H 'Host: localhost:{PORT}' http://127.0.0.1:{PORT}/healthz",
             timeout=300,
@@ -275,7 +279,9 @@ nixpkgs.lib.nixos.runTest {
 
     with subtest("a saved ticket survives the tunnel restarting"):
         # The identity comes from the credential, not from the process, so the ticket
-        # every device has saved keeps working -- the property the app depends on.
+        # every device has saved keeps working -- the property the app depends on. The
+        # restart closes the laptop's connection too, so this is also its dialer exiting
+        # and its restart policy dialing the new process.
         machine.succeed("systemctl restart pw-mgr-tunnel.service")
         machine.wait_for_unit("pw-mgr-tunnel.service")
         machine.wait_until_succeeds(
