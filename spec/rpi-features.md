@@ -97,8 +97,23 @@
 
 ## Auto-reboot
 
-* every 10 minutes it tries to resolve a DNS address
-* if it hasn't succeeded in 3 hours then reboot
+* network-based watchdog
+    * every 10 minutes it tries to resolve a DNS address
+    * if it hasn't succeeded in 3 hours then reboot
+* hardware watchdog
+    * systemd watchdog with 2 minutes
+    * initrd watchdog with 2 minutes
+* other problems
+    * kernel panic => reboot after 10 seconds
+        * boot parameter so it's effective from the beginning
+    * kernel oops => panic
+        * boot parameter
+    * crash logs survive the reboot (ramoops)
+        * 128 KB of the kernel log leading up to the reset (so hangs reset by the watchdog leave a trace, not only panics)
+        * 4 × 16 KB slots for panic/oops dumps
+        * on the next boot they are moved into the journal and not kept as files, so the journal's size limit and rotation apply
+    * if the initrd fails (reaches its emergency mode) => kernel panic
+    * emergency mode is off after the initrd: a failed mount does not stop the boot
 
 ## Backups
 
