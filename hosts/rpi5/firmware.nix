@@ -11,8 +11,8 @@ let
   # only panics and oopses write dump records. 128 KiB is about a day of this host's steady-state
   # kernel log, which is ~20 firewall "refused connection" lines an hour, or a whole boot (~60 KiB).
   consoleSize = kib 128;
-  # Each panic/oops dump is one record, and an oops under oops=panic writes two: the oops, then
-  # the panic. Four slots hold two crashes. Records are compressed (CONFIG_PSTORE_COMPRESS),
+  # Each panic/oops dump is one record, and an oops once panic_on_oops is armed writes two: the
+  # oops, then the panic. Four slots hold two crashes. Records are compressed (CONFIG_PSTORE_COMPRESS),
   # so 16 KiB carries more log than its size suggests.
   recordSize = kib 16;
   records = 4;

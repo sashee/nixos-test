@@ -21,6 +21,11 @@ let
   # StateDirectory on the failsafe unit.
   failsafeStateDir = "/var/lib/iroh-ssh-failsafe";
 
+  # Started by the failsafe the first time in a boot that its probe gets sshd's banner through
+  # the tunnel, for units that may only run once the operator could get in
+  # (modules/crash-recovery.nix arms panic-on-oops from it).
+  answeredTarget = "iroh-ssh-answered.target";
+
   # The canonical connect ticket: endpoint id only, no relay urls. Derived from
   # the secret alone (see packages/iroh-ssh/src/bin/iroh-ssh-ticket.rs), so it is
   # exactly the ticket operators distribute -- which is why the failsafe probes
@@ -50,7 +55,7 @@ let
 
   failsafeScript = pkgs.writeShellApplication {
     name = "iroh-ssh-failsafe";
-    runtimeInputs = [ pkg pkgs.nftables pkgs.coreutils pkgs.gnugrep pkgs.gnused ];
+    runtimeInputs = [ pkg pkgs.nftables pkgs.coreutils pkgs.gnugrep pkgs.gnused config.systemd.package ];
     text = ''
       probe_interval=${toString cfg.failsafe.probeIntervalSeconds}
       recheck_interval=${toString cfg.failsafe.recheckIntervalSeconds}
@@ -121,6 +126,16 @@ let
             done
       }
 
+      # Only the first answer of the boot starts it: starting an active target again would pull
+      # in again whatever among the units it wants has been stopped since. A failure is logged
+      # rather than fatal, so it cannot take the failsafe down with it.
+      mark_answered() {
+        if ! systemctl is-active --quiet ${answeredTarget}; then
+          systemctl start --no-block ${answeredTarget} \
+            || echo "iroh-ssh tunnel answering, but starting ${answeredTarget} failed"
+        fi
+      }
+
       # Two-rate loop: while probes succeed there is one iroh connection per
       # probe_interval (hourly by default); a failure switches to the fast
       # recheck_interval so the delaySeconds window is actually measurable
@@ -134,6 +149,7 @@ let
         if probe_ok; then
           down=0
           close_port
+          mark_answered
           sleep "$probe_interval"
         else
           down=$((down + recheck_interval))
@@ -351,6 +367,9 @@ in
         RestartSec = 5;
         StateDirectory = "iroh-ssh-failsafe";
       };
+    };
+    systemd.targets.${lib.removeSuffix ".target" answeredTarget} = lib.mkIf (cfg.failsafe.enable && firewallManaged) {
+      description = "SSH answered through the iroh tunnel";
     };
   };
 }

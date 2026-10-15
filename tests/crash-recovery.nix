@@ -13,8 +13,12 @@
 #   * a crashed PID 1 -> it reboots itself (systemd.crash_action). This is NOT the watchdog's
 #     case. See modules/crash-recovery.nix for why, after the initrd's arming, a crash
 #     would stop the watchdog rather than trip it.
-#   * oops -> panic -> reboot, through a test-only module (./crash-recovery-oops.nix) that oopses
-#     on load.
+#   * an oops, through a test-only module (./crash-recovery-oops.nix) that oopses on load. Before
+#     panic-on-oops is armed it kills only the task and the machine stays up. The arming waits the
+#     real 10 minutes after the reachable target starts, which the test starts itself, standing in
+#     for the iroh-ssh failsafe's first answer: there is no tunnel here. tests/iroh-ssh.nix proves
+#     the failsafe starts it, tests/crash-recovery-deployed.nix that the Pi is wired to it. Then the
+#     escape hatch disarms it, and once armed again an oops -> panic -> reboot.
 #   * a saved crash log -> the journal, through the real systemd-pstore unit and the deployed
 #     pstore.conf, and on disk before a crash right after can lose it.
 #
@@ -45,6 +49,9 @@ in
 nixpkgs.lib.nixos.runTest {
   name = "crash-recovery";
   hostPkgs = pkgs;
+  # Ceiling, not a wait: on top of five boots, the arming subtest waits the real 10 minutes,
+  # and the rpi variant runs under TCG on the KVM-less aarch64 CI runner.
+  globalTimeout = 5400;
 
   nodes.machine = { config, ... }: {
     imports = [ machineModule ];
@@ -115,7 +122,12 @@ nixpkgs.lib.nixos.runTest {
     };
   };
 
-  testScript = ''
+  testScript = { nodes, ... }: let
+    reachableTarget = nodes.machine.common.crashRecovery.reachableTarget;
+    # The names the escape hatch in docs/rpi5-rescue.md uses.
+    arming = "crash-recovery-panic-on-oops";
+    offFlag = "/run/crash-recovery-oops-panic-off";
+  in ''
     import re
     import time
 
@@ -125,6 +137,17 @@ nixpkgs.lib.nixos.runTest {
         while not re.search(pattern, node.get_console_log()[since:]):
             assert time.monotonic() < deadline, f"{pattern!r} never appeared on {node.name}'s console"
             time.sleep(1)
+
+    def panic_on_oops():
+        return machine.succeed("cat /proc/sys/kernel/panic_on_oops").strip()
+
+    def oops(node):
+        """Load the oopsing module. In the background and after a moment, so the backdoor's reply
+        is out before the kernel goes, if it does."""
+        since = len(node.get_console_log())
+        node.succeed("(sleep 2; modprobe crash_recovery_oops) >/dev/null 2>&1 &")
+        wait_console(node, since, r"kernel BUG at", 120)
+        return since
 
     def rebooted_from_panic(node, since, cause):
         """The panic message for `cause`, panic=10's countdown, then the reboot (a QEMU exit)."""
@@ -145,12 +168,13 @@ nixpkgs.lib.nixos.runTest {
 
     with subtest("the boot parameters reached the kernel"):
         params = machine.succeed("cat /proc/cmdline").split()
-        for p in ("panic=10", "oops=panic", "boot.panic_on_fail", "systemd.crash_action=reboot"):
+        for p in ("panic=10", "boot.panic_on_fail", "systemd.crash_action=reboot"):
             assert p in params, params
-        # The kernel's effective values: the host's panic= is the last one (see the header),
-        # and nothing in stage 2 set either back through sysctl.
+        assert "oops=panic" not in params, params
+        # The kernel's effective values: the host's panic= is the last one (see the header), and
+        # nothing in stage 2 set it back through sysctl. panic_on_oops waits for its arming.
         assert machine.succeed("cat /proc/sys/kernel/panic").strip() == "10"
-        assert machine.succeed("cat /proc/sys/kernel/panic_on_oops").strip() == "1"
+        assert panic_on_oops() == "0"
 
     with subtest("a mount that fails after the initrd does not stop the boot"):
         # Reaching multi-user.target above is the assertion. These check that the boot got there
@@ -208,6 +232,20 @@ nixpkgs.lib.nixos.runTest {
             " | grep -qx crash-recovery-marker"
         )
 
+    with subtest("an oops before panic-on-oops is armed does not panic"):
+        # The failsafe is running, but with no tunnel here its probe never answers, so nothing
+        # arms it.
+        machine.fail("systemctl is-active ${reachableTarget}")
+        assert panic_on_oops() == "0"
+        since = oops(machine)
+        # Well past panic=10's countdown, had there been a panic.
+        time.sleep(30)
+        machine.succeed("true")
+        assert "Kernel panic" not in machine.get_console_log()[since:]
+        # Bit 7 is TAINT_DIE: the kernel oopsed and carried on.
+        tainted = int(machine.succeed("cat /proc/sys/kernel/tainted"))
+        assert tainted & (1 << 7), tainted
+
     with subtest("a hung PID 1 is reset by the hardware watchdog"):
         hung = time.monotonic()
         # PID 1 is alone in init.scope, so freezing that cgroup stops PID 1 and nothing else. It
@@ -239,14 +277,41 @@ nixpkgs.lib.nixos.runTest {
         wait_console(machine, since, r"Rebooting in 10s", 120)
         machine.wait_for_shutdown()
 
-    with subtest("an oops panics the kernel, which reboots"):
+    with subtest("panic-on-oops is armed 10 minutes after ssh first answers"):
         machine.start()
         machine.wait_for_unit("multi-user.target")
-        since = len(machine.get_console_log())
-        # In the background and after a moment, so the backdoor's reply is out before the kernel
-        # goes. Without oops=panic the kernel would only kill this modprobe and carry on.
-        machine.succeed("(sleep 2; modprobe crash_recovery_oops) >/dev/null 2>&1 &")
-        wait_console(machine, since, r"kernel BUG at", 120)
-        rebooted_from_panic(machine, since, "Fatal exception")
+        # Only the reachable target pulls the timer in, not timers.target at boot.
+        machine.fail("systemctl is-active ${arming}.timer")
+        # Standing in for the failsafe's first answer (see the header).
+        machine.succeed("systemctl start ${reachableTarget}")
+        machine.succeed("systemctl is-active ${arming}.timer")
+        assert panic_on_oops() == "0"
+        # Not wait_for_unit: that gives up on an inactive unit with no job queued, which is
+        # what the service is until the timer fires.
+        machine.wait_until_succeeds("systemctl is-active ${arming}.service", timeout=900)
+        assert panic_on_oops() == "1"
+        # On the guest's own monotonic clock, so a slow host cannot make it look early.
+        def entered(unit):
+            return int(machine.succeed(f"systemctl show -P ActiveEnterTimestampMonotonic {unit}"))
+        delay = entered("${arming}.service") - entered("${reachableTarget}")
+        assert delay >= 600 * 10**6, delay
+        machine.log(f"armed {delay / 10**6:.0f}s after ${reachableTarget}")
+
+    with subtest("the escape hatch disarms it for the rest of the boot"):
+        # The way out of a crash loop that recurs after the arming. Not `systemctl mask --runtime
+        # --now`: run here, it disarmed, but the mask did not hold and the next start re-armed
+        # (see modules/crash-recovery.nix for why).
+        machine.succeed("touch ${offFlag} && systemctl stop ${arming}.service")
+        assert panic_on_oops() == "0"
+        # Whatever starts it again, the timer or a start of the target that pulls it in, now
+        # finds its condition false. A failed condition is not an error, hence succeed.
+        machine.succeed("systemctl start ${arming}.service")
+        assert machine.succeed("systemctl show -P ConditionResult ${arming}.service").strip() == "no"
+        assert panic_on_oops() == "0"
+
+    with subtest("once armed, an oops panics the kernel, which reboots"):
+        machine.succeed("rm ${offFlag}", "systemctl start ${arming}.service")
+        assert panic_on_oops() == "1"
+        rebooted_from_panic(machine, oops(machine), "Fatal exception")
   '';
 }

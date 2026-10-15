@@ -1,4 +1,4 @@
-{ config, lib, ... }:
+{ config, lib, pkgs, ... }:
 
 # Recovery from the failures a network watchdog cannot see because the box itself is gone:
 # a hung or crashed PID 1, a hung kernel, a kernel panic or oops, a boot that stops before it
@@ -26,12 +26,31 @@ let
   # connectivity-watchdog has already seen a probe hang under memory pressure.
   watchdogTimeout = "2min";
   panicRebootSeconds = 10;
+  # How long after the host is first reachable an oops starts to panic the kernel. It is the
+  # window an operator gets, on every turn of a crash loop, to get in and stop it.
+  oopsPanicDelay = "10min";
+  oopsPanicUnit = "crash-recovery-panic-on-oops";
+  # While it exists, nothing arms panic-on-oops again. In /run, so a reboot clears it.
+  oopsPanicOffFlag = "/run/crash-recovery-oops-panic-off";
+  sysctl = "${pkgs.procps}/bin/sysctl";
 in
 {
-  options.common.crashRecovery.enable = lib.mkEnableOption ''
-    rebooting the host when PID 1 hangs or crashes, the kernel hangs, panics or oopses, or the
-    initrd fails, and keeping the boot going past a failed mount after it
-  '';
+  options.common.crashRecovery = {
+    enable = lib.mkEnableOption ''
+      rebooting the host when PID 1 hangs or crashes, the kernel hangs, panics or oopses, or the
+      initrd fails, and keeping the boot going past a failed mount after it
+    '';
+
+    reachableTarget = lib.mkOption {
+      type = lib.types.str;
+      example = "iroh-ssh-answered.target";
+      description = ''
+        The unit that starts the first time in a boot that the host is remotely reachable. A
+        kernel oops panics the kernel only from ${oopsPanicDelay} after it starts, so in a boot where
+        it never starts, an oops never does.
+      '';
+    };
+  };
 
   config = lib.mkIf cfg.enable {
     assertions = [
@@ -55,13 +74,11 @@ in
     systemd.settings.Manager.RuntimeWatchdogSec = watchdogTimeout;
     boot.initrd.systemd.settings.Manager.RuntimeWatchdogSec = watchdogTimeout;
 
-    # Boot parameters rather than the kernel.panic/panic_on_oops sysctls: systemd-sysctl applies
-    # those only in stage 2, so a panic in the initrd would hang until power-cycled.
+    # Boot parameters rather than the kernel.panic sysctl: systemd-sysctl applies it only in
+    # stage 2, so a panic in the initrd would hang until power-cycled. kernel.panic_on_oops is
+    # the exception, below.
     boot.kernelParams = lib.mkMerge [
       [
-        # An oops kills only the task that hit it; the kernel carries on tainted, possibly with
-        # a lock that task held. A headless box is better off rebooted into a known state.
-        "oops=panic"
         # An initrd that reaches emergency mode crashes the kernel on purpose (nixpkgs'
         # panic-on-fail.service, wanted by the initrd's emergency.target), and panic= reboots
         # it. Root login is locked in the initrd, so that emergency mode is otherwise a dead end.
@@ -82,6 +99,44 @@ in
       # anyone else's. NixOS's test instrumentation, for one, passes panic=1 to every test VM.
       (lib.mkAfter [ "panic=${toString panicRebootSeconds}" ])
     ];
+
+    # An oops kills only the task that hit it; the kernel carries on tainted, possibly with a lock
+    # that task held, so a headless box is better off rebooted into a known state. But not from
+    # the start of the boot, as oops=panic would: an oops that recurs on every boot would then
+    # reboot the box in a loop that never reaches the network, and nobody can get to the box to
+    # break it. So panic_on_oops is set only ${oopsPanicDelay} after the host was first reachable
+    # in this boot. An oops before that leaves the box up, tainted but reachable. One after it
+    # still loops, but every turn passes through ${oopsPanicDelay} in which an operator can get in
+    # and stop it for the rest of that boot:
+    #
+    #   touch ${oopsPanicOffFlag} && systemctl stop ${oopsPanicUnit}.service
+    #
+    # The stop disarms; the flag keeps anything from arming it again, the timer included if it
+    # has not fired yet. Not `systemctl mask`: a persistent mask fails because
+    # /etc/systemd/system is a store path, and a --runtime one is silently ignored, because
+    # NixOS keeps every unit in /etc/systemd/system, which outranks /run/systemd/system where
+    # runtime masks go (seen in tests/crash-recovery.nix).
+    #
+    # An oops that stops the boot before the host is reachable is the watchdogs' case: the
+    # hardware one if PID 1 is stuck behind it, connectivity-watchdog if the network never
+    # comes up.
+    systemd.timers.${oopsPanicUnit} = {
+      description = "Make a kernel oops panic, ${oopsPanicDelay} after the host was first reachable";
+      wantedBy = [ cfg.reachableTarget ];
+      timerConfig.OnActiveSec = oopsPanicDelay;
+    };
+    systemd.services.${oopsPanicUnit} = {
+      description = "Kernel oops panics the kernel";
+      # Active exactly while armed, so stopping it is disarming it. That includes the stop at
+      # shutdown; a shutdown that an oops hangs is the reboot watchdog's (RebootWatchdogSec).
+      unitConfig.ConditionPathExists = "!${oopsPanicOffFlag}";
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${sysctl} -w kernel.panic_on_oops=1";
+        ExecStop = "${sysctl} -w kernel.panic_on_oops=0";
+      };
+    };
 
     # After the initrd, a failed mount must not stop the boot at a console login no one can
     # reach. Without emergency.target, local-fs.target's OnFailure= has nothing to start and
