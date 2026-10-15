@@ -51,11 +51,11 @@
     "monitoring-platform": {
       "flake": false,
       "locked": {
-        "lastModified": 1791629097,
-        "narHash": "sha256-LYBAP4i+Iis+/v1WTpgw39AzSDHqfVpShMEMTTdTSbY=",
+        "lastModified": 1791996494,
+        "narHash": "sha256-7iNROgWYLU+0FgzDPGVTcTFm/bkXfSk6T92p/w7hz7g=",
         "owner": "sashee",
         "repo": "monitoring-platform",
-        "rev": "0bc7ac6605b1fffa410c29cadd353500ea5d17f4",
+        "rev": "0f93d39c5b46b0fe0248c0e5f2d8efa9ed0441af",
         "type": "github"
       },
       "original": {
@@ -145,11 +145,11 @@
     },
     "nixpkgs_2": {
       "locked": {
-        "lastModified": 1791765022,
-        "narHash": "sha256-ZGq3ptZzA+oO0N/Wi/F+GbuTijLkYExD01LvpNFAvr0=",
+        "lastModified": 1791883866,
+        "narHash": "sha256-yvkDdToRZ4IgPc9tSBzzCYJvTLf8n5eE3rgUkpCuD5A=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "7993f34ee47e28a3d607a525aadc6c94b73be728",
+        "rev": "a033e66ab94a6bedf2c3d58d93a36319d3cbbbaf",
         "type": "github"
       },
       "original": {
