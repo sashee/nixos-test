@@ -107,7 +107,8 @@
     * kernel panic => reboot after 10 seconds
         * boot parameter so it's effective from the beginning
     * kernel oops => panic
-        * boot parameter
+        * set only 10 minutes after ssh first answers through the tunnel, as a sysctl, not a boot parameter
+            * this is to give a chance to interrupt a reboot loop
     * systemd crash => reboot
         * boot parameter
     * crash logs survive the reboot (ramoops)
