@@ -108,6 +108,8 @@
         * boot parameter so it's effective from the beginning
     * kernel oops => panic
         * boot parameter
+    * systemd crash => reboot
+        * boot parameter
     * crash logs survive the reboot (ramoops)
         * 128 KB of the kernel log leading up to the reset (so hangs reset by the watchdog leave a trace, not only panics)
         * 4 × 16 KB slots for panic/oops dumps
