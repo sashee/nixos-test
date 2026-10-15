@@ -15,8 +15,8 @@
 #     would stop the watchdog rather than trip it.
 #   * oops -> panic -> reboot, through a test-only module (./crash-recovery-oops.nix) that oopses
 #     on load.
-#   * a saved crash log -> the journal, through the real systemd-pstore and the deployed
-#     pstore.conf.
+#   * a saved crash log -> the journal, through the real systemd-pstore unit and the deployed
+#     pstore.conf, and on disk before a crash right after can lose it.
 #
 # Not covered, and cannot be: ramoops itself. On the Pi it is a device-tree overlay that a VM
 # never reads, and the driver runs QEMU with -no-reboot, so every reboot here is a fresh QEMU
@@ -175,21 +175,37 @@ nixpkgs.lib.nixos.runTest {
         assert machine.succeed(f"cat {w}/state").strip() == "active"
         assert machine.succeed(f"cat {w}/timeout").strip() == "120"
 
-    with subtest("a saved crash log goes into the journal and leaves no file behind"):
-        # The pstore backend is not testable here (see the header), so the real systemd-pstore is
-        # run on a staged log, with the deployed /etc/systemd/pstore.conf.
+    with subtest("systemd-pstore ran at boot only once the journal was on disk"):
+        # Its condition failed (nothing in /sys/fs/pstore), but PID 1 logs that when the start
+        # job runs, so it still shows the ordering. The first such line: the condition is
+        # checked again later in the boot, and ConditionTimestamp keeps only that one. Without
+        # the ordering it was seen between the flush's Starting and Finished.
+        lines = machine.succeed(
+            "journalctl -b -o cat -u systemd-journal-flush.service -u systemd-pstore.service"
+        ).splitlines()
+        flushed = lines.index("Finished Flush Journal to Persistent Storage.")
+        pstore = next(i for i, l in enumerate(lines) if l.startswith("Platform Persistent Storage Archival"))
+        assert flushed < pstore, lines
+
+    with subtest("a saved crash log survives a crash right after it went into the journal"):
+        # The pstore backend is not testable here (see the header), so a tmpfs stands in for it
+        # and the real unit runs on a staged log, with the deployed /etc/systemd/pstore.conf.
         machine.succeed(
-            "mkdir -p /tmp/pstore/src /tmp/pstore/archive",
-            "echo crash-recovery-marker > /tmp/pstore/src/dmesg-ramoops-0",
-            "/run/current-system/systemd/lib/systemd/systemd-pstore /tmp/pstore/src /tmp/pstore/archive",
+            "mount -t tmpfs pstore-stand-in /sys/fs/pstore",
+            "echo crash-recovery-marker > /sys/fs/pstore/dmesg-ramoops-0",
+            "systemctl start systemd-pstore.service",
         )
         # Moved, not copied: gone from the source, and Storage=journal archived nothing.
-        left = machine.succeed("find /tmp/pstore -type f")
+        left = machine.succeed("find /sys/fs/pstore /var/lib/systemd/pstore -type f")
         assert left == "", left
-        machine.wait_until_succeeds(
-            "journalctl -b --all -o cat --output-fields=FILE 'MESSAGE=PStore dmesg-ramoops-0.'"
-            " | grep -qx crash-recovery-marker",
-            timeout=60,
+        # A hard reset the moment the unit is done, as a crash loop would: whatever the guest
+        # had not written to disk is gone.
+        machine.crash()
+        machine.start()
+        machine.wait_for_unit("multi-user.target")
+        machine.succeed(
+            "journalctl -b -1 --all -o cat --output-fields=FILE 'MESSAGE=PStore dmesg-ramoops-0.'"
+            " | grep -qx crash-recovery-marker"
         )
 
     with subtest("a hung PID 1 is reset by the hardware watchdog"):

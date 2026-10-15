@@ -97,5 +97,14 @@ in
       [PStore]
       Storage=journal
     '';
+    # The journal is then the only copy, and the RAM one is cleared right after the hand-off. So
+    # the log must reach the SD card before a second crash can take it: upstream's unit is not
+    # ordered after journald's move from /run to /var (in a VM it ran in the middle of it), and
+    # journald only syncs an ordinary entry SyncIntervalSec (5min) later. Without these, a box
+    # crash-looping within minutes of boot never keeps the log of the crash that loops it.
+    systemd.services.systemd-pstore = {
+      after = [ "systemd-journal-flush.service" ];
+      serviceConfig.ExecStartPost = "${config.systemd.package}/bin/journalctl --sync";
+    };
   };
 }
