@@ -728,6 +728,35 @@ hours without DNS. The verdict is left in the journal rather than a breadcrumb
 file (journald is persistent by default), readable after the fact with
 `journalctl -b -1 -u connectivity-watchdog`.
 
+`modules/crash-recovery.nix` covers what a DNS probe cannot see, because the
+box itself is gone. The **hardware watchdog** is armed by systemd with a 2-minute
+timeout, both in the initrd and after switch-root, so a hung PID 1 or kernel
+resets the board. A **crashed systemd** reboots itself 10 seconds later
+(`systemd.crash_action=reboot`) rather than freezing. That case is deliberately
+not left to the watchdog: once the initrd has armed and handed it over, the
+kernel treats a frozen PID 1's close of the device as an intentional one and
+stops the watchdog (see the module for the mechanism). A **kernel panic**
+reboots after 10 seconds, an **oops** is promoted to a panic, and an **initrd
+that fails** crashes on purpose (`boot.panic_on_fail`) instead of waiting at a
+locked emergency shell. These are all boot parameters, so they apply from the
+first instruction rather than from when stage 2 applies sysctls. One caveat on
+the 10 seconds: with a DRM framebuffer console up, a panic after the initrd was
+seen to hang before it reboots (QEMU, kernel 6.18). The Pi runs headless with
+no framebuffer device, and if a monitor ever brings one up, the hardware
+watchdog still resets the board within 2 minutes. After the initrd, **emergency mode is off**: a
+failed mount leaves the boot degraded but still reachable over the tunnel.
+
+On the Pi, the `ramoops-pi5` overlay (`hosts/rpi5/firmware.nix`) keeps crash
+logs in RAM across the reset: 128 KiB of the kernel log leading up to it (which
+is the only trace a watchdog reset leaves) and four 16 KiB panic/oops dumps. On
+the next boot `systemd-pstore` moves them into the journal, so they rotate with
+it and leave no files behind. Read them in the boot after the crash with
+`journalctl -b -u systemd-pstore -o verbose --all` (the log is the `FILE=`
+field; without `--all` journalctl shows it as a blob). The bootloader stage is
+the one gap: if the firmware cannot load the kernel, nothing here runs. That
+needs the EEPROM's own `BOOT_WATCHDOG_TIMEOUT`, which the deployed bootloader
+(2025-05-08) predates.
+
 It is **off by default** — a laptop merely closed for two days must not reboot
 itself — and enabled only on the Raspberry Pi host. Evaluation fails unless
 `services.dnscrypt-proxy` is enabled (`modules/doh.nix`), since without a local

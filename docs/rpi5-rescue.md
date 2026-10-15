@@ -63,6 +63,18 @@ boot partition instead (pull the card, or edit it from section 2's mount):
   sulogin force flag is required because root's password is locked.
 - Unbootable system: `init=` pointing at a store path's init, as before.
 
+`cmdline.txt` also carries `boot.panic_on_fail` and `panic=10`
+(`modules/crash-recovery.nix`), so an initrd that fails crashes and reboots
+after 10 seconds instead of stopping. A boot that keeps failing in the initrd
+therefore shows up as a reboot loop. Delete `boot.panic_on_fail` from
+`cmdline.txt` to make it stop and stay put, and add
+`rd.systemd.debug_shell=1` for an unauthenticated root shell on tty9 inside
+the initrd (remove both afterwards). After the initrd, emergency mode is off:
+a failed mount does not stop the boot, so look for the failure over the
+tunnel rather than at the console: `journalctl -b -u local-fs.target` shows
+"Dependency failed for ... Local File Systems" (a mount whose device never
+appeared is not a *failed* unit, so `systemctl --failed` can miss it).
+
 For planned console work, set a temporary password over ssh first
 (`sudo passwd nixos`), and lock it again afterwards
 (`sudo usermod -p '!' nixos`).
