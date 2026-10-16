@@ -222,6 +222,10 @@ nixpkgs.lib.nixos.runTest {
     ).strip())
     assert downtime >= 15, f"failsafe opened after only {downtime}s (delaySeconds=15)"
 
+    # Nothing has answered through the tunnel, so the target that marks the first answer of
+    # the boot (what modules/crash-recovery.nix arms panic-on-oops from) has not started.
+    server.fail("systemctl is-active iroh-ssh-answered.target")
+
     # A firewall reload atomically replaces the nixos-fw table, wiping the
     # runtime rule; while the tunnel is still down the watchdog re-inserts it
     # within one recheck. (No rule-absent assertion in between — it would
@@ -380,6 +384,9 @@ nixpkgs.lib.nixos.runTest {
         f"test -z \"$({nft_chain} | grep -F 'iroh-ssh-failsafe' || true)\"",
         timeout=60,
     )
+
+    # The same answer starts the target that marks it, right after closing the port.
+    server.wait_until_succeeds("systemctl is-active iroh-ssh-answered.target", timeout=60)
 
     # Port 22 is closed to the network again; the tunnel is the only way in.
     client.fail("${pkgs.python3}/bin/python3 -c \"import socket; socket.create_connection(('iroh-server', 22), timeout=2)\"")

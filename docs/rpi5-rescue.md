@@ -16,6 +16,20 @@ temporarily sets `services.openssh.openFirewall = true;` in
 `hosts/rpi5/configuration.nix` -- and wait for the upgrade. No ssh needed:
 github main is the out-of-band management channel.
 
+That needs the Pi to stay up through the upgrade, which a reboot loop from a
+recurring kernel oops does not allow (`journalctl -b -u systemd-pstore -o
+verbose --all` shows the dump in the boot after each one). An oops panics only
+from 10 minutes after ssh first answers through the tunnel
+(`modules/crash-recovery.nix`), so every turn of the loop leaves those 10
+minutes. ssh in during one and run
+
+    sudo touch /run/crash-recovery-oops-panic-off && sudo systemctl stop crash-recovery-panic-on-oops.service
+
+The stop disarms panic-on-oops, and the flag keeps it from being armed again
+for the rest of that boot: the Pi stays up, tainted, until the fix arrives
+through the upgrade above, whose reboot clears the flag. `systemctl mask` does
+not do this on NixOS (see the module).
+
 ## 2. SD card: break-glass firewall unit
 
 Power off, mount the card's second (ext4) partition on another machine. NixOS
@@ -62,6 +76,22 @@ boot partition instead (pull the card, or edit it from section 2's mount):
 - `systemd.unit=rescue.target systemd.setenv=SYSTEMD_SULOGIN_FORCE=1` -- the
   sulogin force flag is required because root's password is locked.
 - Unbootable system: `init=` pointing at a store path's init, as before.
+
+`cmdline.txt` is `nixos/default/cmdline.txt` on the FAT partition (config.txt
+sets `os_prefix=nixos/default/`); the copies in the numbered directories next
+to it are not what boots.
+
+`cmdline.txt` also carries `boot.panic_on_fail` and `panic=10`
+(`modules/crash-recovery.nix`), so an initrd that fails crashes and reboots
+after 10 seconds instead of stopping. A boot that keeps failing in the initrd
+therefore shows up as a reboot loop. Delete `boot.panic_on_fail` from
+`cmdline.txt` to make it stop and stay put, and add
+`rd.systemd.debug_shell=1` for an unauthenticated root shell on tty9 inside
+the initrd (remove both afterwards). After the initrd, emergency mode is off:
+a failed mount does not stop the boot, so look for the failure over the
+tunnel rather than at the console: `journalctl -b -u local-fs.target` shows
+"Dependency failed for ... Local File Systems" (a mount whose device never
+appeared is not a *failed* unit, so `systemctl --failed` can miss it).
 
 For planned console work, set a temporary password over ssh first
 (`sudo passwd nixos`), and lock it again afterwards

@@ -55,6 +55,7 @@ in
     ../../modules/time-sync.nix
     ../../modules/connectivity-fallback.nix
     ../../modules/connectivity-watchdog.nix
+    ../../modules/crash-recovery.nix
     ../../modules/iroh-ssh.nix
     ../../modules/monitoring-platform-tunnel.nix
     ../../modules/pw-mgr-tunnel.nix
@@ -498,6 +499,14 @@ in
   # stay below afterSeconds and a multiple of the default 60s accuracySeconds, which 600 is.
   common.connectivityWatchdog.afterSeconds = 10800;
   common.connectivityWatchdog.intervalSeconds = 600;
+  # The failures the DNS probe cannot see: a hung PID 1 or kernel (hardware watchdog), a panic or
+  # oops, an initrd that fails or a mount after it that does. The crash-log buffer these reboots
+  # leave behind is the ramoops overlay in ./firmware.nix.
+  common.crashRecovery.enable = true;
+  # An oops panics only from 10 minutes after ssh first answers through the tunnel, so that a
+  # crash loop always leaves a way in (modules/crash-recovery.nix). The failsafe's probe is what
+  # starts this target: sshd's banner, dialed through the operator's own ticket.
+  common.crashRecovery.reachableTarget = "iroh-ssh-answered.target";
   # SSH over iroh (see modules/iroh-ssh.nix): sshd is reached through the tunnel's
   # outbound connection, so no inbound port is needed. Secret provisioned out-of-band:
   #   iroh-ssh-generate-secret | systemd-creds encrypt --name=iroh-secret - /etc/credentials/iroh-ssh/iroh-secret

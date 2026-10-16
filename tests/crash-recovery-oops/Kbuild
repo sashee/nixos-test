@@ -1,0 +1,1 @@
+obj-m := crash_recovery_oops.o

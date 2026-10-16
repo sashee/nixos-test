@@ -735,6 +735,44 @@ resolver every probe would fail and a perfectly healthy machine would reboot on
 a timer. Tune with
 `common.connectivityWatchdog.{enable,afterSeconds,intervalSeconds,accuracySeconds}`.
 
+`modules/crash-recovery.nix` covers what a DNS probe cannot see, because the
+box itself is gone. The **hardware watchdog** is armed by systemd with a 2-minute
+timeout, both in the initrd and after switch-root, so a hung PID 1 or kernel
+resets the board. A **crashed systemd** reboots itself 10 seconds later
+(`systemd.crash_action=reboot`) rather than freezing. That case is deliberately
+not left to the watchdog: once the initrd has armed and handed it over, the
+kernel treats a frozen PID 1's close of the device as an intentional one and
+stops the watchdog (see the module for the mechanism). A **kernel panic**
+reboots after 10 seconds, and an **initrd that fails** crashes on purpose
+(`boot.panic_on_fail`) instead of waiting at a locked emergency shell. These
+are boot parameters, so they apply from the first instruction rather than from
+when stage 2 applies sysctls. An **oops** is the exception: it is promoted to a
+panic only from 10 minutes after ssh first answers through the iroh tunnel
+(the failsafe's probe starts `iroh-ssh-answered.target`, a timer arms
+`kernel.panic_on_oops` 10 minutes later). An oops that recurs on every boot
+would otherwise reboot the Pi in a loop that never reaches the network. This
+way an oops before then leaves it up and reachable, and a loop after it leaves
+10 minutes per turn to get in and disarm it for the rest of that boot (see
+`docs/rpi5-rescue.md`). One caveat on the 10 seconds: with a DRM framebuffer
+console up, a panic after the initrd was
+seen to hang before it reboots (QEMU, kernel 6.18). The Pi runs headless with
+no framebuffer device, and if a monitor ever brings one up, the hardware
+watchdog still resets the board within 2 minutes. After the initrd, **emergency mode is off**: a
+failed mount leaves the boot degraded but still reachable over the tunnel.
+
+On the Pi, the `ramoops-pi5` overlay (`hosts/rpi5/firmware.nix`) keeps crash
+logs in RAM across the reset: 128 KiB of the kernel log leading up to it (which
+is the only trace a watchdog reset leaves) and four 16 KiB panic/oops dumps. On
+the next boot `systemd-pstore` moves them into the journal, so they rotate with
+it and leave no files behind. The move clears the RAM copy, so it waits for the
+journal to be on the SD card and syncs it straight after: a second crash soon
+after boot cannot lose the first one's log. Read them in the boot after the crash with
+`journalctl -b -u systemd-pstore -o verbose --all` (the log is the `FILE=`
+field; without `--all` journalctl shows it as a blob). The bootloader stage is
+the one gap: if the firmware cannot load the kernel, nothing here runs. That
+needs the EEPROM's own `BOOT_WATCHDOG_TIMEOUT`, which the deployed bootloader
+(2025-05-08) predates.
+
 `modules/fonts.nix` contains common desktop fonts.
 
 `modules/development-base.nix` contains common CLI tools and direnv with

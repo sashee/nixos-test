@@ -359,6 +359,9 @@
         modules = [
           nixos-raspberrypi.nixosModules.sd-image
           ({ ... }: { imports = with nixos-raspberrypi.nixosModules; [ raspberry-pi-5.base ]; })
+          # config.txt; sets options raspberry-pi-5.base declares, so it rides with it rather
+          # than in the hardware-free rpi5HostModules.
+          ./hosts/rpi5/firmware.nix
         ] ++ rpi5HostModules ++ modules;
       };
       # Laptop hosts: config lives in-repo; the machine-unique parts (LUKS
@@ -796,6 +799,20 @@
         };
         inherit dohStamps;
       };
+      # Hardware watchdog, panic/oops reboots and the emergency-mode settings on the REAL rpi
+      # config, on the Pi's own kernel -- the oops module is built against it. Its first boot
+      # outlasts connectivity-fallback's production bootGrace (a TCG boot plus up to two minutes
+      # waiting for the watchdog), hence the same push past the end of the run as the
+      # connectivity-watchdog check above.
+      crashRecoveryTestRpi = import ./tests/crash-recovery.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = { ... }: {
+          imports = [ rpiSystemModule ];
+          common.connectivityFallback.bootGrace = "3h";
+        };
+      };
       # The time-correction service on the REAL rpi config -- the valuable variant, since the
       # RTC-less Pi is the host that actually needs it: the deployed dnscrypt, the DoH egress
       # rules and the default-deny firewall are all live around it.
@@ -926,6 +943,7 @@
         connectivity-fallback = connectivityFallbackTestRpi;
         connectivity-fallback-trigger = connectivityFallbackTriggerTestRpi;
         connectivity-watchdog = connectivityWatchdogTestRpi;
+        crash-recovery = crashRecoveryTestRpi;
         time-correction = timeCorrectionTestRpi;
         nts-sync = ntsSyncTestRpi;
         connectivity-fallback-timing = connectivityFallbackTimingTestRpi;
@@ -1221,6 +1239,12 @@
         rpi5-x86-connectivity-fallback-trigger = rpi5X86Test ./tests/connectivity-fallback-trigger.nix {
           machineModule = rpi5X86QuiescedModule;
         };
+        rpi5-x86-crash-recovery = rpi5X86Test ./tests/crash-recovery.nix {
+          machineModule = { ... }: {
+            imports = [ rpi5X86SystemModule ];
+            common.connectivityFallback.bootGrace = "3h";
+          };
+        };
         rpi5-x86-connectivity-watchdog = rpi5X86Test ./tests/connectivity-watchdog.nix {
           machineModule = rpi5X86LongRunModule;
           inherit dohStamps;
@@ -1432,6 +1456,12 @@
       # hosts it covered, so rpi5 dropping the feature shows up as a check that asserted nothing
       # instead of as a pass.
       thingspeakDeployedTest = import ./tests/thingspeak-deployed.nix {
+        inherit pkgs;
+        hosts.rpi5 = rpi5Base;
+      };
+      # The ramoops overlay and the deployed boot parameters: what the Pi's firmware reads from
+      # config.txt/cmdline.txt, which tests/crash-recovery.nix's nodes do not have.
+      crashRecoveryDeployedTest = import ./tests/crash-recovery-deployed.nix {
         inherit pkgs;
         hosts.rpi5 = rpi5Base;
       };
@@ -1679,6 +1709,7 @@
         time-sync-deployed = timeSyncDeployedTest;
         time-sync-assertions = timeSyncAssertionsTest;
         thingspeak-deployed = thingspeakDeployedTest;
+        crash-recovery-deployed = crashRecoveryDeployedTest;
         qemu-graphical-eval = qemuGraphicalEval;
         upgrade-plan-parse = upgradePlanParseTest;
       };
