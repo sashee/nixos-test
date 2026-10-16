@@ -208,7 +208,8 @@ Firefox, and Konsole.
 
 `modules/laptop-base.nix` contains NetworkManager, Bluetooth, redistributable
 firmware, CPU microcode updates (Intel and AMD), firmware updates (fwupd), power
-profiles, printing, UPower, and zram swap. The microcode and firmware settings
+profiles, printing, UPower, zram swap, and the weekly fstrim timer (also set by
+`hosts/rpi5`; covered by the `system` check). The microcode and firmware settings
 are CPU- and vendor-agnostic, so the base works unchanged on any Intel or AMD
 laptop.
 

@@ -3,8 +3,8 @@
 , journalMaxUse ? null
 }:
 
-# The shared System feature (spec/features/system.md): zram swap plus the
-# byte-based dirty-page writeback thresholds. The zram assertions are
+# The shared System feature (spec/features/system/system.md): zram swap, the
+# byte-based dirty-page writeback thresholds, and the fstrim timer. The zram assertions are
 # value-agnostic because the hosts size it differently; the writeback ones are
 # not, so the expected values come in as arguments -- the per-host numbers live
 # in flake.nix next to the other spec constants (gcOptions, keptAfterGc).
@@ -64,6 +64,12 @@ nixpkgs.lib.nixos.runTest {
     # ratio here would mean the byte value never took (defaults are 20 and 10).
     assert machine.succeed("cat /proc/sys/vm/dirty_ratio").strip() == "0"
     assert machine.succeed("cat /proc/sys/vm/dirty_background_ratio").strip() == "0"
+
+    # the fstrim timer is enabled. Compared to "enabled" rather than trusting the exit code,
+    # which is 0 for "static" too -- a unit nothing pulls in. is-active is the half that says
+    # the timer is armed in this boot, not only linked into timers.target.
+    assert machine.succeed("systemctl is-enabled fstrim.timer").strip() == "enabled"
+    machine.succeed("systemctl is-active fstrim.timer")
     ${nixpkgs.lib.optionalString (journalMaxUse != null) ''
       # the spec'd journal cap reached the config journald reads
       machine.succeed("grep -qE '^[[:space:]]*SystemMaxUse=${journalMaxUse}[[:space:]]*$' /etc/systemd/journald.conf")

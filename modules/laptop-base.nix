@@ -15,6 +15,10 @@
 
   zramSwap.enable = true;
 
+  # Spec: fstrim timer enabled (spec/features/system/system.md). Already the nixpkgs default;
+  # set here so the spec does not rest on an upstream default staying put.
+  services.fstrim.enable = true;
+
   # Byte-based dirty-page writeback thresholds, replacing the kernel's
   # RAM-proportional dirty_ratio/dirty_background_ratio defaults (20%/10%).
   # Setting either byte knob zeroes its ratio counterpart, so these become the
