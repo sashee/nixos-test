@@ -103,6 +103,11 @@ in
     memoryPercent = 100;
   };
 
+  # Spec: fstrim timer enabled (spec/features/system/system.md). Already the nixpkgs default;
+  # set here (modules/laptop-base.nix, which has the laptop copy, is not imported by this host)
+  # so the spec does not rest on an upstream default staying put.
+  services.fstrim.enable = true;
+
   # Dirty-page writeback thresholds, a quarter of the laptop values (see
   # modules/laptop-base.nix, which this host does not import). Both scales are
   # wrong for this box by default: the kernel's ratio defaults (20%/10%) allow
