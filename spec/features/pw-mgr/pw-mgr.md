@@ -12,9 +12,6 @@
 
 ### Backup
 
-* PROVISIONAL: currently there is no restic configured, so this part is skipped
-
 * uses the [Restic-based backup system](../backups.md)
 * stops the service before the backup and starts it after
-
 
