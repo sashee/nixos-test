@@ -3,7 +3,7 @@
 ### Healthcheck monitoring
 
 * reports success:
-    * backups ran
+    * backups ran successfully in the last 14 days
     * disk is alright
     * auto-upgrade run successfully in the last 14 days
     * gc ran successfully in the last 14 days

@@ -103,6 +103,7 @@
 ## Backups
 
 * [](./features/backups.md)
+* there is one configured REST backend that backs up everything that needs backup
 
 ## Dotfiles
 
