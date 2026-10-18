@@ -7,8 +7,8 @@
 # their own (monitoring every 30 min; restic/upgrade Persistent daily), then inspects reports.
 #
 # On top of the real config it layers three test-only things:
-#   - the real monitoring-platform backup re-pointed at an in-VM REST server, so the restic
-#     check reports for real and the backup's stopServices path runs against the real receiver,
+#   - the real borgbase backup re-pointed at an in-VM REST server, so the restic check reports
+#     for real and the backup's stopServices path runs against the real receiver and pw-mgr,
 #   - a mocked nixos-rebuild so the (real, enabled) auto-upgrade succeeds in a VM, and
 #   - nix.gc.automatic off, so a warp-triggered catch-up GC can't starve the monitoring run.
 # smart stays [SKIP] (the Pi's real setting, untouched).
@@ -65,7 +65,7 @@ nixpkgs.lib.nixos.runTest {
     # CONCATENATION, so a plain definition here would be appended to the host's policy rather
     # than replace it -- "keep 1 latest, 7 daily, 4 weekly, 12 monthly", under which two
     # snapshots a simulated day apart are both kept as daily and forget deletes nothing at all.
-    common.restic.backups.monitoring-platform.prune.opts = lib.mkForce [ "--keep-last 1" ];
+    common.restic.backups.borgbase.prune.opts = lib.mkForce [ "--keep-last 1" ];
 
     # Mock the upgrade so the real, enabled nixos-upgrade.timer succeeds when the clock
     # wakes it and records its last-success marker via the module's OnSuccess hook.
@@ -122,23 +122,23 @@ nixpkgs.lib.nixos.runTest {
     # this stands in for the out-of-band provisioning documented in hosts/rpi5.
     systemd.services.test-monitoring-credential = {
       wantedBy = [ "multi-user.target" ];
-      before = [ "common-monitoring.service" "restic-backups-monitoring-platform.service" ];
+      before = [ "common-monitoring.service" "restic-backups-borgbase.service" ];
       serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
       script = ''
-        install -d -m 0700 /etc/credentials/monitoring /etc/credentials/restic/monitoring-platform
+        install -d -m 0700 /etc/credentials/monitoring /etc/credentials/restic/borgbase
 
         printf '%s' 'http://monitoring-platform:8080/health' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=healthchecks-url - /etc/credentials/monitoring/healthchecks-url
-        printf '%s' 'rest:http://monitoring-platform:8000/monitoring-platform' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository - /etc/credentials/restic/monitoring-platform/repository
-        printf '%s' 'repo-secret'    | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository-password - /etc/credentials/restic/monitoring-platform/repository-password
-        printf '%s' 'test-user'      | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-username - /etc/credentials/restic/monitoring-platform/backend-username
-        printf '%s' 'backend-secret' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-password - /etc/credentials/restic/monitoring-platform/backend-password
+        printf '%s' 'rest:http://monitoring-platform:8000/borgbase' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository - /etc/credentials/restic/borgbase/repository
+        printf '%s' 'repo-secret'    | ${pkgs.systemd}/bin/systemd-creds encrypt --name=repository-password - /etc/credentials/restic/borgbase/repository-password
+        printf '%s' 'test-user'      | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-username - /etc/credentials/restic/borgbase/backend-username
+        printf '%s' 'backend-secret' | ${pkgs.systemd}/bin/systemd-creds encrypt --name=backend-password - /etc/credentials/restic/borgbase/backend-password
 
         chmod 0600 \
           /etc/credentials/monitoring/healthchecks-url \
-          /etc/credentials/restic/monitoring-platform/repository \
-          /etc/credentials/restic/monitoring-platform/repository-password \
-          /etc/credentials/restic/monitoring-platform/backend-username \
-          /etc/credentials/restic/monitoring-platform/backend-password
+          /etc/credentials/restic/borgbase/repository \
+          /etc/credentials/restic/borgbase/repository-password \
+          /etc/credentials/restic/borgbase/backend-username \
+          /etc/credentials/restic/borgbase/backend-password
       '';
     };
 
@@ -224,18 +224,23 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("systemctl is-active --quiet common-monitoring.timer")
     client.succeed("systemctl cat common-monitoring.service | grep -F 'LoadCredentialEncrypted=healthchecks-url:/etc/credentials/monitoring/healthchecks-url'")
     client.fail("systemctl cat common-monitoring.service | grep -F 'http://monitoring-platform:8080/health'")
-    client.succeed("systemctl cat restic-backups-monitoring-platform.service | grep -F 'LoadCredentialEncrypted=repository-password:/etc/credentials/restic/monitoring-platform/repository-password'")
-    client.succeed("systemctl cat restic-backups-monitoring-platform.service | grep -F 'LoadCredentialEncrypted=repository:/etc/credentials/restic/monitoring-platform/repository'")
+    backup_units = "restic-backups-borgbase.service restic-backups-borgbase-preflight.service restic-backups-borgbase-backup.service restic-backups-borgbase-maintenance.service"
+    client.succeed("systemctl cat restic-backups-borgbase-backup.service | grep -F 'LoadCredentialEncrypted=repository-password:/etc/credentials/restic/borgbase/repository-password'")
+    client.succeed("systemctl cat restic-backups-borgbase-backup.service | grep -F 'LoadCredentialEncrypted=repository:/etc/credentials/restic/borgbase/repository'")
     # The deployed config names no repository: it comes from the credential above, so the real
-    # BorgBase URL is neither in git nor in this unit.
-    client.fail("systemctl cat restic-backups-monitoring-platform.service | grep -E 'RESTIC_REPOSITORY=|borgbase|rest:'")
-    client.succeed("systemctl show restic-backups-monitoring-platform.timer -p Persistent --value | grep -F yes")
-    client.succeed("systemctl show restic-backups-monitoring-platform.timer -p TimersCalendar --value | grep -F '*-*-* 05:00:00'")
-    # The backup stops the receiver for the backup phase and starts it again before prune/check.
-    client.succeed("systemctl cat restic-backups-monitoring-platform.service | grep -E '^ExecStartPre=\\+.*-stop-services'")
-    client.succeed("systemctl cat restic-backups-monitoring-platform.service | grep -E '^ExecStopPost=\\+.*-start-services'")
-    client.succeed("systemctl cat restic-backups-monitoring-platform.service | grep -F 'User=monitoring-platform'")
+    # BorgBase URL is neither in git nor in any of the backup's units.
+    client.fail(f"systemctl cat {backup_units} | grep -E 'RESTIC_REPOSITORY=|repo[.]borgbase|rest:'")
+    client.succeed("systemctl show restic-backups-borgbase.timer -p Persistent --value | grep -F yes")
+    client.succeed("systemctl show restic-backups-borgbase.timer -p TimersCalendar --value | grep -F '*-*-* 05:00:00'")
+    # The root orchestrator stops the receiver and pw-mgr for the backup phase and starts them
+    # again before prune/check; restic itself runs as a dynamic user in the workers.
+    client.succeed("systemctl cat restic-backups-borgbase.service | grep -E '^ExecStartPre=.*-stop-services'")
+    client.succeed("systemctl cat restic-backups-borgbase.service | grep -E '^ExecStopPost=.*-start-services'")
+    client.succeed("systemctl cat restic-backups-borgbase-backup.service | grep -F 'DynamicUser=true'")
+    for path in ["/var/lib/monitoring-platform", "/var/lib/pw-mgr"]:
+        client.succeed(f"systemctl cat restic-backups-borgbase-backup.service | grep -Fx 'BindReadOnlyPaths={path}'")
     client.succeed("systemctl is-active --quiet monitoring-platform.service")
+    client.succeed("systemctl is-active --quiet pw-mgr.service")
 
     def quiesce_monitoring():
         # Pause the timer and drain any in-flight run before touching the platform log, so a
@@ -277,7 +282,7 @@ nixpkgs.lib.nixos.runTest {
         arm_monitoring()
 
     upgrade_marker = "/var/lib/common-monitoring/nixos-upgrade.service.last-success"
-    restic_marker = "/var/lib/common-monitoring/restic-backups-monitoring-platform.service.last-success"
+    restic_marker = "/var/lib/common-monitoring/restic-backups-borgbase.service.last-success"
 
     # The backup is only ever driven by its own timer, so "the run I just triggered has
     # finished" has to be read from its last-success marker taking a NEW value: a oneshot the
@@ -286,24 +291,24 @@ nixpkgs.lib.nixos.runTest {
     # be handed back in as `previous` at the next warp.
     def restic_ran_since(previous):
         client.wait_until_succeeds(f"test \"$(cat {restic_marker})\" != {previous!r}", timeout=600)
-        result = client.succeed("systemctl show restic-backups-monitoring-platform.service -p Result --value").strip()
+        result = client.succeed("systemctl show restic-backups-borgbase.service -p Result --value").strip()
         assert result == "success", result
         return client.succeed(f"cat {restic_marker}").strip()
 
-    # Deletes the server refused, counted over the whole boot. Two readings around a run say
+    # Deletes the server refused, counted over the whole boot (forget runs in the maintenance worker). Two readings around a run say
     # whether that run was refused anything, without depending on journal timestamps (this test
     # warps the clock, so --since is meaningless) or on a finished oneshot still reporting an
     # InvocationID to match on.
     def refusals():
         return int(client.succeed(
-            "journalctl -b --no-pager -u restic-backups-monitoring-platform.service"
+            "journalctl -b --no-pager -u restic-backups-borgbase-maintenance.service"
             " | grep -c -F '(403): 403 Forbidden' || true"
         ).strip())
 
     # Read off the server's own filesystem rather than through `restic snapshots`: it is the
     # side the refusal comes from, and it needs no repository password on this node.
     def snapshot_ids():
-        return set(platform.succeed("ls -1 /var/lib/restic/monitoring-platform/snapshots").split())
+        return set(platform.succeed("ls -1 /var/lib/restic/borgbase/snapshots").split())
 
     # Warm up: one day forward wakes the daily timers on their own. The mocked upgrade
     # succeeds and the real restic backup to the REST server succeeds, each recording its
@@ -319,15 +324,20 @@ nixpkgs.lib.nixos.runTest {
     # and the append-only server has nothing to refuse yet.
     assert len(snapshot_ids()) == 1, snapshot_ids()
     assert refusals() == 0
-    # The receiver was stopped for the backup phase and started again before the check, on the
-    # real config -- ordering, not just liveness. Last occurrence of each: the receiver also
+    # The receiver and pw-mgr were stopped for the backup phase and started again before the
+    # check, on the real config -- ordering, not just liveness. Last occurrence of each: both also
     # started at boot, and only this one backup run has happened so far.
-    client.succeed("systemctl is-active --quiet monitoring-platform.service")
-    mp_log = client.succeed("journalctl -b --no-pager -u restic-backups-monitoring-platform.service -u monitoring-platform.service").splitlines()
-    assert any("Stopped Monitoring platform OTLP receiver" in line for line in mp_log), mp_log[-40:]
-    restarted = max(i for i, line in enumerate(mp_log) if "Started Monitoring platform OTLP receiver" in line)
-    checked = max(i for i, line in enumerate(mp_log) if "no errors were found" in line)
-    assert restarted < checked, mp_log[min(restarted, checked):]
+    backup_log = client.succeed(
+        "journalctl -b --no-pager -u restic-backups-borgbase.service -u restic-backups-borgbase-maintenance.service"
+        " -u monitoring-platform.service -u pw-mgr.service"
+    ).splitlines()
+    checked = max(i for i, line in enumerate(backup_log) if "no errors were found" in line)
+    for unit in ["monitoring-platform.service", "pw-mgr.service"]:
+        client.succeed(f"systemctl is-active --quiet {unit}")
+        description = client.succeed(f"systemctl show {unit} -p Description --value").strip()
+        assert any(f"Stopped {description}" in line for line in backup_log), (unit, backup_log[-40:])
+        restarted = max(i for i, line in enumerate(backup_log) if f"Started {description}" in line)
+        assert restarted < checked, (unit, backup_log[min(restarted, checked):])
     # Let the warm-up monitoring run (also fired by the jump) finish so its POSTs can't
     # leak into the next run's log after we reset it. `! systemctl is-active` is unreliable
     # here: common-monitoring.service is Type=oneshot, so while it runs it is in state
@@ -345,7 +355,7 @@ nixpkgs.lib.nixos.runTest {
     assert_events(["POST /health/start", "POST /health/log", "POST /health"])
     platform.succeed("grep -F '[SKIP] smart: disabled' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F '[SKIP] iroh-ssh: disabled' /var/lib/monitoring-platform/bodies.log")
-    platform.succeed("grep -F '[OK] restic monitoring-platform: restic-backups-monitoring-platform.service last succeeded' /var/lib/monitoring-platform/bodies.log")
+    platform.succeed("grep -F '[OK] restic borgbase: restic-backups-borgbase.service last succeeded' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F '[OK] auto-upgrade: nixos-upgrade.service last succeeded' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F '[OK] disk-space:' /var/lib/monitoring-platform/bodies.log")
     platform.succeed("grep -F '[OK] generations:' /var/lib/monitoring-platform/bodies.log")
@@ -374,7 +384,7 @@ nixpkgs.lib.nixos.runTest {
     assert refused > 0, "append-only server refused no delete; forget had nothing to expire"
     stale = snapshot_ids()
     assert len(stale) == 2, stale
-    client.succeed("journalctl -b --no-pager -u restic-backups-monitoring-platform.service | grep -F 'no errors were found'")
+    client.succeed("journalctl -b --no-pager -u restic-backups-borgbase-maintenance.service | grep -F 'no errors were found'")
 
     # --- append-only off: the same repository actually gets pruned ------------------------
     # Only the server's refusal goes away -- same repo, same credentials, same policy. The next
@@ -408,7 +418,7 @@ nixpkgs.lib.nixos.runTest {
     platform.wait_until_succeeds("grep -Fxq 'POST /health/fail' /var/lib/monitoring-platform/events.log", timeout=600)
     assert_events(["POST /health/start", "POST /health/log", "POST /health/fail"])
     platform.succeed("grep -F '[FAIL] auto-upgrade: nixos-upgrade.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")
-    platform.succeed("grep -F '[FAIL] restic monitoring-platform: restic-backups-monitoring-platform.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")
+    platform.succeed("grep -F '[FAIL] restic borgbase: restic-backups-borgbase.service last succeeded' /var/lib/monitoring-platform/bodies.log | grep -F 'older than 14d'")
     platform.succeed("grep -F 'status=failed' /var/lib/monitoring-platform/bodies.log")
   '';
 }
