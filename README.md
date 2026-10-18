@@ -374,12 +374,32 @@ distinct operators, an empty or unknown server list, and a marker path
 `RuntimeDirectory` cannot create.
 
 `modules/restic.nix` configures named restic backups using systemd credentials.
-Each backup must specify the user that runs the service. Backup paths are bound
-read-only into the hardened unit while `/home` is otherwise protected with a
-temporary filesystem view.
-Each backup expects a credential directory with raw secret files:
+Each backup `<name>` becomes four units:
+
+- `restic-backups-<name>`: the scheduled unit (timer, monitoring marker). It runs as
+  root but only drives systemd: no network, no capabilities, unix sockets only.
+- `restic-backups-<name>-preflight`: opens (or initialises) the repository before
+  anything is stopped, so an unreachable backend leaves `stopServices` alone.
+- `restic-backups-<name>-backup`: `restic backup` of the configured paths.
+- `restic-backups-<name>-maintenance`: `unlock`, `forget --prune` and `check`.
+
+The three workers run as a dynamic user in an empty root (NixOS confinement) holding
+only the store paths they need, `/etc/resolv.conf` and `/etc/hosts`. Only the backup
+worker sees the backup paths, read-only, and reads them with `CAP_DAC_READ_SEARCH`
+whatever their owner and mode; nothing is writable but each unit's own cache and
+runtime directories. TLS trusts the system CA store (`security.pki.caBundle`, so
+`security.pki.certificateFiles` applies).
+
+Units listed in `stopServices` are stopped after the preflight and started again right
+after the backup, before retention and check. Only units that were running are started
+again, and they are started again when the backup fails too.
+
+Each backup expects a credential directory of systemd-creds-encrypted files, each
+encrypted with `--name=` set to its file name. The repository location is one of them,
+so it stays out of git and the store:
 
 ```text
+/etc/credentials/restic/home/repository
 /etc/credentials/restic/home/repository-password
 /etc/credentials/restic/home/backend-username
 /etc/credentials/restic/home/backend-password
@@ -390,36 +410,33 @@ separate from the common module:
 
 ```nix
 common.restic.backups.home = common.lib.restic.rest {
-  user = "sashee";
   credentialDirectory = "/etc/credentials/restic/home";
-  url = "https://backup.example.com";
-  repository = "home";
   paths = [ "/home/sashee" ];
   exclude = [ ".stversions" ];
-  prune.ignoreErrors = false;
+  stopServices = [ "syncthing.service" ];
 };
 
 common.restic.backups.photos = common.lib.restic.s3 {
-  user = "sashee";
   credentialDirectory = "/etc/credentials/restic/photos";
-  endpoint = "s3.example.com";
-  bucket = "restic-backups";
   paths = [ "/home/sashee/Pictures" ];
   prune.ignoreErrors = true;
 };
 ```
 
-For S3 backups, use AWS credential files instead of `backend-password`:
+For S3 backups, use AWS credential files instead of `backend-username` and
+`backend-password`:
 
 ```text
+/etc/credentials/restic/photos/repository
 /etc/credentials/restic/photos/repository-password
 /etc/credentials/restic/photos/aws-access-key-id
 /etc/credentials/restic/photos/aws-secret-access-key
 ```
 
-Missing credential files skip the generated backup unit instead of failing it.
+Missing credential files skip the generated backup units instead of failing them.
 Backups run `restic unlock` before `backup`, use `--group-by=` for backup and
-retention, and run `restic check` after backup/retention.
+retention (by default keeping 7 daily, 4 weekly and 12 monthly snapshots), and run
+`restic check` after retention.
 When `prune.ignoreErrors = true`, backup success is preserved even if `restic
 forget --prune` fails on an append-only repository.
 

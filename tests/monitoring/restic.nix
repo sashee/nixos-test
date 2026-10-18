@@ -52,7 +52,6 @@ let
     };
 
     common.restic.backups.monitored = resticLib.rest {
-      user = "backup-user";
       credentialDirectory = "/etc/credentials/restic/monitored";
       paths = [ "/home/backup-user/monitored" ];
       prune.opts = [ "--keep-last 2" ];
