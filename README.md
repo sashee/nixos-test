@@ -392,15 +392,18 @@ The repository is opened (or initialised), the backup's sandbox built and stale 
 cleared before anything in `stopServices` is stopped, so an unreachable backend or a
 missing backup path leaves those units alone. They are released right after the backup,
 before retention and check, and when the backup fails too. Only units that were running
-(or had failed) are started again.
+or on their way up are started again (a crash loop waiting out `RestartSec` included); a
+unit stopped by hand, or failed, is left as it is. A start or restart under way when the
+backup begins is waited for rather than cut short.
 
 Stopping goes through units, so that backups sharing a unit share its downtime: each
 stopped unit gets one `restic-quiesce-<unit>`, which stops it when started and starts it
 again when stopped, and each backup a `restic-hold-<name>` that requires those. The
 backup starts its hold before reading and stops it right after (`BindsTo=` stops it
 however the backup ends), and systemd stops a quiesce unit once no hold requires it
-(`StopWhenUnneeded=`). A start that fails leaves the quiesce unit failed;
-`restic-recover-quiesced.timer` retries it every 15 minutes.
+(`StopWhenUnneeded=`). The start itself is `restic-restart-<unit>`, which retries a
+failed start every 15 minutes until it succeeds; the next backup of the unit takes a
+pending retry over, and `systemctl stop restic-restart-<unit>` gives up on it.
 
 Each backup expects a credential directory of systemd-creds-encrypted files, each
 encrypted with `--name=` set to its file name. The repository location is one of them,

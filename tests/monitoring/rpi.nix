@@ -329,20 +329,30 @@ nixpkgs.lib.nixos.runTest {
     # and the append-only server has nothing to refuse yet.
     assert len(snapshot_ids()) == 1, snapshot_ids()
     assert refusals() == 0
-    # The receiver and pw-mgr were stopped for the backup phase and started again before the
-    # check, on the real config -- ordering, not just liveness. Last occurrence of each: both also
-    # started at boot, and only this one backup run has happened so far.
+    # The receiver and pw-mgr were down while restic read them and started again once the backup
+    # released its hold, which it does before the check -- on the real config, ordering, not just
+    # liveness. The release only sets the start off (systemd then stops the quiesce units, which
+    # starts the services), so they may still be starting while the check runs: the order is
+    # checked against the hold's release, and liveness waited for. Last occurrence of each: both
+    # also started at boot, and only this one backup run has happened so far.
+    for unit in ["monitoring-platform.service", "pw-mgr.service"]:
+        client.wait_until_succeeds(f"systemctl is-active --quiet {unit}", timeout=300)
+    hold = "restic-hold-borgbase.service"
     backup_log = client.succeed(
         "journalctl -b --no-pager -u restic-backups-borgbase.service"
-        " -u monitoring-platform.service -u pw-mgr.service"
+        f" -u {hold} -u monitoring-platform.service -u pw-mgr.service"
     ).splitlines()
-    checked = max(i for i, line in enumerate(backup_log) if "no errors were found" in line)
+    last = lambda match: max(i for i, line in enumerate(backup_log) if match(line))
+    hold_description = client.succeed(f"systemctl show {hold} -p Description --value").strip()
+    saved = last(lambda line: "snapshot " in line and " saved" in line)
+    hold_released = last(lambda line: f"Stopped {hold_description}" in line)
+    checked = last(lambda line: "no errors were found" in line)
+    assert saved < hold_released < checked, backup_log[saved:checked + 1]
     for unit in ["monitoring-platform.service", "pw-mgr.service"]:
-        client.succeed(f"systemctl is-active --quiet {unit}")
         description = client.succeed(f"systemctl show {unit} -p Description --value").strip()
-        assert any(f"Stopped {description}" in line for line in backup_log), (unit, backup_log[-40:])
-        restarted = max(i for i, line in enumerate(backup_log) if f"Started {description}" in line)
-        assert restarted < checked, (unit, backup_log[min(restarted, checked):])
+        stopped = last(lambda line: f"Stopped {description}" in line)
+        restarted = last(lambda line: f"Started {description}" in line)
+        assert stopped < saved and hold_released < restarted, (unit, backup_log[stopped:])
     # Let the warm-up monitoring run (also fired by the jump) finish so its POSTs can't
     # leak into the next run's log after we reset it. `! systemctl is-active` is unreliable
     # here: common-monitoring.service is Type=oneshot, so while it runs it is in state
