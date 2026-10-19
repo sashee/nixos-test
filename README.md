@@ -374,25 +374,25 @@ distinct operators, an empty or unknown server list, and a marker path
 `RuntimeDirectory` cannot create.
 
 `modules/restic.nix` configures named restic backups using systemd credentials.
-Each backup `<name>` becomes four units:
+Each backup `<name>` is one unit, `restic-backups-<name>`, with its timer. It runs as a
+dynamic user holding only `CAP_DAC_READ_SEARCH` (read any file, whatever its owner and
+mode), and every restic run goes through a Landlock sandbox (`setpriv`) that decides
+what restic may touch:
 
-- `restic-backups-<name>`: the scheduled unit (timer, monitoring marker). It runs as
-  root but only drives systemd: no network, no capabilities, unix sockets only.
-- `restic-backups-<name>-preflight`: opens (or initialises) the repository before
-  anything is stopped, so an unreachable backend leaves `stopServices` alone.
-- `restic-backups-<name>-backup`: `restic backup` of the configured paths.
-- `restic-backups-<name>-maintenance`: `unlock`, `forget --prune` and `check`.
+- `backup`: reads the backup paths, read-only, with the capability.
+- everything else (`cat config`/`init`, `unlock`, `forget --prune`, `check`): no backup
+  paths, and the capability dropped.
 
-The three workers run as a dynamic user in an empty root (NixOS confinement) holding
-only the store paths they need, `/etc/resolv.conf` and `/etc/hosts`. Only the backup
-worker sees the backup paths, read-only, and reads them with `CAP_DAC_READ_SEARCH`
-whatever their owner and mode; nothing is writable but each unit's own cache and
-runtime directories. TLS trusts the system CA store (`security.pki.caBundle`, so
-`security.pki.certificateFiles` applies).
+Either way restic can read the store, its credentials, `/etc/resolv.conf` and
+`/etc/hosts`, and write only its cache and private `/tmp`. Landlock restricts opening
+files, not looking them up, so names and metadata elsewhere stay visible. TLS trusts the
+system CA store (`security.pki.caBundle`, so `security.pki.certificateFiles` applies).
 
-Units listed in `stopServices` are stopped after the preflight and started again right
-after the backup, before retention and check. Only units that were running are started
-again, and they are started again when the backup fails too.
+The repository is opened (or initialised) and the backup's sandbox built before
+anything in `stopServices` is stopped, so an unreachable backend or a missing backup
+path leaves those units alone. They are stopped with root `+` hooks and started again
+right after the backup, before retention and check. Only units that were running are
+started again, and they are started again when the backup fails too.
 
 Each backup expects a credential directory of systemd-creds-encrypted files, each
 encrypted with `--name=` set to its file name. The repository location is one of them,
@@ -433,12 +433,13 @@ For S3 backups, use AWS credential files instead of `backend-username` and
 /etc/credentials/restic/photos/aws-secret-access-key
 ```
 
-Missing credential files skip the generated backup units instead of failing them.
+Missing credential files skip the generated backup unit instead of failing it.
 Backups run `restic unlock` before `backup`, use `--group-by=` for backup and
 retention (by default keeping 7 daily, 4 weekly and 12 monthly snapshots), and run
-`restic check` after retention.
+`restic check` after retention, whether or not retention succeeded.
 When `prune.ignoreErrors = true`, backup success is preserved even if `restic
-forget --prune` fails on an append-only repository.
+forget --prune` fails on an append-only repository; otherwise that failure fails the
+unit once the check has run.
 
 `modules/monitoring.nix` runs daily health checks — SMART disk status, restic
 backup age, local disk-space usage, NixOS system-generation count,
