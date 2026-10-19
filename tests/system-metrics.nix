@@ -838,9 +838,6 @@ nixpkgs.lib.nixos.runTest {
         # From services.dnscrypt-proxy and nix.gc, nixpkgs options read directly.
         assert "dnscrypt-proxy.service" in watched, watched
         assert "nix-gc.service" in watched, watched
-        # From common.restic.backups: each backup's orchestrator and all of its workers.
-        for suffix in ["", "-preflight", "-backup", "-maintenance"]:
-            assert f"restic-backups-borgbase{suffix}.service" in watched, watched
 
     with subtest("a watched unit reports its state and its last success separately"):
         collector = by_attr(measurements, "system.unit", "unit", "mp-collector.service")

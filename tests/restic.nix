@@ -62,30 +62,41 @@ let
     };
 
   # An HTTPS REST backend signed by a test CA that the client trusts only through the system CA
-  # store (security.pki.certificateFiles) -- the bundle the workers' SSL_CERT_FILE points at.
+  # store (security.pki.certificateFiles) -- the bundle the unit's SSL_CERT_FILE points at.
   tlsCert = import ./test-cert.nix { inherit pkgs; } { name = "restic-backend"; sans = [ "restic-backend" ]; };
 
-  # Runs inside a worker's sandbox as an extra ExecStartPre and fails the unit on any breach of
-  # spec/features/backups.md's hardening: only the backed-up directories are readable, nothing is
-  # writable but the unit's own directories. Checked from the inside because a sandbox setting can
-  # be dropped without a word -- TemporaryFileSystem=/ is, under ProtectSystem=strict -- and no
-  # config-shape assertion would notice.
+  # Runs inside the backup's Landlock sandbox -- through the module's own launcher, as an extra
+  # ExecStartPre -- and fails the unit on any breach of spec/features/backups.md's hardening: only
+  # what the phase needs is readable, nothing is writable but the unit's own directories. Checked
+  # from the inside because a sandbox can be weaker than its configuration reads, and no
+  # config-shape assertion would notice. Each denial is of something file permissions allow here
+  # (world-readable, owned by the unit, or within CAP_DAC_READ_SEARCH), so it is Landlock's.
   sandboxProbe = phase: pkgs.writeShellScript "restic-sandbox-probe-${phase}" ''
-    export PATH=${nixpkgs.lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep ]}
+    export PATH=${nixpkgs.lib.makeBinPath [ pkgs.coreutils pkgs.util-linux ]}
     fail() { echo "sandbox probe (${phase}): $*"; exit 1; }
-    for path in /etc/shadow /etc/credentials /var/lib/systemd/credential.secret /var/lib/sandbox-outside /root/sandbox-outside; do
-      [ ! -e "$path" ] || fail "$path is visible"
+    # Never into /dev/null: it is outside the sandbox, so the redirect would fail before the
+    # command ran, and pass for a denial.
+    quiet() { "$@" > /tmp/sandbox-probe-out 2>&1; }
+    for path in /etc/shadow /var/lib/systemd/credential.secret /etc/credentials/restic/sandbox/repository /root/sandbox-outside /var/lib/sandbox-outside/world-readable /proc/self/status; do
+      if quiet cat "$path"; then fail "$path is readable"; fi
     done
-    if touch /sandbox-probe 2>/dev/null; then fail "/ is writable"; fi
-    touch "$CACHE_DIRECTORY/sandbox-probe" || fail "its cache directory is not writable"
+    if quiet ls /; then fail "/ can be listed"; fi
+    quiet cat "$CREDENTIALS_DIRECTORY/repository-password" || fail "cannot read its credentials"
+    for path in /sandbox-probe "$RUNTIME_DIRECTORY/sandbox-probe" /var/tmp/sandbox-probe; do
+      if quiet touch "$path"; then fail "$path is writable"; fi
+    done
+    quiet touch "$CACHE_DIRECTORY/sandbox-probe" || fail "its cache directory is not writable"
     rm -f "$CACHE_DIRECTORY/sandbox-probe"
+    # Raising the inheritable set only works for a capability the process holds: a test of the
+    # capability that does not need /proc.
     ${if phase == "backup" then ''
-      grep -Eqx 'CapEff:[[:space:]]+0000000000000004' /proc/self/status || fail "capabilities beyond CAP_DAC_READ_SEARCH: $(grep CapEff /proc/self/status)"
-      cat /home/backup-user/sandbox/root-only > /dev/null || fail "cannot read a root-only file in its backup path"
-      if touch /home/backup-user/sandbox/sandbox-probe 2>/dev/null; then fail "its backup path is writable"; fi
+      quiet setpriv --inh-caps=+dac_read_search true || fail "does not hold CAP_DAC_READ_SEARCH"
+      quiet cat /home/backup-user/sandbox/root-only || fail "cannot read a root-only file in its backup path"
+      quiet cat "$RUNTIME_DIRECTORY/includes" || fail "cannot read its --files-from list"
+      if quiet touch /home/backup-user/sandbox/sandbox-probe; then fail "its backup path is writable"; fi
     '' else ''
-      grep -Eqx 'CapEff:[[:space:]]+0000000000000000' /proc/self/status || fail "has capabilities: $(grep CapEff /proc/self/status)"
-      [ ! -e /home/backup-user/sandbox ] || fail "the backup path is visible"
+      if quiet setpriv --inh-caps=+dac_read_search true; then fail "holds CAP_DAC_READ_SEARCH"; fi
+      if quiet cat /home/backup-user/sandbox/payload.txt; then fail "the backup path is readable"; fi
     ''}
     echo "sandbox probe (${phase}): ok"
   '';
@@ -95,7 +106,7 @@ nixpkgs.lib.nixos.runTest {
   hostPkgs = pkgs;
   skipTypeCheck = true;
 
-  nodes.client = { ... }: {
+  nodes.client = { config, ... }: {
     imports = [ commonDesktopModule ];
 
     networking.hostName = "restic-client";
@@ -214,11 +225,12 @@ nixpkgs.lib.nixos.runTest {
       paths = [ "/home/backup-user/sandbox" ];
       timerConfig = null;
     };
-    systemd.services.restic-backups-sandbox-preflight.serviceConfig.ExecStartPre = [ "${sandboxProbe "preflight"}" ];
-    # After upstream's own pre-start (repository init), right before the backup.
-    systemd.services.restic-backups-sandbox-backup.serviceConfig.ExecStartPre =
-      nixpkgs.lib.mkOrder 2000 [ "${sandboxProbe "backup"}" ];
-    systemd.services.restic-backups-sandbox-maintenance.serviceConfig.ExecStartPre = [ "${sandboxProbe "maintenance"}" ];
+    # After upstream's pre-start (repository init, the --files-from list), right before the backup.
+    systemd.services.restic-backups-sandbox.serviceConfig.ExecStartPre =
+      let
+        sandbox = nixpkgs.lib.getExe config.common.restic.backups.sandbox.sandbox;
+      in
+      nixpkgs.lib.mkOrder 2000 (map (phase: "${sandbox} ${phase} ${sandboxProbe phase}") [ "repository" "backup" ]);
 
     common.restic.backups.s3 = resticLib.s3 {
       credentialDirectory = "/etc/credentials/restic/s3";
@@ -306,6 +318,8 @@ nixpkgs.lib.nixos.runTest {
   };
 
   testScript = ''
+    import re
+
     start_all()
 
     for node in machines:
@@ -398,55 +412,56 @@ nixpkgs.lib.nixos.runTest {
         raise Exception(f"could not parse Garage key output: {s3_key_output}")
     backend.succeed("garage bucket allow --read --write restic-s3 --key restic-s3")
 
-    # Each backup is a root orchestrator (no network, unix sockets only) driving three sandboxed
-    # workers that run as a dynamic user; only the backup worker reads the paths, with a capability.
-    for unit in ["restic-backups-append-ignored-preflight.service", "restic-backups-append-ignored-backup.service", "restic-backups-append-ignored-maintenance.service"]:
-        client.succeed(f"systemctl cat {unit} | grep -F 'User=restic-append-ignored'")
-        client.succeed(f"systemctl cat {unit} | grep -F 'DynamicUser=true'")
-        client.succeed(f"systemctl cat {unit} | grep -F 'ProtectSystem=strict'")
-        client.succeed(f"systemctl cat {unit} | grep -F 'ProtectHome=tmpfs'")
-        client.succeed(f"systemctl cat {unit} | grep -F 'RootDirectory='")
-        client.succeed(f"systemctl cat {unit} | grep -F 'RestrictAddressFamilies=' | grep -F 'AF_INET' | grep -F 'AF_INET6'")
-        client.fail(f"systemctl cat {unit} | grep -F 'RestrictAddressFamilies=' | grep -F 'AF_UNIX'")
-    client.succeed("systemctl cat restic-backups-append-ignored-backup.service | grep -F 'AmbientCapabilities=CAP_DAC_READ_SEARCH'")
-    client.succeed("systemctl cat restic-backups-append-ignored-backup.service | grep -F 'PrivateUsers=false'")
-    client.succeed("systemctl cat restic-backups-append-ignored-backup.service | grep -F 'BindReadOnlyPaths=/home/backup-user/append-ignored'")
-    for unit in ["restic-backups-append-ignored-preflight.service", "restic-backups-append-ignored-maintenance.service"]:
-        client.fail(f"systemctl cat {unit} | grep -F 'CAP_DAC_READ_SEARCH'")
-        client.succeed(f"systemctl cat {unit} | grep -F 'PrivateUsers=true'")
-        client.fail(f"systemctl cat {unit} | grep -F 'BindReadOnlyPaths=/home/backup-user/append-ignored'")
-    client.succeed("systemctl cat restic-backups-append-ignored.service | grep -Fx 'RestrictAddressFamilies=AF_UNIX'")
-    client.succeed("systemctl cat restic-backups-append-ignored.service | grep -Fx 'PrivateNetwork=true'")
-    client.succeed("systemctl cat restic-backups-append-ignored.service | grep -Fx 'CapabilityBoundingSet='")
-    client.fail("systemctl cat restic-backups-append-ignored.service | grep -F 'User='")
-    client.succeed("systemctl cat restic-backups-append-ignored-backup.service | grep -F 'RESTIC_PASSWORD_FILE=$CREDENTIALS_DIRECTORY/repository-password'")
-    client.fail("systemctl cat restic-backups-append-ignored-backup.service | grep -F '/run/credentials/restic-backups-append-ignored-backup.service/repository-password'")
-    client.succeed("systemctl cat restic-backups-append-ignored-backup.service | grep -F 'backup --group-by='")
-    client.succeed("systemctl cat restic-backups-append-ignored-maintenance.service | grep -F 'forget --prune --group-by='")
-    client.succeed("systemctl cat restic-backups-append-ignored-maintenance.service | grep -F ' check'")
-    client.succeed("grep -F '${pkgs.restic}/bin/restic unlock' /nix/store/*-restic-append-ignored/bin/restic-append-ignored")
-    client.succeed("systemctl cat restic-backups-normal-strict-maintenance.service | grep -F 'forget --prune --group-by='")
-    client.succeed("systemctl cat restic-backups-s3-backup.service | grep -F 'LoadCredentialEncrypted=aws-access-key-id:/etc/credentials/restic/s3/aws-access-key-id'")
-    client.succeed("systemctl cat restic-backups-s3-backup.service | grep -F 'LoadCredentialEncrypted=aws-secret-access-key:/etc/credentials/restic/s3/aws-secret-access-key'")
-    client.succeed("systemctl cat restic-backups-s3-backup.service | grep -F -- '--exclude-file='")
+    # The store paths of a unit's ExecStart commands, in order.
+    def exec_paths(unit, prop="ExecStart"):
+        return re.findall(r"path=(\S+) ;", client.succeed(f"systemctl show {unit} -p {prop} --value"))
 
-    # --- the repository location is a credential, so it must appear nowhere in the units ---
+    def only_index(cmds, needle):
+        matches = [i for i, cmd in enumerate(cmds) if needle in cmd]
+        assert len(matches) == 1, f"expected exactly one {needle!r} in {cmds}"
+        return matches[0]
+
+    # Each backup is one unit, run as a dynamic user holding only CAP_DAC_READ_SEARCH. What restic
+    # may touch is decided per run by the Landlock sandbox the wrapper starts it in, not by mounts.
+    unit = "restic-backups-append-ignored.service"
+    for line in ["User=restic-append-ignored", "DynamicUser=true", "AmbientCapabilities=CAP_DAC_READ_SEARCH", "CapabilityBoundingSet=CAP_DAC_READ_SEARCH", "PrivateUsers=false", "ProtectSystem=strict", "ProtectHome=read-only", "X-RestartIfChanged=false"]:
+        client.succeed(f"systemctl cat {unit} | grep -Fx '{line}'")
+    client.fail(f"systemctl cat {unit} | grep -E '^(RootDirectory|BindReadOnlyPaths|BindPaths|TemporaryFileSystem)='")
+    client.succeed(f"systemctl cat {unit} | grep -F 'RestrictAddressFamilies=' | grep -F 'AF_INET' | grep -F 'AF_INET6'")
+    client.fail(f"systemctl cat {unit} | grep -F 'RestrictAddressFamilies=' | grep -F 'AF_UNIX'")
+    client.succeed(f"systemctl cat {unit} | grep -F 'RESTIC_PASSWORD_FILE=$CREDENTIALS_DIRECTORY/repository-password'")
+    client.fail(f"systemctl cat {unit} | grep -F '/run/credentials/{unit}/repository-password'")
+    client.succeed(f"systemctl cat {unit} | grep -F 'backup --group-by='")
+    # Every restic run goes through the sandbox; only the backup itself in the backup phase.
+    wrapper = next(p for p in exec_paths(unit) if p.endswith("/bin/restic-append-ignored"))
+    client.succeed(f"grep -E 'restic-append-ignored-sandbox repository ${pkgs.restic}/bin/restic unlock$' {wrapper}")
+    client.succeed(f"grep -E '^ *exec .*restic-append-ignored-sandbox backup ${pkgs.restic}/bin/restic \"[$]@\"$' {wrapper}")
+    client.succeed(f"grep -E '^ *exec .*restic-append-ignored-sandbox repository ${pkgs.restic}/bin/restic \"[$]@\"$' {wrapper}")
+    for name in ["append-ignored", "normal-strict"]:
+        maintenance = next(p for p in exec_paths(f"restic-backups-{name}.service") if p.endswith("-maintenance"))
+        client.succeed(f"grep -F 'forget --prune --group-by=' {maintenance}")
+        client.succeed(f"grep -E ' check$' {maintenance}")
+    client.succeed("systemctl cat restic-backups-s3.service | grep -F 'LoadCredentialEncrypted=aws-access-key-id:/etc/credentials/restic/s3/aws-access-key-id'")
+    client.succeed("systemctl cat restic-backups-s3.service | grep -F 'LoadCredentialEncrypted=aws-secret-access-key:/etc/credentials/restic/s3/aws-secret-access-key'")
+    client.succeed("systemctl cat restic-backups-s3.service | grep -F -- '--exclude-file='")
+
+    # --- the repository location is a credential, so it must appear nowhere in the unit ---
     for name in ["append-ignored", "s3"]:
-        all_units = " ".join(f"restic-backups-{name}{suffix}.service" for suffix in ["", "-preflight", "-backup", "-maintenance"])
-        for phase in ["preflight", "backup", "maintenance"]:
-            client.succeed(f"systemctl cat restic-backups-{name}-{phase}.service | grep -F 'LoadCredentialEncrypted=repository:/etc/credentials/restic/{name}/repository'")
-            client.succeed(f"systemctl cat restic-backups-{name}-{phase}.service | grep -F 'RESTIC_REPOSITORY_FILE=/run/credentials/restic-backups-{name}-{phase}.service/repository'")
-        client.succeed(f"systemctl cat restic-backups-{name}.service | grep -F 'ConditionPathExists=/etc/credentials/restic/{name}/repository'")
+        unit = f"restic-backups-{name}.service"
+        client.succeed(f"systemctl cat {unit} | grep -F 'LoadCredentialEncrypted=repository:/etc/credentials/restic/{name}/repository'")
+        client.succeed(f"systemctl cat {unit} | grep -F 'RESTIC_REPOSITORY_FILE=/run/credentials/{unit}/repository'")
+        client.succeed(f"systemctl cat {unit} | grep -F 'ConditionPathExists=/etc/credentials/restic/{name}/repository'")
         # Upstream would render RESTIC_REPOSITORY= from the (now absent) option; the wrapper
-        # points restic at the decrypted file instead, so the location never reaches a unit.
-        client.fail(f"systemctl cat {all_units} | grep -F 'RESTIC_REPOSITORY='")
-        client.fail(f"systemctl cat {all_units} | grep -E 'rest:|s3:'")
+        # points restic at the decrypted file instead, so the location never reaches the unit.
+        client.fail(f"systemctl cat {unit} | grep -F 'RESTIC_REPOSITORY='")
+        client.fail(f"systemctl cat {unit} | grep -E 'rest:|s3:'")
     # createWrapper=false: no restic-<name> on the system PATH baking the environment into a
     # world-readable store path.
     client.fail("command -v restic-append-ignored")
     client.succeed("systemctl show restic-backups-timer-rest.timer -p TimersCalendar --value | grep -F '*-*-* 00:00:00'")
     client.succeed("systemctl show restic-backups-timer-rest.timer -p Persistent --value | grep -F yes")
     client.succeed("systemctl show restic-backups-timer-rest.timer -p RandomizedDelayUSec --value | grep -F '1h'")
+    client.succeed("systemctl cat restic-backups-timer-rest.timer | grep -Fx 'X-OnlyManualStart=true'")
     client.succeed("systemctl is-active --quiet restic-backups-timer-rest.timer")
     client.succeed("test -f /etc/credentials/restic/timer-rest/repository")
     client.succeed("test -f /etc/credentials/restic/timer-rest/repository-password")
@@ -455,26 +470,20 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("test -f /home/backup-user/timer-rest/payload.txt")
 
     # --- stopServices: hook shape and, above all, where the restart sits in the sequence ---
-    # The hooks live in the root orchestrator, so they need no "+"; the workers cannot reach systemd.
-    client.succeed("systemctl cat restic-backups-quiesce.service | grep -E '^ExecStartPre=.*-stop-services'")
-    client.succeed("systemctl cat restic-backups-quiesce.service | grep -E '^ExecStopPost=.*-start-services'")
-    client.fail("systemctl cat restic-backups-quiesce-backup.service | grep -F 'RestrictAddressFamilies=' | grep -F 'AF_UNIX'")
+    # "+" runs the hooks as root outside the sandbox, the only way to reach systemd from this unit.
+    client.succeed("systemctl cat restic-backups-quiesce.service | grep -E '^ExecStartPre=\\+.*-stop-services'")
+    client.succeed("systemctl cat restic-backups-quiesce.service | grep -E '^ExecStopPost=\\+.*-start-services'")
+    client.fail("systemctl cat restic-backups-quiesce.service | grep -F 'RestrictAddressFamilies=' | grep -F 'AF_UNIX'")
     # A backup without stopServices gets no hooks at all.
     client.fail("systemctl cat restic-backups-normal-strict.service | grep -F '-services'")
 
-    # systemctl show prints one line per ExecStart command, in order: the restart must come
-    # after the backup and before the check, so the check does not run with the units down.
+    # The restart must come after the backup and before the check, so the check does not run with
+    # the units down.
     quiesce_cmds = client.succeed("systemctl show restic-backups-quiesce.service -p ExecStart --value").splitlines()
-
-    def only_index(cmds, needle):
-        matches = [i for i, cmd in enumerate(cmds) if needle in cmd]
-        assert len(matches) == 1, f"expected exactly one {needle!r} in {cmds}"
-        return matches[0]
-
-    assert only_index(quiesce_cmds, "restic-backups-quiesce-backup.service") < only_index(quiesce_cmds, "-start-services") < only_index(quiesce_cmds, "restic-backups-quiesce-maintenance.service"), quiesce_cmds
-    # And the repository is opened before anything is stopped.
+    assert only_index(quiesce_cmds, "/bin/restic-quiesce backup") < only_index(quiesce_cmds, "-start-services") < only_index(quiesce_cmds, "-maintenance"), quiesce_cmds
+    # And the repository is opened, and the backup's sandbox built, before anything is stopped.
     quiesce_pre = client.succeed("systemctl show restic-backups-quiesce.service -p ExecStartPre --value").splitlines()
-    assert only_index(quiesce_pre, "restic-backups-quiesce-preflight.service") < only_index(quiesce_pre, "-stop-services"), quiesce_pre
+    assert only_index(quiesce_pre, "-pre-start") < only_index(quiesce_pre, "-sandbox backup") < only_index(quiesce_pre, "-stop-services"), quiesce_pre
 
     client.succeed("systemctl start restic-backups-append-ignored.service || true")
     client.fail("systemctl is-failed --quiet restic-backups-append-ignored.service")
@@ -487,7 +496,7 @@ nixpkgs.lib.nixos.runTest {
     # jumping past its next occurrence. Its credentials are provisioned before the
     # service (ordering), so the timer-driven backup succeeds.
     fire_timer(3600)
-    client.wait_until_succeeds("systemctl show restic-backups-timer-rest.service -p ActiveState --value | grep -F inactive && systemctl show restic-backups-timer-rest.service -p Result --value | grep -F success && journalctl -u restic-backups-timer-rest-backup.service | grep -F 'snapshot '", timeout=120)
+    client.wait_until_succeeds("systemctl show restic-backups-timer-rest.service -p ActiveState --value | grep -F inactive && systemctl show restic-backups-timer-rest.service -p Result --value | grep -F success && journalctl -u restic-backups-timer-rest.service | grep -F 'snapshot '", timeout=120)
     assert service_result("timer-rest") == "success"
     client.succeed(f"RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY={REPOS['timer-rest']} ${pkgs.restic}/bin/restic snapshots | grep -F timer-rest")
     client.succeed("systemctl stop restic-backups-timer-rest.timer")
@@ -503,9 +512,10 @@ nixpkgs.lib.nixos.runTest {
     write_rest_credentials("normal-strict", repository=REPOS["s3"])
     client.fail("systemctl start restic-backups-normal-strict.service")
     assert service_result("normal-strict") == "exit-code"
-    # The preflight is the first worker to open the repository, so the guard fires there.
-    client.succeed("journalctl -u restic-backups-normal-strict-preflight.service -n 30 | grep -F 'does not name a rest repository'")
-    client.succeed("systemctl reset-failed restic-backups-normal-strict.service restic-backups-normal-strict-preflight.service")
+    # Upstream's pre-start (repository init) is the first to open the repository, so the guard
+    # fires there.
+    client.succeed("journalctl -u restic-backups-normal-strict.service -n 30 | grep -F 'does not name a rest repository'")
+    client.succeed("systemctl reset-failed restic-backups-normal-strict.service")
     write_rest_credentials("normal-strict")
 
     client.succeed("mkdir -p /etc/credentials/restic/s3 /home/backup-user/s3")
@@ -527,10 +537,17 @@ nixpkgs.lib.nixos.runTest {
         write_payload(name, f"{name} payload updated")
     write_payload("s3", "s3 payload updated")
 
+    # Two snapshots against --keep-last 1: forget now has something to delete, and the append-only
+    # server refuses it.
     client.succeed("systemctl start restic-backups-append-ignored.service")
     assert service_result("append-ignored") == "success"
+    client.succeed("journalctl -b --no-pager -u restic-backups-append-ignored.service | grep -F 'ignored: prune.ignoreErrors'")
+    checks = lambda unit: int(client.succeed(f"journalctl -b --no-pager -u {unit} | grep -c -F 'no errors were found' || true").strip())
+    checked_before = checks("restic-backups-append-strict.service")
     client.fail("systemctl start restic-backups-append-strict.service")
     assert service_result("append-strict") == "exit-code"
+    # The refusal fails the unit, but only after the check: the repository is verified anyway.
+    client.wait_until_succeeds(f"test \"$(journalctl -b --no-pager -u restic-backups-append-strict.service | grep -c -F 'no errors were found')\" -gt {checked_before}", timeout=30)
 
     client.succeed("runuser -u backup-user -- dd if=/dev/urandom of=/home/backup-user/normal-strict/large.bin bs=1M count=64 status=none")
     client.succeed(f"RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY={REPOS['normal-strict']} ${pkgs.restic}/bin/restic backup /home/backup-user/normal-strict >/tmp/create-stale-lock.log 2>&1 & printf '%s' $! > /tmp/create-stale-lock.pid")
@@ -561,8 +578,8 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("grep -F stopped /tmp/restic-quiesce-restore/home/backup-user/quiesce/quiesced-one")
     client.succeed("grep -F stopped /tmp/restic-quiesce-restore/home/backup-user/quiesce/quiesced-two")
 
-    # An unreachable repository fails in the preflight, before anything is stopped: restic would
-    # otherwise retry it for ~15 minutes with the units down. The inactive-enter timestamp tells
+    # An unreachable repository fails in upstream's pre-start (repository init), before anything is
+    # stopped: restic would otherwise retry it for ~15 minutes with the units down. The inactive-enter timestamp tells
     # whether a unit went down at all, whatever state it is back in.
     stamp = lambda unit: client.succeed(f"systemctl show {unit} -p InactiveEnterTimestampMonotonic --value").strip()
     stopped_before = stamp("quiesced-one.service")
@@ -572,11 +589,22 @@ nixpkgs.lib.nixos.runTest {
     assert stamp("quiesced-one.service") == stopped_before, "units were stopped although the repository was unreachable"
     client.succeed("systemctl is-active --quiet quiesced-one.service")
     write_rest_credentials("quiesce")
-    client.succeed("systemctl reset-failed restic-backups-quiesce.service restic-backups-quiesce-preflight.service")
+    client.succeed("systemctl reset-failed restic-backups-quiesce.service")
+
+    # A missing backup path fails the dry run of the backup's sandbox, before anything is stopped:
+    # there is no bind mount any more to fail the unit as it starts.
+    stopped_before = stamp("quiesced-one.service")
+    client.succeed("mv /home/backup-user/quiesce /home/backup-user/quiesce.away")
+    client.fail("systemctl start restic-backups-quiesce.service")
+    assert service_result("quiesce") == "exit-code"
+    client.succeed("journalctl -u restic-backups-quiesce.service -n 30 | grep -F 'could not open file for landlock: /home/backup-user/quiesce'")
+    assert stamp("quiesced-one.service") == stopped_before, "units were stopped for a backup path that does not exist"
+    client.succeed("mv /home/backup-user/quiesce.away /home/backup-user/quiesce")
+    client.succeed("systemctl reset-failed restic-backups-quiesce.service")
 
     # A backup that fails after the units were stopped still brings them back (ExecStopPost). The
-    # repository is broken after the preflight passed -- while the stop script is held on
-    # quiesced-starting -- so the backup worker fails with the units already down. (An unreadable
+    # repository is broken after the pre-start opened it -- while the stop script is held on
+    # quiesced-starting -- so restic backup fails with the units already down. (An unreadable
     # file would not do: CAP_DAC_READ_SEARCH reads it.)
     stopped_before = stamp("quiesced-one.service")
     client.succeed("touch /run/quiesce-hold")
@@ -594,7 +622,7 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("systemctl is-active --quiet quiesced-two.service")
     client.succeed("systemctl is-active --quiet quiesced-starting.service")
     backend.succeed("mv /var/lib/restic-normal/quiesce/keys.bak/* /var/lib/restic-normal/quiesce/keys/ && rmdir /var/lib/restic-normal/quiesce/keys.bak")
-    client.succeed("systemctl reset-failed restic-backups-quiesce.service restic-backups-quiesce-backup.service")
+    client.succeed("systemctl reset-failed restic-backups-quiesce.service")
 
     # A unit that was already stopped stays stopped.
     client.succeed("systemctl stop quiesced-two.service")
@@ -606,7 +634,7 @@ nixpkgs.lib.nixos.runTest {
 
     # Runtime confirmation of the ExecStart ordering asserted above: the last restart of
     # quiesced-one precedes the check output of the run it belongs to.
-    quiesce_log = client.succeed("journalctl -b --no-pager -u restic-backups-quiesce.service -u restic-backups-quiesce-maintenance.service -u quiesced-one.service").splitlines()
+    quiesce_log = client.succeed("journalctl -b --no-pager -u restic-backups-quiesce.service -u quiesced-one.service").splitlines()
     restarted = max(i for i, line in enumerate(quiesce_log) if "Finished" in line and "quiesced-one" in line)
     checked = max(i for i, line in enumerate(quiesce_log) if "no errors were found" in line)
     assert restarted < checked, quiesce_log[min(restarted, checked):]
@@ -640,7 +668,7 @@ nixpkgs.lib.nixos.runTest {
     backend.succeed("set -- /var/lib/restic-normal/check-damaged/data/*/*; rm \"$1\"")
     client.fail("systemctl start restic-backups-check-damaged.service")
     assert service_result("check-damaged") == "exit-code"
-    client.succeed("journalctl -u restic-backups-check-damaged-maintenance.service -n 80 | grep -E 'check|Fatal|not found|repository contains errors|does not exist'")
+    client.succeed("journalctl -u restic-backups-check-damaged.service -n 80 | grep -E 'check|Fatal|not found|repository contains errors|does not exist'")
 
     backend.succeed("test -d /var/lib/restic-append/append-ignored/data")
     backend.succeed("test -d /var/lib/restic-normal/normal-strict/data")
@@ -651,16 +679,16 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("grep -F 's3 payload updated' /tmp/restic-restore/home/backup-user/s3/payload.txt")
     client.fail("test -e /tmp/restic-restore/home/backup-user/s3/excluded.txt")
 
-    # --- the sandbox, from the inside: each worker's probe fails its unit on a breach ---
+    # --- the sandbox, from the inside: each phase's probe fails the unit on a breach ---
     write_rest_credentials("sandbox")
     write_payload("sandbox", "sandbox payload")
     client.succeed("install -m 0600 -o root -g root /dev/null /home/backup-user/sandbox/root-only")
     client.succeed("install -d -m 0755 /var/lib/sandbox-outside && echo visible > /var/lib/sandbox-outside/world-readable && chmod 0644 /var/lib/sandbox-outside/world-readable")
     client.succeed("echo secret > /root/sandbox-outside")
     rc, _ = client.execute("systemctl start restic-backups-sandbox.service")
-    probe_log = client.succeed("journalctl -b --no-pager -o cat -u restic-backups-sandbox-preflight.service -u restic-backups-sandbox-backup.service -u restic-backups-sandbox-maintenance.service | grep -F 'sandbox probe' || true")
+    probe_log = client.succeed("journalctl -b --no-pager -o cat -u restic-backups-sandbox.service | grep -F 'sandbox probe' || true")
     assert rc == 0 and service_result("sandbox") == "success", probe_log
-    for phase in ["preflight", "backup", "maintenance"]:
+    for phase in ["repository", "backup"]:
         assert f"sandbox probe ({phase}): ok" in probe_log, probe_log
     # The root-only file was read: it is in the snapshot.
     sandbox_env = f"RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY={REPOS['sandbox']}"
@@ -679,9 +707,9 @@ nixpkgs.lib.nixos.runTest {
     write_payload("tls", "tls payload")
     client.succeed("systemctl start restic-backups-tls.service")
     assert service_result("tls") == "success"
-    # The workers trust exactly the bundle /etc/ssl/certs points at.
+    # The unit trusts exactly the bundle /etc/ssl/certs points at.
     bundle = client.succeed("readlink -f /etc/ssl/certs/ca-certificates.crt").strip()
-    client.succeed(f"systemctl show restic-backups-tls-backup.service -p Environment --value | tr ' ' '\\n' | grep -Fx SSL_CERT_FILE={bundle}")
+    client.succeed(f"systemctl show restic-backups-tls.service -p Environment --value | tr ' ' '\\n' | grep -Fx SSL_CERT_FILE={bundle}")
     tls_env = f"RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY={tls_repo}"
     client.succeed(f"{tls_env} ${pkgs.restic}/bin/restic snapshots | grep -F /home/backup-user/tls")
     # Control: the stock nixpkgs bundle lacks the test CA, so it is the system store that made the

@@ -7,6 +7,9 @@ let
     "${backup.credentialDirectory}/${credentialName}";
 
   wrapperFor = name: backup:
+    let
+      sandbox = lib.getExe (sandboxFor name backup);
+    in
     pkgs.writeShellApplication {
       name = "restic-${name}";
       runtimeInputs = [ pkgs.coreutils ];
@@ -47,38 +50,80 @@ let
           ''
         }
 
+        # Every restic run is sandboxed; only `backup` gets the backup paths and the capability.
         if [ "''${1:-}" = "backup" ]; then
-          ${lib.getExe pkgs.restic} unlock
+          ${sandbox} repository ${lib.getExe pkgs.restic} unlock
+          exec ${sandbox} backup ${lib.getExe pkgs.restic} "$@"
         fi
 
-        exec ${lib.getExe pkgs.restic} "$@"
+        exec ${sandbox} repository ${lib.getExe pkgs.restic} "$@"
       '';
     };
 
-  # restic-backups-<name> is a root orchestrator that only drives systemd; the restic work runs in
-  # sandboxed oneshot workers it starts in turn (preflight, backup, maintenance). They are separate
-  # units because the workers live in an empty root, and an empty root (RootDirectory=,
-  # TemporaryFileSystem=) also applies to "+" commands: in the same unit, the stop/start scripts
-  # would run chrooted, where systemctl ignores its command and exits 0.
-  systemctl = "${config.systemd.package}/bin/systemctl";
-  workerName = name: phase: "restic-backups-${name}-${phase}";
-  phases = [ "preflight" "backup" "maintenance" ];
-  unitsFor = name: [ "restic-backups-${name}" ] ++ map (workerName name) phases;
-  cacheDir = name: "restic-backups-${name}";
-  credentialsFor = backup: [ "repository" "repository-password" ] ++ backup.backend.credentials;
-  # What name resolution reads; the workers' empty root has no /etc otherwise.
-  nameResolution = [ "/etc/resolv.conf" "/etc/hosts" ];
+  # Landlock rights (setpriv(1) names) on a directory the unit owns.
+  ownDirectoryRights = "read-file,read-dir,write-file,make-dir,make-reg,remove-dir,remove-file,truncate,refer";
 
-  # The workers share one cache, so prune reuses the index the backup just downloaded.
-  workerEnvironment = name: {
-    RESTIC_CACHE_DIR = lib.mkForce "/var/cache/${cacheDir name}";
-    # The system CA store: security.pki.caBundle is the bundle /etc/ssl/certs points at, built
-    # from security.pki.certificateFiles, so a test CA added there is trusted here too.
-    SSL_CERT_FILE = config.security.pki.caBundle;
-  };
+  # Runs a command under this backup's Landlock ruleset: setpriv applies it right before the exec,
+  # and everything the command starts inherits it. Landlock decides on top of file permissions, so
+  # it holds against CAP_DAC_READ_SEARCH, opens by file handle included. It restricts opening
+  # files, not looking them up: names and metadata stay visible.
+  #
+  # Readable in either phase: the store, the unit's credentials and name resolution. Writable: the
+  # unit's cache and its private /tmp, nothing else.
+  #   repository: no backup paths, and the unit's CAP_DAC_READ_SEARCH is dropped.
+  #   backup: the backup paths and the runtime directory (upstream's --files-from list) too,
+  #     read-only, with the capability.
+  # The runtime directory also holds the list of units the root start script starts again, so it
+  # is never writable here.
+  sandboxFor = name: backup:
+    pkgs.writeShellApplication {
+      name = "restic-${name}-sandbox";
+      text = ''
+        phase=$1
+        shift
+        args=(
+          --no-new-privs
+          --landlock-access fs
+          --landlock-rule "path-beneath:execute,read-file,read-dir:/nix/store"
+          --landlock-rule "path-beneath:read-file,read-dir:$CREDENTIALS_DIRECTORY"
+          --landlock-rule "path-beneath:${ownDirectoryRights}:$CACHE_DIRECTORY"
+          --landlock-rule "path-beneath:${ownDirectoryRights}:/tmp"
+        )
+        # A rule on a missing path fails the run, so these are only added where they exist.
+        for file in /etc/resolv.conf /etc/hosts; do
+          if [ -e "$file" ]; then
+            args+=(--landlock-rule "path-beneath:read-file:$file")
+          fi
+        done
 
-  # Only the backup phase itself comes from services.restic.backups (as "<name>-backup", with
-  # no timer of its own); the orchestrator and the maintenance worker are emitted below.
+        case "$phase" in
+          repository)
+            # Clearing the inheritable set clears the ambient one with it, so the command starts
+            # with no capabilities at all.
+            args+=(--inh-caps=-all --ambient-caps=-all)
+            ;;
+          backup)
+            args+=(--landlock-rule "path-beneath:read-file,read-dir:$RUNTIME_DIRECTORY")
+            paths=(${lib.escapeShellArgs backup.paths})
+            for path in "''${paths[@]}"; do
+              # read-dir is rejected on a file.
+              if [ -d "$path" ]; then
+                args+=(--landlock-rule "path-beneath:read-file,read-dir:$path")
+              else
+                args+=(--landlock-rule "path-beneath:read-file:$path")
+              fi
+            done
+            ;;
+          *)
+            echo "unknown sandbox phase: $phase" >&2
+            exit 2
+            ;;
+        esac
+
+        exec ${pkgs.util-linux}/bin/setpriv "''${args[@]}" -- "$@"
+      '';
+    };
+
   backupToResticConfig = name: rawBackup:
     let
       backup = rawBackup // { inherit name; };
@@ -87,38 +132,58 @@ let
       inherit (backup) paths;
       exclude = backup.exclude;
       extraBackupArgs = [ "--group-by=" ];
+      # Opens (or creates) the repository in upstream's pre-start, before anything is stopped.
       initialize = true;
       package = wrapperFor name backup;
       passwordFile = "$CREDENTIALS_DIRECTORY/repository-password";
+      # The repository location comes from the credential, so the unit carries a path to it
+      # rather than the location itself. Not "$CREDENTIALS_DIRECTORY/repository" like
+      # passwordFile above: repositoryFile is typed as an absolute path, so it has to name
+      # systemd's documented runtime location for the unit's credentials directly. Upstream
+      # asserts exactly one of repository/repositoryFile/environmentFile is set.
       repository = null;
-      repositoryFile = "/run/credentials/${workerName name "backup"}.service/repository";
+      repositoryFile = "/run/credentials/restic-backups-${name}.service/repository";
+      # Upstream's `restic-<name>` PATH script bakes the unit's environment into a
+      # world-readable store path, and cannot decrypt systemd credentials anyway.
       createWrapper = false;
       pruneOpts = [ ];
       runCheck = false;
-      # The orchestrator owns the schedule; this unit is only ever started by it.
-      timerConfig = null;
-      # The name of the dynamic user the workers share (DynamicUser below).
+      timerConfig = backup.timerConfig;
+      # The dynamic user the unit runs as (DynamicUser below).
       user = "restic-${name}";
     };
 
   resticFor = name: backup: lib.getExe (wrapperFor name backup);
 
-  # prune.ignoreErrors becomes a "-" prefix (useful for append-only repositories): the
-  # commands still run, their failure does not fail the unit.
-  pruneCommands = name: backup:
+  # Retention, then check. The check runs whatever retention did, so the repository is verified
+  # after every backup; a retention failure fails the unit afterwards unless prune.ignoreErrors
+  # (useful for append-only repositories).
+  maintenanceScript = name: backup:
     let
       restic = resticFor name backup;
-      prefix = lib.optionalString backup.prune.ignoreErrors "-";
       opts = lib.concatStringsSep " " ([ "--group-by=" ] ++ backup.prune.opts);
     in
-    [
-      "${prefix}${restic} unlock"
-      "${prefix}${restic} forget --prune ${opts}"
-    ];
+    pkgs.writeShellApplication {
+      name = "restic-${name}-maintenance";
+      text = ''
+        retention=0
+        ${restic} unlock || retention=$?
+        ${restic} forget --prune ${opts} || retention=$?
+        ${restic} check
+        ${if backup.prune.ignoreErrors then ''
+          if [ "$retention" -ne 0 ]; then
+            echo "retention failed (exit $retention), ignored: prune.ignoreErrors" >&2
+          fi
+        '' else ''
+          exit "$retention"
+        ''}
+      '';
+    };
 
   # The units that were running when the backup started, so a unit someone stopped for
-  # maintenance is not started again. The orchestrator's RuntimeDirectory: root-owned, and not
-  # mounted into either worker, so nothing restic runs can add names to it.
+  # maintenance is not started again. RuntimeDirectory exists before the first Exec* runs
+  # and is removed with the unit, so this cannot outlive a run. restic cannot write it: the
+  # sandbox gives it the directory read-only, in the backup phase only.
   stoppedUnitsFile = name: "/run/restic-backups-${name}/stopped-units";
 
   stopScript = name: backup:
@@ -163,157 +228,78 @@ let
       '';
     };
 
-  # The sandbox the workers share: a throwaway uid in an empty root (NixOS confinement) that holds
-  # only the closures of the unit's Exec* commands, the CA bundle and the binds below. Nothing in
-  # it is writable except the unit's own cache, runtime and private tmp directories.
-  workerFor = name: backup: {
-    unitConfig.ConditionPathExists = map (credentialPath backup) (credentialsFor backup);
-    confinement = {
-      enable = true;
-      packages = [ config.security.pki.caBundle ];
-    };
-    serviceConfig = {
-      # Backend/repo secrets are systemd-creds-encrypted blobs on disk, decrypted at
-      # runtime into $CREDENTIALS_DIRECTORY (never plaintext at rest, never in git/store).
-      LoadCredentialEncrypted = map (credential: "${credential}:${credentialPath backup credential}") (credentialsFor backup);
-      DynamicUser = true;
-      User = "restic-${name}";
-      # ~@privileged also takes open_by_handle_at, which would let CAP_DAC_READ_SEARCH (backup
-      # worker) open files outside the empty root by handle.
-      SystemCallFilter = [ "@system-service" "~@privileged" ];
-      NoNewPrivileges = true;
-      ProtectKernelTunables = true;
-      ProtectKernelModules = true;
-      ProtectKernelLogs = true;
-      ProtectControlGroups = true;
-      RestrictSUIDSGID = true;
-      KeyringMode = "private";
-      ProtectClock = true;
-      RestrictRealtime = true;
-      PrivateDevices = true;
-      PrivateTmp = true;
-      ProtectHostname = true;
-      SystemCallArchitectures = "native";
-      RestrictNamespaces = true;
-      LockPersonality = true;
-      RestrictAddressFamilies = [ "AF_INET" "AF_INET6" ];
-      ProtectProc = "noaccess";
-      RemoveIPC = true;
-      ProtectSystem = "strict";
-      ProtectHome = "tmpfs";
-      CacheDirectory = lib.mkForce (cacheDir name);
-      CacheDirectoryMode = "0700";
-    };
-  };
-
-  # Reads the backup paths: the only unit that holds CAP_DAC_READ_SEARCH (read any file, whatever
-  # its owner and mode), and the only one they are mounted into.
-  backupWorkerFor = name: backup: lib.recursiveUpdate (workerFor name backup) {
-    environment = workerEnvironment name;
-    serviceConfig = {
-      AmbientCapabilities = [ "CAP_DAC_READ_SEARCH" ];
-      CapabilityBoundingSet = [ "CAP_DAC_READ_SEARCH" ];
-      # The capability does not apply to files of uids outside a user namespace.
-      PrivateUsers = false;
-      BindReadOnlyPaths = backup.paths ++ nameResolution;
-    };
-  };
-
-  # Opens (or creates) the repository before anything is stopped. restic retries an unreachable
-  # backend for ~15 minutes, so without this a backend, TLS or DNS outage would keep the
-  # stopServices units down for that long before the backup worker gave up.
-  preflightWorkerFor = name: backup: lib.recursiveUpdate (workerFor name backup) {
-    description = "restic repository preflight for ${name}";
-    wants = [ "network-online.target" ];
-    after = [ "network-online.target" ];
-    environment = workerEnvironment name // {
-      RESTIC_REPOSITORY_FILE = "/run/credentials/${workerName name "preflight"}.service/repository";
-    };
-    serviceConfig = {
-      Type = "oneshot";
-      CapabilityBoundingSet = "";
-      PrivateUsers = true;
-      BindReadOnlyPaths = nameResolution;
-      ExecStart = lib.getExe (pkgs.writeShellApplication {
-        name = "restic-${name}-preflight";
-        text = ''
-          ${resticFor name backup} cat config > /dev/null || ${resticFor name backup} init
-        '';
-      });
-    };
-  };
-
-  # Retention and check talk to the repository only: no backup paths, no capability.
-  maintenanceWorkerFor = name: backup: lib.recursiveUpdate (workerFor name backup) {
-    description = "restic prune and check for ${name}";
-    wants = [ "network-online.target" ];
-    after = [ "network-online.target" ];
-    environment = workerEnvironment name // {
-      RESTIC_REPOSITORY_FILE = "/run/credentials/${workerName name "maintenance"}.service/repository";
-    };
-    serviceConfig = {
-      Type = "oneshot";
-      CapabilityBoundingSet = "";
-      PrivateUsers = true;
-      BindReadOnlyPaths = nameResolution;
-      ExecStart = pruneCommands name backup ++ [ "${resticFor name backup} check" ];
-    };
-  };
-
-  # Root, because it drives systemd, and needs nothing else: no network, no capabilities. Each
-  # `systemctl start` of a oneshot worker returns when the worker has finished, and fails if it
-  # failed. The workers must never be ordered After= this unit: it waits on them.
-  #
-  # Not ProtectProc=: systemctl tells a chroot from the host by PID 1's /proc entry, and inside a
-  # chroot it ignores its command and exits 0 -- the units would silently never be stopped.
-  orchestratorFor = name: backup:
+  # One unit per backup, upstream's restic-backups-<name> with its timer. The unit runs as a
+  # dynamic user holding only CAP_DAC_READ_SEARCH (read any file, whatever its owner and mode),
+  # and what restic may touch is decided per run by the Landlock sandbox above, not by mounts:
+  # an empty root would also apply to the "+" stop/start scripts, where systemctl, chrooted,
+  # ignores its command and exits 0. The systemd hardening below is the second layer.
+  serviceConfigFor = name: rawBackup:
     let
+      backup = rawBackup // { inherit name; };
+      credentials = [ "repository" "repository-password" ] ++ backup.backend.credentials;
       quiesce = backup.stopServices != [ ];
-      startServices = lib.getExe (startScript name backup);
+      # "+" runs the command fully privileged: systemd then skips User=, the capability and
+      # namespacing options and the seccomp filters for it, which is what lets systemctl
+      # (root, AF_UNIX to PID 1) work from inside this otherwise sandboxed unit.
+      startServices = "+${lib.getExe (startScript name backup)}";
     in
     {
-      description = "restic backup ${name}";
-      wants = [ "network-online.target" ];
-      after = [ "network-online.target" ];
-      unitConfig.ConditionPathExists = map (credentialPath backup) (credentialsFor backup);
+      environment = {
+        # The system CA store: security.pki.caBundle is the bundle /etc/ssl/certs points at, built
+        # from security.pki.certificateFiles, so a test CA added there is trusted here too.
+        SSL_CERT_FILE = config.security.pki.caBundle;
+      };
+      unitConfig.ConditionPathExists = map (credentialPath backup) credentials;
       serviceConfig = {
-        Type = "oneshot";
-        RuntimeDirectory = "restic-backups-${name}";
-        ExecStartPre =
-          [ "${systemctl} start ${workerName name "preflight"}.service" ]
-          ++ lib.optional quiesce (lib.getExe (stopScript name backup));
-        # The restart sits between the backup and the prune, so the check does not run with the
-        # units down.
-        ExecStart =
-          [ "${systemctl} start ${workerName name "backup"}.service" ]
-          ++ lib.optional quiesce startServices
-          ++ [ "${systemctl} start ${workerName name "maintenance"}.service" ];
-        # An ExecStart list aborts at the first failing command, so without this a failed
-        # backup would leave the units stopped.
-        ExecStopPost = lib.optional quiesce startServices;
-        PrivateNetwork = true;
-        RestrictAddressFamilies = [ "AF_UNIX" ];
-        CapabilityBoundingSet = "";
+        # Backend/repo secrets are systemd-creds-encrypted blobs on disk, decrypted at
+        # runtime into $CREDENTIALS_DIRECTORY (never plaintext at rest, never in git/store).
+        LoadCredentialEncrypted = map (credential: "${credential}:${credentialPath backup credential}") credentials;
+        DynamicUser = true;
+        AmbientCapabilities = [ "CAP_DAC_READ_SEARCH" ];
+        CapabilityBoundingSet = [ "CAP_DAC_READ_SEARCH" ];
+        # The capability does not apply to files of uids outside a user namespace.
+        PrivateUsers = false;
+        # @sandbox for Landlock, capset for setpriv (it sets capabilities even when told to change
+        # none), which ~@privileged would take. ~@privileged also takes open_by_handle_at, the
+        # other way CAP_DAC_READ_SEARCH reaches files by handle rather than by path.
+        SystemCallFilter = [ "@system-service" "@sandbox" "~@privileged" "capset" ];
         NoNewPrivileges = true;
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        PrivateTmp = true;
-        PrivateDevices = true;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
         ProtectKernelLogs = true;
         ProtectControlGroups = true;
-        ProtectClock = true;
-        ProtectHostname = true;
-        RestrictNamespaces = true;
-        RestrictRealtime = true;
         RestrictSUIDSGID = true;
-        LockPersonality = true;
-        MemoryDenyWriteExecute = true;
         KeyringMode = "private";
-        UMask = "0077";
-        SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+        ProtectClock = true;
+        RestrictRealtime = true;
+        PrivateDevices = true;
+        PrivateTmp = true;
+        ProtectHostname = true;
         SystemCallArchitectures = "native";
+        RestrictNamespaces = true;
+        LockPersonality = true;
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" ];
+        ProtectProc = "noaccess";
+        RemoveIPC = true;
+        ProtectSystem = "strict";
+        ProtectHome = "read-only";
+        UMask = "0077";
+        # After upstream's pre-start (repository init): build the backup's sandbox once, which
+        # fails on a missing backup path, so nothing is stopped for a backup that cannot run.
+        ExecStartPre = lib.mkAfter (
+          [ "${lib.getExe (sandboxFor name backup)} backup ${pkgs.coreutils}/bin/true" ]
+          ++ lib.optional quiesce "+${lib.getExe (stopScript name backup)}"
+        );
+        # Appended to upstream's backup command: restart the stopped units, then retention and
+        # check, so the check does not run with the units down.
+        ExecStart = lib.mkAfter (
+          lib.optional quiesce startServices
+          ++ [ (lib.getExe (maintenanceScript name backup)) ]
+        );
+      } // lib.optionalAttrs quiesce {
+        # An ExecStart list aborts at the first failing command, so without this a failed
+        # backup would leave the units stopped. Stopping the unit kills restic first.
+        ExecStopPost = lib.mkAfter [ startServices ];
       };
     };
 in
@@ -321,7 +307,7 @@ in
   options.common.restic.backups = lib.mkOption {
     description = "Named restic backups using systemd credentials.";
     default = { };
-    type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
+    type = lib.types.attrsOf (lib.types.submodule ({ name, config, ... }: {
       options = {
         credentialDirectory = lib.mkOption {
           type = lib.types.str;
@@ -407,41 +393,43 @@ in
           };
           description = "systemd timer configuration for the backup.";
         };
+
+        sandbox = lib.mkOption {
+          type = lib.types.package;
+          readOnly = true;
+          internal = true;
+          description = ''
+            The launcher every restic run of this backup goes through:
+            `restic-<name>-sandbox repository|backup <command>...` runs the command under the
+            backup's Landlock ruleset for that phase. Exposed so tests can probe the sandbox
+            from inside.
+          '';
+        };
       };
+
+      config.sandbox = sandboxFor name config;
     }));
   };
 
   config = lib.mkIf (cfg.backups != { }) {
-    assertions =
-      let
-        allUnits = lib.concatMap unitsFor (lib.attrNames cfg.backups);
-      in
-      lib.mapAttrsToList
-        (name: backup: {
-          assertion = !lib.any (unit: lib.elem (lib.removeSuffix ".service" unit) (unitsFor name)) backup.stopServices;
-          message = "common.restic.backups.${name}.stopServices must not contain its own units (${lib.concatStringsSep ", " (unitsFor name)}).";
-        })
-        cfg.backups
-      ++ [{
-        # A backup named "x-backup" would otherwise be the backup worker of a backup named "x".
-        assertion = lib.length allUnits == lib.length (lib.unique allUnits);
-        message = "common.restic.backups: the names ${lib.concatStringsSep ", " (lib.attrNames cfg.backups)} generate colliding units (each backup owns ${lib.concatStringsSep ", " (map (p: "restic-backups-<name>-${p}") phases)}).";
-      }];
+    assertions = lib.concatLists (lib.mapAttrsToList
+      (name: backup: [
+        {
+          assertion = !lib.any (unit: unit == "restic-backups-${name}" || unit == "restic-backups-${name}.service") backup.stopServices;
+          message = "common.restic.backups.${name}.stopServices must not contain its own unit, restic-backups-${name}.service.";
+        }
+        {
+          # systemd checks the dynamic user's name only when the unit starts, and then refuses
+          # to run it at all.
+          assertion = builtins.match "[A-Za-z0-9_-]+" name != null && lib.stringLength "restic-${name}" <= 31;
+          message = "common.restic.backups.${name}: the backup runs as the dynamic user restic-${name}, so its name must be at most 24 characters of [A-Za-z0-9_-].";
+        }
+      ])
+      cfg.backups);
 
-    services.restic.backups = lib.mapAttrs'
-      (name: backup: lib.nameValuePair "${name}-backup" (backupToResticConfig name backup))
+    services.restic.backups = lib.mapAttrs backupToResticConfig cfg.backups;
+    systemd.services = lib.mapAttrs'
+      (name: backup: lib.nameValuePair "restic-backups-${name}" (serviceConfigFor name backup))
       cfg.backups;
-    systemd.services = lib.mkMerge [
-      (lib.mapAttrs' (name: backup: lib.nameValuePair (workerName name "preflight") (preflightWorkerFor name backup)) cfg.backups)
-      (lib.mapAttrs' (name: backup: lib.nameValuePair (workerName name "backup") (backupWorkerFor name backup)) cfg.backups)
-      (lib.mapAttrs' (name: backup: lib.nameValuePair (workerName name "maintenance") (maintenanceWorkerFor name backup)) cfg.backups)
-      (lib.mapAttrs' (name: backup: lib.nameValuePair "restic-backups-${name}" (orchestratorFor name backup)) cfg.backups)
-    ];
-    systemd.timers = lib.mapAttrs'
-      (name: backup: lib.nameValuePair "restic-backups-${name}" {
-        wantedBy = [ "timers.target" ];
-        timerConfig = backup.timerConfig;
-      })
-      (lib.filterAttrs (_: backup: backup.timerConfig != null) cfg.backups);
   };
 }

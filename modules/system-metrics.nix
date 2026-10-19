@@ -64,10 +64,7 @@ let
     ++ lib.optional (commonFeature [ "connectivityWatchdog" "enable" ] false)
       "connectivity-watchdog.service"
     ++ lib.optional (commonFeature [ "timeSync" "enable" ] false) "time-correction.service"
-    # Each backup's orchestrator and its workers (modules/restic.nix). A worker's failure also
-    # fails the orchestrator, but only the worker's own state says which phase it was.
-    ++ lib.concatMap
-      (name: map (suffix: "restic-backups-${name}${suffix}.service") [ "" "-preflight" "-backup" "-maintenance" ])
+    ++ map (name: "restic-backups-${name}.service")
       (lib.attrNames (commonFeature [ "restic" "backups" ] { }))
     ++ lib.optional config.nix.gc.automatic "nix-gc.service"
     ++ lib.optional config.system.autoUpgrade.enable "nixos-upgrade.service"

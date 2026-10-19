@@ -385,9 +385,10 @@ in
   # rides out the restart (the notes on their `after` in modules/monitoring-platform-tunnel.nix
   # and modules/pw-mgr-tunnel.nix).
   #
-  # restic itself runs as a throwaway dynamic user in an empty root holding only the two state
-  # directories, read-only, and reads them with CAP_DAC_READ_SEARCH -- both are 0700 and owned by
-  # their services' users. See modules/restic.nix.
+  # restic itself runs as a throwaway dynamic user and reads the two state directories with
+  # CAP_DAC_READ_SEARCH -- both are 0700 and owned by their services' users -- inside a Landlock
+  # sandbox that lets it read them, read-only, and nothing else of the host's. See
+  # modules/restic.nix.
   #
   # Off the default midnight slot: the auto-upgrade starts 00:00-02:00 and drags a GC in
   # ahead of itself, and all of them are SD-I/O bound on this box.
@@ -397,7 +398,7 @@ in
   #
   # Provision out-of-band, ON THIS HOST -- there is no TPM on a Pi 5, so systemd-creds falls back
   # to the host key (/var/lib/systemd/credential.secret) and a reimaged SD needs fresh blobs. All
-  # four must exist: the units' ConditionPathExists lists them, so a missing one makes systemd
+  # four must exist: the unit's ConditionPathExists lists them, so a missing one makes systemd
   # *skip* the backup rather than fail it, which shows up only as a monitoring check that never
   # goes green. The file name and the --name= must match; the name is authenticated into the blob
   # (the directory is not, so a credential directory can be moved with `cp -a`).

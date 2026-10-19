@@ -224,21 +224,23 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("systemctl is-active --quiet common-monitoring.timer")
     client.succeed("systemctl cat common-monitoring.service | grep -F 'LoadCredentialEncrypted=healthchecks-url:/etc/credentials/monitoring/healthchecks-url'")
     client.fail("systemctl cat common-monitoring.service | grep -F 'http://monitoring-platform:8080/health'")
-    backup_units = "restic-backups-borgbase.service restic-backups-borgbase-preflight.service restic-backups-borgbase-backup.service restic-backups-borgbase-maintenance.service"
-    client.succeed("systemctl cat restic-backups-borgbase-backup.service | grep -F 'LoadCredentialEncrypted=repository-password:/etc/credentials/restic/borgbase/repository-password'")
-    client.succeed("systemctl cat restic-backups-borgbase-backup.service | grep -F 'LoadCredentialEncrypted=repository:/etc/credentials/restic/borgbase/repository'")
+    client.succeed("systemctl cat restic-backups-borgbase.service | grep -F 'LoadCredentialEncrypted=repository-password:/etc/credentials/restic/borgbase/repository-password'")
+    client.succeed("systemctl cat restic-backups-borgbase.service | grep -F 'LoadCredentialEncrypted=repository:/etc/credentials/restic/borgbase/repository'")
     # The deployed config names no repository: it comes from the credential above, so the real
-    # BorgBase URL is neither in git nor in any of the backup's units.
-    client.fail(f"systemctl cat {backup_units} | grep -E 'RESTIC_REPOSITORY=|repo[.]borgbase|rest:'")
+    # BorgBase URL is neither in git nor in this unit.
+    client.fail("systemctl cat restic-backups-borgbase.service | grep -E 'RESTIC_REPOSITORY=|repo[.]borgbase|rest:'")
     client.succeed("systemctl show restic-backups-borgbase.timer -p Persistent --value | grep -F yes")
     client.succeed("systemctl show restic-backups-borgbase.timer -p TimersCalendar --value | grep -F '*-*-* 05:00:00'")
-    # The root orchestrator stops the receiver and pw-mgr for the backup phase and starts them
-    # again before prune/check; restic itself runs as a dynamic user in the workers.
-    client.succeed("systemctl cat restic-backups-borgbase.service | grep -E '^ExecStartPre=.*-stop-services'")
-    client.succeed("systemctl cat restic-backups-borgbase.service | grep -E '^ExecStopPost=.*-start-services'")
-    client.succeed("systemctl cat restic-backups-borgbase-backup.service | grep -F 'DynamicUser=true'")
+    # The backup stops the receiver and pw-mgr for the backup phase and starts them again before
+    # prune/check. restic runs as a dynamic user with CAP_DAC_READ_SEARCH, in a Landlock sandbox
+    # that lets the backup phase read the two state directories and nothing else of the host's.
+    client.succeed("systemctl cat restic-backups-borgbase.service | grep -E '^ExecStartPre=\\+.*-stop-services'")
+    client.succeed("systemctl cat restic-backups-borgbase.service | grep -E '^ExecStopPost=\\+.*-start-services'")
+    client.succeed("systemctl cat restic-backups-borgbase.service | grep -Fx 'DynamicUser=true'")
+    client.succeed("systemctl cat restic-backups-borgbase.service | grep -Fx 'AmbientCapabilities=CAP_DAC_READ_SEARCH'")
+    sandbox = client.succeed("systemctl cat restic-backups-borgbase.service | grep -o '/nix/store/[^ ]*/bin/restic-borgbase-sandbox'").strip()
     for path in ["/var/lib/monitoring-platform", "/var/lib/pw-mgr"]:
-        client.succeed(f"systemctl cat restic-backups-borgbase-backup.service | grep -Fx 'BindReadOnlyPaths={path}'")
+        client.succeed(f"grep -F 'paths=(' {sandbox} | grep -Fw {path}")
     client.succeed("systemctl is-active --quiet monitoring-platform.service")
     client.succeed("systemctl is-active --quiet pw-mgr.service")
 
@@ -295,13 +297,13 @@ nixpkgs.lib.nixos.runTest {
         assert result == "success", result
         return client.succeed(f"cat {restic_marker}").strip()
 
-    # Deletes the server refused, counted over the whole boot (forget runs in the maintenance worker). Two readings around a run say
+    # Deletes the server refused, counted over the whole boot. Two readings around a run say
     # whether that run was refused anything, without depending on journal timestamps (this test
     # warps the clock, so --since is meaningless) or on a finished oneshot still reporting an
     # InvocationID to match on.
     def refusals():
         return int(client.succeed(
-            "journalctl -b --no-pager -u restic-backups-borgbase-maintenance.service"
+            "journalctl -b --no-pager -u restic-backups-borgbase.service"
             " | grep -c -F '(403): 403 Forbidden' || true"
         ).strip())
 
@@ -328,7 +330,7 @@ nixpkgs.lib.nixos.runTest {
     # check, on the real config -- ordering, not just liveness. Last occurrence of each: both also
     # started at boot, and only this one backup run has happened so far.
     backup_log = client.succeed(
-        "journalctl -b --no-pager -u restic-backups-borgbase.service -u restic-backups-borgbase-maintenance.service"
+        "journalctl -b --no-pager -u restic-backups-borgbase.service"
         " -u monitoring-platform.service -u pw-mgr.service"
     ).splitlines()
     checked = max(i for i, line in enumerate(backup_log) if "no errors were found" in line)
@@ -384,7 +386,7 @@ nixpkgs.lib.nixos.runTest {
     assert refused > 0, "append-only server refused no delete; forget had nothing to expire"
     stale = snapshot_ids()
     assert len(stale) == 2, stale
-    client.succeed("journalctl -b --no-pager -u restic-backups-borgbase-maintenance.service | grep -F 'no errors were found'")
+    client.succeed("journalctl -b --no-pager -u restic-backups-borgbase.service | grep -F 'no errors were found'")
 
     # --- append-only off: the same repository actually gets pruned ------------------------
     # Only the server's refusal goes away -- same repo, same credentials, same policy. The next
