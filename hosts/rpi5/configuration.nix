@@ -379,11 +379,11 @@ in
   # Nightly backup of everything on this host that needs one -- the measurement database and the
   # password manager's store (pw-mgr, below) -- in one snapshot to the BorgBase repository
   # (restic module imported above). Both services are stopped for the backup phase only, since a
-  # SQLite file read while its service writes can be torn, and started again before the prune
-  # and check phases; nothing is stopped until the repository has been opened. Neither tunnel
-  # needs the same treatment: each dials its service's socket lazily, once per stream, so it
-  # rides out the restart (the notes on their `after` in modules/monitoring-platform-tunnel.nix
-  # and modules/pw-mgr-tunnel.nix).
+  # SQLite file read while its service writes can be torn, and released for starting again
+  # before the prune and check phases; nothing is stopped until the repository has been opened.
+  # Neither tunnel needs the same treatment: each dials its service's socket lazily, once per
+  # stream, so it rides out the restart (the notes on their `after` in
+  # modules/monitoring-platform-tunnel.nix and modules/pw-mgr-tunnel.nix).
   #
   # restic itself runs as a throwaway dynamic user and reads the two state directories with
   # CAP_DAC_READ_SEARCH -- both are 0700 and owned by their services' users -- inside a Landlock

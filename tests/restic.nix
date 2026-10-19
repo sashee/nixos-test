@@ -42,9 +42,10 @@ let
     };
 
   # A quiesced service that can be held mid-start while /run/quiesce-hold exists, the way the
-  # monitoring platform is held in `activating` by a schema migration before READY=1. It appends
-  # rather than overwrites, so a snapshot shows whether the start it was caught in ran to the end
-  # before the backup stopped it, rather than being killed halfway or not stopped at all.
+  # monitoring platform is held in `activating` by a schema migration before READY=1, and mid-stop
+  # while /run/quiesce-stop-hold exists. It appends rather than overwrites, so a snapshot shows
+  # whether the start or restart it was caught in ran to the end before the backup stopped it,
+  # rather than being cut short or not stopped at all.
   startingService = unit:
     let
       log = state: ''
@@ -62,7 +63,10 @@ let
         while [ -e /run/quiesce-hold ]; do sleep 0.2; done
         ${log "running"}
       '';
-      postStop = log "stopped";
+      postStop = ''
+        ${log "stopped"}
+        while [ -e /run/quiesce-stop-hold ]; do sleep 0.2; done
+      '';
     };
 
   # An HTTPS REST backend signed by a test CA that the client trusts only through the system CA
@@ -73,8 +77,11 @@ let
   # ExecStartPre -- and fails the unit on any breach of spec/features/backups.md's hardening: only
   # what the phase needs is readable, nothing is writable but the unit's own directories. Checked
   # from the inside because a sandbox can be weaker than its configuration reads, and no
-  # config-shape assertion would notice. Each denial is of something file permissions allow here
-  # (world-readable, owned by the unit, or within CAP_DAC_READ_SEARCH), so it is Landlock's.
+  # config-shape assertion would notice. Not every denial is Landlock's alone: in the repository
+  # phase, which drops CAP_DAC_READ_SEARCH, file permissions deny the root-only paths too, and no
+  # phase may write / or the backup paths anyway. Landlock is what denies the world-readable file
+  # outside the backup paths (and in the repository phase the one inside), /proc, listing /,
+  # writes to the runtime directory and /var/tmp, and, in the backup phase, every read.
   sandboxProbe = phase: pkgs.writeShellScript "restic-sandbox-probe-${phase}" ''
     export PATH=${nixpkgs.lib.makeBinPath [ pkgs.coreutils pkgs.util-linux ]}
     fail() { echo "sandbox probe (${phase}): $*"; exit 1; }
@@ -100,7 +107,7 @@ let
       if quiet touch /home/backup-user/sandbox/sandbox-probe; then fail "its backup path is writable"; fi
     '' else ''
       if quiet setpriv --inh-caps=+dac_read_search true; then fail "holds CAP_DAC_READ_SEARCH"; fi
-      if quiet cat /home/backup-user/sandbox/payload.txt; then fail "the backup path is readable"; fi
+      if quiet cat /var/lib/sandbox-inside/world-readable; then fail "the backup paths are readable"; fi
     ''}
     echo "sandbox probe (${phase}): ok"
   '';
@@ -155,6 +162,11 @@ nixpkgs.lib.nixos.runTest {
     systemd.services.quiesced-one = quiescedService "quiesced-one";
     systemd.services.quiesced-two = quiescedService "quiesced-two";
     systemd.services.quiesced-starting = startingService "quiesced-starting";
+    # Crash-loops while /run/quiesce-fail-quiesced-crashing exists, "activating" between attempts.
+    systemd.services.quiesced-crashing = nixpkgs.lib.mkMerge [
+      (quiescedService "quiesced-crashing")
+      { serviceConfig = { Restart = "on-failure"; RestartSec = "2s"; }; }
+    ];
 
     virtualisation.qemu.options = [
       "-rtc"
@@ -212,7 +224,7 @@ nixpkgs.lib.nixos.runTest {
     common.restic.backups.quiesce = resticLib.rest {
       credentialDirectory = "/etc/credentials/restic/quiesce";
       paths = [ "/home/backup-user/quiesce" ];
-      stopServices = [ "quiesced-one.service" "quiesced-two.service" "quiesced-starting.service" ];
+      stopServices = [ "quiesced-one.service" "quiesced-two.service" "quiesced-starting.service" "quiesced-crashing.service" ];
       prune.opts = [ "--keep-last 99" ];
       timerConfig = null;
     };
@@ -240,7 +252,8 @@ nixpkgs.lib.nixos.runTest {
 
     common.restic.backups.sandbox = resticLib.rest {
       credentialDirectory = "/etc/credentials/restic/sandbox";
-      paths = [ "/home/backup-user/sandbox" ];
+      # The second path is world-readable: only Landlock can keep the repository phase out of it.
+      paths = [ "/home/backup-user/sandbox" "/var/lib/sandbox-inside" ];
       timerConfig = null;
     };
     # After upstream's pre-start (repository init, the --files-from list), right before the backup.
@@ -498,7 +511,7 @@ nixpkgs.lib.nixos.runTest {
     client.fail("systemctl cat restic-backups-quiesce.service | grep -F 'RestrictAddressFamilies=' | grep -F 'AF_UNIX'")
     def unit_list(unit, prop):
         return client.succeed(f"systemctl show {unit} -p {prop} --value").split()
-    QUIESCED = ["quiesced-one", "quiesced-two", "quiesced-starting"]
+    QUIESCED = ["quiesced-one", "quiesced-two", "quiesced-starting", "quiesced-crashing"]
     quiesce_units = [f"restic-quiesce-{u}.service" for u in QUIESCED]
     # BindsTo= releases the hold however the backup ends; not After= it, which would deadlock.
     assert unit_list("restic-hold-quiesce.service", "BindsTo") == ["restic-backups-quiesce.service"]
@@ -513,13 +526,16 @@ nixpkgs.lib.nixos.runTest {
     # A backup without stopServices gets no hold at all.
     client.fail("systemctl cat restic-backups-normal-strict.service | grep -F 'restic-hold-'")
     client.fail("systemctl cat restic-hold-normal-strict.service")
-    # The recovery timer is armed. Stopped for the rest of the test, which runs it by hand: a run of
-    # its own would make the failed-restart checks below racy.
-    client.succeed("systemctl is-active --quiet restic-recover-quiesced.timer")
-    client.succeed("systemctl stop restic-recover-quiesced.timer")
+    # Each unit is started again by restic-restart-<unit>, which retries a failed start every 15
+    # minutes and is idle otherwise: no timer polls for work.
+    for u in QUIESCED:
+        assert unit_list(f"restic-restart-{u}.service", "Restart") == ["on-failure"]
+        assert unit_list(f"restic-restart-{u}.service", "RestartUSec") == ["15min"]
+        assert unit_list(f"restic-restart-{u}.service", "ActiveState") == ["inactive"]
+    client.fail("systemctl cat restic-recover-quiesced.timer")
 
-    # The release must come after the backup and before the check, so the check does not run with
-    # the units down.
+    # The release must come after the backup and before the check, so the units are not held down
+    # through it.
     quiesce_cmds = client.succeed("systemctl show restic-backups-quiesce.service -p ExecStart --value").splitlines()
     assert only_index(quiesce_cmds, "/bin/restic-quiesce backup") < only_index(quiesce_cmds, "stop restic-hold-quiesce.service") < only_index(quiesce_cmds, "-maintenance"), quiesce_cmds
     # And the repository is opened, the backup's sandbox built and stale locks cleared before
@@ -622,7 +638,7 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("systemctl is-active --quiet quiesced-two.service")
     # Nothing is left held: the hold went with the backup, the quiesce units with the hold.
     assert unit_list("restic-hold-quiesce.service", "ActiveState") == ["inactive"]
-    assert [quiesce_state(u) for u in QUIESCED] == ["inactive"] * 3, [quiesce_state(u) for u in QUIESCED]
+    assert [quiesce_state(u) for u in QUIESCED] == ["inactive"] * len(QUIESCED), [quiesce_state(u) for u in QUIESCED]
 
     # The snapshot is what proves it: both units wrote "stopped" before restic read the files.
     client.succeed("mkdir -p /tmp/restic-quiesce-restore")
@@ -685,12 +701,17 @@ nixpkgs.lib.nixos.runTest {
     client.fail("systemctl is-active --quiet quiesced-two.service")
     client.succeed("systemctl start quiesced-two.service")
 
-    # Runtime confirmation of the ExecStart ordering asserted above: the last restart of
-    # quiesced-one precedes the check output of the run it belongs to.
-    quiesce_log = client.succeed("journalctl -b --no-pager -u restic-backups-quiesce.service -u quiesced-one.service").splitlines()
-    restarted = max(i for i, line in enumerate(quiesce_log) if "Finished" in line and "quiesced-one" in line)
-    checked = max(i for i, line in enumerate(quiesce_log) if "no errors were found" in line)
-    assert restarted < checked, quiesce_log[min(restarted, checked):]
+    # Runtime confirmation of the ExecStart ordering asserted above, on the last run: the hold is
+    # released after the snapshot is saved and before the check, and quiesced-one starts again
+    # after the release. Not necessarily before the check: the release only sets the start off.
+    quiesce_log = client.succeed("journalctl -b --no-pager -u restic-backups-quiesce.service -u restic-hold-quiesce.service -u quiesced-one.service").splitlines()
+    last = lambda match: max(i for i, line in enumerate(quiesce_log) if match(line))
+    saved = last(lambda line: "snapshot " in line and " saved" in line)
+    hold_released = last(lambda line: "Stopped restic backup quiesce reading its stopServices" in line)
+    checked = last(lambda line: "no errors were found" in line)
+    restarted = last(lambda line: "Finished" in line and "quiesced-one" in line)
+    assert saved < hold_released < checked, quiesce_log[saved:checked + 1]
+    assert hold_released < restarted, quiesce_log[hold_released:]
 
     # A unit still starting when the backup begins is waited for, then stopped like the rest. The
     # monitoring platform migrates its database before READY=1: a backup that took it for stopped
@@ -717,6 +738,30 @@ nixpkgs.lib.nixos.runTest {
     client.succeed(f"RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY={REPOS['quiesce']} ${pkgs.restic}/bin/restic restore latest --target /tmp/restic-quiesce-starting-restore")
     snapshotted = client.succeed("cat /tmp/restic-quiesce-starting-restore/home/backup-user/quiesce/quiesced-starting").split()
     assert snapshotted == ["starting", "running", "stopped"], snapshotted
+
+    # A restart under way when the backup begins is let finish too, then the unit is stopped.
+    # Taking the unit for stopped while it is deactivating would let the restart's start half bring
+    # it up under restic; stopping it at once would cancel the restart, failing whoever asked for it.
+    client.succeed("truncate -s 0 /home/backup-user/quiesce/quiesced-starting")
+    client.succeed("touch /run/quiesce-stop-hold")
+    client.succeed("(systemctl restart quiesced-starting.service; echo $? > /tmp/quiesce-restart-rc) > /dev/null 2>&1 &")
+    client.wait_until_succeeds("systemctl show quiesced-starting.service -p ActiveState --value | grep -Fqx deactivating")
+    client.succeed("systemctl start --no-block restic-backups-quiesce.service")
+    client.wait_until_succeeds("systemctl show restic-quiesce-quiesced-starting.service -p ActiveState --value | grep -Fqx activating")
+    client.sleep(5)
+    assert client.succeed("systemctl show restic-backups-quiesce.service -p SubState --value").strip() == "start-pre"
+    assert client.succeed("systemctl show quiesced-starting.service -p ActiveState --value").strip() == "deactivating"
+
+    client.succeed("rm /run/quiesce-stop-hold")
+    client.wait_until_succeeds("systemctl show restic-backups-quiesce.service -p ActiveState --value | grep -Fqx inactive")
+    assert service_result("quiesce") == "success"
+    released()
+    assert client.succeed("cat /tmp/quiesce-restart-rc").strip() == "0", "the restart was cancelled"
+    client.succeed("systemctl is-active --quiet quiesced-starting.service")
+    client.succeed("mkdir -p /tmp/restic-quiesce-restart-restore")
+    client.succeed(f"RESTIC_REST_USERNAME=test-user RESTIC_REST_PASSWORD=backend-secret RESTIC_PASSWORD_FILE=/tmp/plain-repo-pw RESTIC_REPOSITORY={REPOS['quiesce']} ${pkgs.restic}/bin/restic restore latest --target /tmp/restic-quiesce-restart-restore")
+    snapshotted = client.succeed("cat /tmp/restic-quiesce-restart-restore/home/backup-user/quiesce/quiesced-starting").split()
+    assert snapshotted == ["stopped", "starting", "running", "stopped"], snapshotted
 
     # --- two backups sharing a unit: one downtime, started again after the last reader ---
     # quiesce holds quiesced-two while its restic is stalled on a frozen server; quiesce-shared, on
@@ -753,34 +798,81 @@ nixpkgs.lib.nixos.runTest {
     for u in QUIESCED:
         client.succeed(f"systemctl is-active --quiet {u}.service")
 
-    # --- a start that fails after the backup ---
-    # The quiesce unit is left failed. The next backup of the unit starts it again (a failed unit
-    # counts as running), and so does the recovery run, which also clears the failed quiesce unit.
-    client.succeed("touch /run/quiesce-fail-quiesced-one")
-    client.succeed("systemctl start restic-backups-quiesce.service")
-    assert service_result("quiesce") == "success"
-    released()
-    assert quiesce_state("quiesced-one") == "failed", quiesce_state("quiesced-one")
-    client.succeed("systemctl is-failed --quiet quiesced-one.service")
-    client.succeed("rm /run/quiesce-fail-quiesced-one")
-    client.succeed("systemctl start restic-backups-quiesce.service")
-    assert service_result("quiesce") == "success"
-    released()
-    client.succeed("systemctl is-active --quiet quiesced-one.service")
-    assert quiesce_state("quiesced-one") == "inactive", quiesce_state("quiesced-one")
+    # --- a unit crash-looping when the backup begins ---
+    # Waiting out RestartSec it is "activating", with nothing under way: it is stopped, which cancels
+    # the pending restart, and started after the backup. The backup phase is stalled on a frozen
+    # server, as above, for several RestartSec, and the start is made to succeed meanwhile: a
+    # restart nobody cancelled would bring the unit up under restic.
+    client.succeed("touch /run/quiesce-fail-quiesced-crashing")
+    client.succeed("systemctl restart --no-block quiesced-crashing.service")
+    client.wait_until_succeeds("systemctl show quiesced-crashing.service -p SubState --value | grep -q '^auto-restart'")
+    client.succeed("touch /run/quiesce-hold")
+    client.succeed("systemctl restart --no-block quiesced-starting.service")
+    client.wait_until_succeeds("systemctl show quiesced-starting.service -p ActiveState --value | grep -Fqx activating")
+    client.succeed("systemctl start --no-block restic-backups-quiesce.service")
+    client.wait_until_succeeds("systemctl show restic-quiesce-quiesced-starting.service -p ActiveState --value | grep -Fqx activating")
+    backend.succeed("systemctl kill --signal=SIGSTOP restic-rest-normal.service")
+    client.succeed("rm /run/quiesce-hold")
+    client.wait_until_succeeds("systemctl show restic-hold-quiesce.service -p ActiveState --value | grep -Fqx active")
+    client.succeed("rm /run/quiesce-fail-quiesced-crashing")
+    client.sleep(6)
+    assert client.succeed("systemctl show quiesced-crashing.service -p ActiveState --value").strip() == "inactive"
+    assert client.succeed("systemctl show restic-backups-quiesce.service -p ActiveState --value").strip() == "activating"
 
-    client.succeed("touch /run/quiesce-fail-quiesced-one")
-    client.succeed("systemctl start restic-backups-quiesce.service")
+    backend.succeed("systemctl kill --signal=SIGCONT restic-rest-normal.service")
+    client.wait_until_succeeds("systemctl show restic-backups-quiesce.service -p ActiveState --value | grep -Eqx 'inactive|failed'", timeout=300)
+    assert service_result("quiesce") == "success", service_result("quiesce")
     released()
-    assert quiesce_state("quiesced-one") == "failed", quiesce_state("quiesced-one")
-    # While the start still fails, the recovery run fails too and leaves its cue in place.
-    client.fail("systemctl start restic-recover-quiesced.service")
-    assert quiesce_state("quiesced-one") == "failed", quiesce_state("quiesced-one")
+    for u in QUIESCED:
+        client.succeed(f"systemctl is-active --quiet {u}.service")
+
+    # --- a start that fails after the backup ---
+    # restic-restart-<unit> owns it: the quiesce unit is done, and the start is retried every 15
+    # minutes. `restart` rather than `start` below: a start would wait the 15 minutes out.
+    def restart_state(unit):
+        return client.succeed(f"systemctl show restic-restart-{unit}.service -p ActiveState --value").strip()
+
+    def failed_start():
+        client.succeed("touch /run/quiesce-fail-quiesced-one")
+        client.succeed("systemctl start restic-backups-quiesce.service")
+        assert service_result("quiesce") == "success"
+        released()
+        assert quiesce_state("quiesced-one") == "inactive", quiesce_state("quiesced-one")
+        client.succeed("systemctl is-failed --quiet quiesced-one.service")
+        # Waiting out RestartSec.
+        assert restart_state("quiesced-one") == "activating", restart_state("quiesced-one")
+
+    failed_start()
+    client.fail("systemctl restart restic-restart-quiesced-one.service")
+    assert restart_state("quiesced-one") == "activating", restart_state("quiesced-one")
     client.succeed("rm /run/quiesce-fail-quiesced-one")
-    client.succeed("systemctl start restic-recover-quiesced.service")
+    client.succeed("systemctl restart restic-restart-quiesced-one.service")
     client.succeed("systemctl is-active --quiet quiesced-one.service")
-    assert quiesce_state("quiesced-one") == "inactive", quiesce_state("quiesced-one")
-    for u in ["quiesced-two", "quiesced-starting"]:
+    assert restart_state("quiesced-one") == "inactive", restart_state("quiesced-one")
+
+    # The next backup of the unit takes a pending retry over and starts the unit after itself. The
+    # unit is failed by then, which by itself would not get it started.
+    failed_start()
+    client.succeed("rm /run/quiesce-fail-quiesced-one")
+    client.succeed("systemctl start restic-backups-quiesce.service")
+    assert service_result("quiesce") == "success"
+    released()
+    client.succeed("systemctl is-active --quiet quiesced-one.service")
+    assert restart_state("quiesced-one") == "inactive", restart_state("quiesced-one")
+
+    # Stopping the retry gives up on it. What is left is a unit failed for whatever reason, and a
+    # backup leaves that alone: it is not the unit's supervisor.
+    failed_start()
+    client.succeed("systemctl stop restic-restart-quiesced-one.service")
+    client.succeed("rm /run/quiesce-fail-quiesced-one")
+    client.succeed("systemctl start restic-backups-quiesce.service")
+    assert service_result("quiesce") == "success"
+    released()
+    client.succeed("systemctl is-failed --quiet quiesced-one.service")
+    assert restart_state("quiesced-one") == "inactive", restart_state("quiesced-one")
+    client.succeed("systemctl reset-failed quiesced-one.service")
+    client.succeed("systemctl start quiesced-one.service")
+    for u in QUIESCED:
         client.succeed(f"systemctl is-active --quiet {u}.service")
 
     backend.succeed("set -- /var/lib/restic-normal/check-damaged/data/*/*; rm \"$1\"")
@@ -803,6 +895,7 @@ nixpkgs.lib.nixos.runTest {
     client.succeed("install -m 0600 -o root -g root /dev/null /home/backup-user/sandbox/root-only")
     client.succeed("install -d -m 0755 /var/lib/sandbox-outside && echo visible > /var/lib/sandbox-outside/world-readable && chmod 0644 /var/lib/sandbox-outside/world-readable")
     client.succeed("echo secret > /root/sandbox-outside")
+    client.succeed("install -d -m 0755 /var/lib/sandbox-inside && echo inside > /var/lib/sandbox-inside/world-readable && chmod 0644 /var/lib/sandbox-inside/world-readable")
     rc, _ = client.execute("systemctl start restic-backups-sandbox.service")
     probe_log = client.succeed("journalctl -b --no-pager -o cat -u restic-backups-sandbox.service | grep -F 'sandbox probe' || true")
     assert rc == 0 and service_result("sandbox") == "success", probe_log
