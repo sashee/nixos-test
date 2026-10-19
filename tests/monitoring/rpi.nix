@@ -231,11 +231,14 @@ nixpkgs.lib.nixos.runTest {
     client.fail("systemctl cat restic-backups-borgbase.service | grep -E 'RESTIC_REPOSITORY=|repo[.]borgbase|rest:'")
     client.succeed("systemctl show restic-backups-borgbase.timer -p Persistent --value | grep -F yes")
     client.succeed("systemctl show restic-backups-borgbase.timer -p TimersCalendar --value | grep -F '*-*-* 05:00:00'")
-    # The backup stops the receiver and pw-mgr for the backup phase and starts them again before
-    # prune/check. restic runs as a dynamic user with CAP_DAC_READ_SEARCH, in a Landlock sandbox
-    # that lets the backup phase read the two state directories and nothing else of the host's.
-    client.succeed("systemctl cat restic-backups-borgbase.service | grep -E '^ExecStartPre=\\+.*-stop-services'")
-    client.succeed("systemctl cat restic-backups-borgbase.service | grep -E '^ExecStopPost=\\+.*-start-services'")
+    # The backup holds the receiver and pw-mgr stopped for the backup phase (restic-hold-borgbase,
+    # through a shared restic-quiesce-<unit> each) and releases them before prune/check. restic
+    # runs as a dynamic user with CAP_DAC_READ_SEARCH, in a Landlock sandbox that lets the backup
+    # phase read the two state directories and nothing else of the host's.
+    client.succeed("systemctl cat restic-backups-borgbase.service | grep -E '^ExecStartPre=\\+.*/systemctl start restic-hold-borgbase[.]service$'")
+    client.succeed("systemctl cat restic-backups-borgbase.service | grep -E '^ExecStart=\\+.*/systemctl stop restic-hold-borgbase[.]service$'")
+    held = client.succeed("systemctl show restic-hold-borgbase.service -p Requires --value").split()
+    assert {"restic-quiesce-monitoring-platform.service", "restic-quiesce-pw-mgr.service"} <= set(held), held
     client.succeed("systemctl cat restic-backups-borgbase.service | grep -Fx 'DynamicUser=true'")
     client.succeed("systemctl cat restic-backups-borgbase.service | grep -Fx 'AmbientCapabilities=CAP_DAC_READ_SEARCH'")
     sandbox = client.succeed("systemctl cat restic-backups-borgbase.service | grep -o '/nix/store/[^ ]*/bin/restic-borgbase-sandbox'").strip()
@@ -375,10 +378,10 @@ nixpkgs.lib.nixos.runTest {
     # --- append-only: the run survives a prune it is not allowed to perform ---------------
     # Backup #2 (fired by the OK-run jump above) is the first whose forget has an expired
     # snapshot to drop, so the first the append-only server refuses. The Pi sets
-    # prune.ignoreErrors, so the "-" prefix on unlock/forget keeps the unit succeeding, the
-    # marker still gets recorded, and `check` -- the command AFTER forget in the ExecStart
-    # list, which a strict prune failure would skip entirely -- still runs and still passes on
-    # the half-pruned repository. That combination is what let the OK run above report [OK];
+    # prune.ignoreErrors, so the maintenance script logs the refused forget instead of failing
+    # the unit, the marker still gets recorded, and `check` -- which runs after forget either
+    # way -- still passes on the half-pruned repository. That combination is what let the OK
+    # run above report [OK];
     # without ignoreErrors this unit fails nightly while the backups themselves keep working,
     # and the restic check only notices 14 days later, once the marker goes stale.
     backup_at = restic_ran_since(backup_at)
