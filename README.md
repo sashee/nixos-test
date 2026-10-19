@@ -388,11 +388,19 @@ Either way restic can read the store, its credentials, `/etc/resolv.conf` and
 files, not looking them up, so names and metadata elsewhere stay visible. TLS trusts the
 system CA store (`security.pki.caBundle`, so `security.pki.certificateFiles` applies).
 
-The repository is opened (or initialised) and the backup's sandbox built before
-anything in `stopServices` is stopped, so an unreachable backend or a missing backup
-path leaves those units alone. They are stopped with root `+` hooks and started again
-right after the backup, before retention and check. Only units that were running are
-started again, and they are started again when the backup fails too.
+The repository is opened (or initialised), the backup's sandbox built and stale locks
+cleared before anything in `stopServices` is stopped, so an unreachable backend or a
+missing backup path leaves those units alone. They are released right after the backup,
+before retention and check, and when the backup fails too. Only units that were running
+(or had failed) are started again.
+
+Stopping goes through units, so that backups sharing a unit share its downtime: each
+stopped unit gets one `restic-quiesce-<unit>`, which stops it when started and starts it
+again when stopped, and each backup a `restic-hold-<name>` that requires those. The
+backup starts its hold before reading and stops it right after (`BindsTo=` stops it
+however the backup ends), and systemd stops a quiesce unit once no hold requires it
+(`StopWhenUnneeded=`). A start that fails leaves the quiesce unit failed;
+`restic-recover-quiesced.timer` retries it every 15 minutes.
 
 Each backup expects a credential directory of systemd-creds-encrypted files, each
 encrypted with `--name=` set to its file name. The repository location is one of them,

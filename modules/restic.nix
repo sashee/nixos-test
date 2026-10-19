@@ -52,7 +52,6 @@ let
 
         # Every restic run is sandboxed; only `backup` gets the backup paths and the capability.
         if [ "''${1:-}" = "backup" ]; then
-          ${sandbox} repository ${lib.getExe pkgs.restic} unlock
           exec ${sandbox} backup ${lib.getExe pkgs.restic} "$@"
         fi
 
@@ -73,8 +72,6 @@ let
   #   repository: no backup paths, and the unit's CAP_DAC_READ_SEARCH is dropped.
   #   backup: the backup paths and the runtime directory (upstream's --files-from list) too,
   #     read-only, with the capability.
-  # The runtime directory also holds the list of units the root start script starts again, so it
-  # is never writable here.
   sandboxFor = name: backup:
     pkgs.writeShellApplication {
       name = "restic-${name}-sandbox";
@@ -180,58 +177,129 @@ let
       '';
     };
 
-  # The units that were running when the backup started, so a unit someone stopped for
-  # maintenance is not started again. RuntimeDirectory exists before the first Exec* runs
-  # and is removed with the unit, so this cannot outlive a run. restic cannot write it: the
-  # sandbox gives it the directory read-only, in the backup phase only.
-  stoppedUnitsFile = name: "/run/restic-backups-${name}/stopped-units";
+  # stopServices are stopped and started again through systemd units, so that backups sharing a
+  # unit share its downtime rather than each restarting it under the others:
+  #   restic-quiesce-<unit>: one per stopped unit, shared by every backup that lists it. Starting
+  #     it stops the unit; stopping it starts the unit again. StopWhenUnneeded= has systemd stop
+  #     it once no active unit requires it any more.
+  #   restic-hold-<name>: one per backup, requiring the quiesce units of its stopServices. The
+  #     backup starts it before reading and stops it right after; BindsTo= stops it whenever
+  #     the backup ends, failed or killed included.
+  # So the unit is down from the first backup's start of reading to the last one's end of it.
 
-  stopScript = name: backup:
+  # systemctl's reading of a name: one without a unit type suffix is a service. Normalised so
+  # that "foo" and "foo.service" in two backups share one quiesce unit.
+  unitTypes = [ "service" "socket" "device" "mount" "automount" "swap" "target" "path" "timer" "slice" "scope" ];
+  normalizeUnit = unit:
+    if lib.any (type: lib.hasSuffix ".${type}" unit) unitTypes then unit else "${unit}.service";
+
+  quiesceName = unit: "restic-quiesce-${lib.replaceStrings [ "@" ] [ "-" ] (lib.removeSuffix ".service" (normalizeUnit unit))}";
+  holdName = name: "restic-hold-${name}";
+  recoverName = "restic-recover-quiesced";
+
+  quiescingBackups = lib.filterAttrs (_: backup: backup.stopServices != [ ]) cfg.backups;
+  quiescedUnits = lib.unique (lib.concatMap (backup: map normalizeUnit backup.stopServices) (lib.attrValues quiescingBackups));
+
+  # Starting the quiesce unit. "restart" in its RuntimeDirectory marks the unit for starting
+  # again; RuntimeDirectory goes away with the quiesce unit, so the mark cannot outlive it.
+  quiesceStopScript = unit:
     pkgs.writeShellApplication {
-      name = "restic-${name}-stop-services";
-      runtimeInputs = [ pkgs.coreutils pkgs.findutils config.systemd.package ];
-      # An array rather than a literal word list: with a single unit, `for u in 'a.service'`
-      # is a shellcheck error (SC2043) and writeShellApplication runs shellcheck.
+      name = "${quiesceName unit}-stop";
+      runtimeInputs = [ pkgs.coreutils config.systemd.package ];
       text = ''
-        units=(${lib.escapeShellArgs backup.stopServices})
-
-        : > ${stoppedUnitsFile name}
-        for unit in "''${units[@]}"; do
-          # A unit still starting is let finish first. `is-active` reports it as not running, so
-          # it would be neither stopped nor restarted while it came up and wrote under restic --
-          # the monitoring platform migrates its database before READY=1, for up to hours. Stopping
-          # it instead would roll a migration back only to restart it from scratch afterwards.
-          # `start` joins the pending job and returns when it does; a failed start leaves nothing
-          # running, which the check below then sees.
-          if [ "$(systemctl show --property=ActiveState --value "$unit")" = activating ]; then
-            systemctl start "$unit" || true
-          fi
-          if systemctl is-active --quiet "$unit"; then
-            printf '%s\n' "$unit" >> ${stoppedUnitsFile name}
-          fi
-        done
-        xargs -r systemctl stop -- < ${stoppedUnitsFile name}
-      '';
-    };
-
-  # Idempotent: the file is removed once the units are back, so the ExecStopPost safety net
-  # is a no-op after the ExecStart run succeeded, and retries it when it did not.
-  startScript = name: _backup:
-    pkgs.writeShellApplication {
-      name = "restic-${name}-start-services";
-      runtimeInputs = [ pkgs.coreutils pkgs.findutils config.systemd.package ];
-      text = ''
-        if [ -e ${stoppedUnitsFile name} ]; then
-          xargs -r systemctl start -- < ${stoppedUnitsFile name}
-          rm -f ${stoppedUnitsFile name}
+        unit=${lib.escapeShellArg unit}
+        # A unit still starting is let finish first. `is-active` reports it as not running, so
+        # it would be neither stopped nor restarted while it came up and wrote under restic --
+        # the monitoring platform migrates its database before READY=1, for up to hours. Stopping
+        # it instead would roll a migration back only to restart it from scratch afterwards.
+        # `start` joins the pending job and returns when it does; a failed start leaves nothing
+        # running, which the check below then sees.
+        if [ "$(systemctl show --property=ActiveState --value "$unit")" = activating ]; then
+          systemctl start "$unit" || true
+        fi
+        # A unit stopped by hand is inactive and stays stopped. A failed one is started again
+        # afterwards, like a running one: that is how a start that failed after the last backup
+        # is retried rather than forgotten.
+        if systemctl is-active --quiet "$unit" || systemctl is-failed --quiet "$unit"; then
+          touch /run/${quiesceName unit}/restart
+          systemctl stop "$unit"
         fi
       '';
     };
 
+  # Stopping the quiesce unit. A failed start fails it, which leaves the quiesce unit failed:
+  # the recovery timer's cue.
+  quiesceStartScript = unit:
+    pkgs.writeShellApplication {
+      name = "${quiesceName unit}-start";
+      runtimeInputs = [ config.systemd.package ];
+      text = ''
+        if [ -e /run/${quiesceName unit}/restart ]; then
+          systemctl start ${lib.escapeShellArg unit}
+        fi
+      '';
+    };
+
+  quiesceServiceFor = unit: {
+    description = "Keep ${unit} stopped while restic backups read it";
+    # A switch must not restart it under a running backup: its stop starts the unit.
+    restartIfChanged = false;
+    # Ordered after the recovery run, so a backup starting while it runs cannot have the unit
+    # stopped and then started again underneath it.
+    after = [ "${recoverName}.service" ];
+    unitConfig.StopWhenUnneeded = true;
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      RuntimeDirectory = quiesceName unit;
+      ExecStart = lib.getExe (quiesceStopScript unit);
+      ExecStop = lib.getExe (quiesceStartScript unit);
+      # Starting the unit again takes as long as its start does: hours for a migration.
+      TimeoutStopSec = "infinity";
+    };
+  };
+
+  holdServiceFor = name: backup: {
+    description = "restic backup ${name} reading its stopServices";
+    restartIfChanged = false;
+    requires = map (unit: "${quiesceName unit}.service") backup.stopServices;
+    after = map (unit: "${quiesceName unit}.service") backup.stopServices;
+    # Not After= as well: the backup starts this from its own pre-start, so that would deadlock.
+    bindsTo = [ "restic-backups-${name}.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = "${pkgs.coreutils}/bin/true";
+    };
+  };
+
+  # Retries a start that failed when a quiesce unit stopped, without waiting for the next backup
+  # of that unit.
+  recoverScript = pkgs.writeShellApplication {
+    name = recoverName;
+    runtimeInputs = [ config.systemd.package ];
+    text = ''
+      status=0
+      recover() {
+        if systemctl is-failed --quiet "$1"; then
+          if systemctl start "$2"; then
+            systemctl reset-failed "$1"
+          else
+            status=1
+          fi
+        fi
+      }
+      ${lib.concatMapStrings (unit: ''
+        recover ${quiesceName unit}.service ${lib.escapeShellArg unit}
+      '') quiescedUnits}
+      exit "$status"
+    '';
+  };
+
   # One unit per backup, upstream's restic-backups-<name> with its timer. The unit runs as a
   # dynamic user holding only CAP_DAC_READ_SEARCH (read any file, whatever its owner and mode),
   # and what restic may touch is decided per run by the Landlock sandbox above, not by mounts:
-  # an empty root would also apply to the "+" stop/start scripts, where systemctl, chrooted,
+  # an empty root would also apply to the "+" hold commands, where systemctl, chrooted,
   # ignores its command and exits 0. The systemd hardening below is the second layer.
   serviceConfigFor = name: rawBackup:
     let
@@ -241,7 +309,7 @@ let
       # "+" runs the command fully privileged: systemd then skips User=, the capability and
       # namespacing options and the seccomp filters for it, which is what lets systemctl
       # (root, AF_UNIX to PID 1) work from inside this otherwise sandboxed unit.
-      startServices = "+${lib.getExe (startScript name backup)}";
+      hold = verb: "+${config.systemd.package}/bin/systemctl ${verb} ${holdName name}.service";
     in
     {
       environment = {
@@ -285,21 +353,23 @@ let
         ProtectHome = "read-only";
         UMask = "0077";
         # After upstream's pre-start (repository init): build the backup's sandbox once, which
-        # fails on a missing backup path, so nothing is stopped for a backup that cannot run.
+        # fails on a missing backup path, so nothing is stopped for a backup that cannot run. Then
+        # clear stale locks, which the backup would trip over: a backend round-trip that retries
+        # for minutes on a flaky link, so it too runs before anything is stopped.
         ExecStartPre = lib.mkAfter (
-          [ "${lib.getExe (sandboxFor name backup)} backup ${pkgs.coreutils}/bin/true" ]
-          ++ lib.optional quiesce "+${lib.getExe (stopScript name backup)}"
+          [
+            "${lib.getExe (sandboxFor name backup)} backup ${pkgs.coreutils}/bin/true"
+            "${resticFor name backup} unlock"
+          ]
+          ++ lib.optional quiesce (hold "start")
         );
-        # Appended to upstream's backup command: restart the stopped units, then retention and
-        # check, so the check does not run with the units down.
+        # Appended to upstream's backup command: release the stopped units, then retention and
+        # check, so the check does not run with the units down. A failed backup never gets here;
+        # BindsTo= on the hold unit releases them then.
         ExecStart = lib.mkAfter (
-          lib.optional quiesce startServices
+          lib.optional quiesce (hold "stop")
           ++ [ (lib.getExe (maintenanceScript name backup)) ]
         );
-      } // lib.optionalAttrs quiesce {
-        # An ExecStart list aborts at the first failing command, so without this a failed
-        # backup would leave the units stopped. Stopping the unit kills restic first.
-        ExecStopPost = lib.mkAfter [ startServices ];
       };
     };
 in
@@ -357,12 +427,16 @@ in
             finishes, before prune and check. Use this for services whose on-disk state is
             only consistent while they are down, such as a database with a write-ahead log.
 
-            Nothing is stopped until the repository has been opened, so an unreachable
-            backend leaves the units alone. Only units that were running when the backup
-            started are started again, so a unit stopped for maintenance stays stopped. A
-            unit still starting counts as running: the backup waits for it to finish
-            starting, then stops it. They are also started again when the backup fails.
-            Names are passed to systemctl verbatim, so "foo" means "foo.service".
+            Nothing is stopped until the repository has been opened and unlocked, so an
+            unreachable backend leaves the units alone. Only units that were running (or
+            had failed) when the backup started are started again, so a unit stopped for
+            maintenance stays stopped. A unit still starting counts as running: the backup
+            waits for it to finish starting, then stops it. They are also started again
+            when the backup fails. A start that fails is retried every 15 minutes.
+
+            Backups that list the same unit share its downtime: it is stopped once, and
+            started again only after the last of them has finished reading. "foo" means
+            "foo.service", as for systemctl.
           '';
         };
 
@@ -415,7 +489,7 @@ in
     assertions = lib.concatLists (lib.mapAttrsToList
       (name: backup: [
         {
-          assertion = !lib.any (unit: unit == "restic-backups-${name}" || unit == "restic-backups-${name}.service") backup.stopServices;
+          assertion = !lib.any (unit: normalizeUnit unit == "restic-backups-${name}.service") backup.stopServices;
           message = "common.restic.backups.${name}.stopServices must not contain its own unit, restic-backups-${name}.service.";
         }
         {
@@ -425,11 +499,41 @@ in
           message = "common.restic.backups.${name}: the backup runs as the dynamic user restic-${name}, so its name must be at most 24 characters of [A-Za-z0-9_-].";
         }
       ])
-      cfg.backups);
+      cfg.backups)
+    ++ [
+      {
+        # "@" is folded into "-" in the quiesce unit's name.
+        assertion = lib.length (lib.unique (map quiesceName quiescedUnits)) == lib.length quiescedUnits;
+        message = "common.restic.backups: two stopServices units map to the same quiesce unit name: ${lib.concatStringsSep ", " quiescedUnits}.";
+      }
+    ];
 
     services.restic.backups = lib.mapAttrs backupToResticConfig cfg.backups;
-    systemd.services = lib.mapAttrs'
-      (name: backup: lib.nameValuePair "restic-backups-${name}" (serviceConfigFor name backup))
-      cfg.backups;
+    systemd.services =
+      lib.mapAttrs'
+        (name: backup: lib.nameValuePair "restic-backups-${name}" (serviceConfigFor name backup))
+        cfg.backups
+      // lib.mapAttrs'
+        (name: backup: lib.nameValuePair (holdName name) (holdServiceFor name backup))
+        quiescingBackups
+      // lib.listToAttrs (map (unit: lib.nameValuePair (quiesceName unit) (quiesceServiceFor unit)) quiescedUnits)
+      // lib.optionalAttrs (quiescedUnits != [ ]) {
+        ${recoverName} = {
+          description = "Start units again whose restart after a restic backup failed";
+          serviceConfig = {
+            Type = "oneshot";
+            ExecStart = lib.getExe recoverScript;
+          };
+        };
+      };
+    systemd.timers = lib.optionalAttrs (quiescedUnits != [ ]) {
+      ${recoverName} = {
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnBootSec = "15min";
+          OnUnitActiveSec = "15min";
+        };
+      };
+    };
   };
 }

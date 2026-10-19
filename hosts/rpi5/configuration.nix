@@ -413,6 +413,10 @@ in
   #     /etc/credentials/restic/borgbase/backend-password
   #   sudo chmod 0600 /etc/credentials/restic/borgbase/*
   #
+  # A further backup defined here would not just skip until provisioned: common.monitoring reports
+  # a backup with no recorded success as [FAIL] from its first run, failing the whole Healthchecks
+  # report. tests/monitoring/rpi.nix has to provision it too, since its OK run asserts every backup.
+  #
   # /var/lib/mp-collector is deliberately not in paths: spool plus epoch table, rebuilt from
   # scratch. Nor are the credential blobs -- host-key-encrypted, so useless off this SD.
   common.restic.backups.borgbase = resticLib.rest {
@@ -474,13 +478,6 @@ in
     enable = true;
     credentialDirectory = "/etc/credentials/pw-mgr-tunnel";
   };
-
-  # No backup of the vault yet: spec/features/pw-mgr/pw-mgr.md marks it PROVISIONAL until there
-  # is a repository. A defined backup without credentials would not just skip -- common.monitoring
-  # reports a backup with no recorded success as [FAIL] from its first run, failing the whole
-  # Healthchecks report. When it lands, it is the receiver's block above with this service's user,
-  # /var/lib/pw-mgr, stopServices = [ "pw-mgr.service" ] and its own credential directory -- and
-  # tests/monitoring/rpi.nix has to provision it too, since its OK run asserts every backup.
 
   networking.wireless.iwd.enable = true;
   common.connectivityFallback.enable = true;
