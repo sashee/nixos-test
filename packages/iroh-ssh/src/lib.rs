@@ -27,6 +27,7 @@ use std::{
 };
 
 use iroh::{
+    dns::DnsResolver,
     endpoint::{presets, ConnectionError},
     tls::CaTlsConfig,
     Endpoint, EndpointAddr, SecretKey,
@@ -138,11 +139,26 @@ const PUBLISHED_USER_DATA: &str = ".";
 /// Create an iroh endpoint that verifies relay TLS against the OS trust store
 /// (`rustls-platform-verifier`) rather than compiled-in Mozilla roots, so
 /// `security.pki`-installed CAs are honored.
+///
+/// DNS goes through the system resolver only. Since iroh 1.3 the endpoint's
+/// default resolver keeps Cloudflare, Google and Quad9 (UDP and DoH) as a
+/// fallback tier, queried whenever the system resolver fails -- which on these
+/// hosts means dnscrypt-proxy down, starting or wedged. modules/doh.nix rejects
+/// the UDP leg but not DoH on 443, so the fallback would carry lookups past the
+/// curated upstream set (including Quad9's filtering resolver, which
+/// `require_nofilter` excludes) exactly when dnscrypt-proxy is broken. Failing
+/// the lookup is the honest outcome then.
 pub async fn create_endpoint(secret_key: SecretKey, alpns: Vec<Vec<u8>>) -> Result<Endpoint> {
     let user_data = PUBLISHED_USER_DATA
         .parse()
         .expect("one byte, well inside UserData's 245 byte limit");
     Endpoint::builder(presets::N0)
+        .dns_resolver(
+            DnsResolver::builder()
+                .with_system_defaults()
+                .disable_fallback()
+                .build(),
+        )
         .ca_tls_config(CaTlsConfig::system())
         .secret_key(secret_key)
         .alpns(alpns)

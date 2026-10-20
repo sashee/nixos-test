@@ -547,8 +547,8 @@ five measurement types, `system.cpu` / `system.memory` / `system.filesystem` /
 `system.generation` / `system.host`, each carrying `resource.attributes.host.name`
 so one query can serve a whole fleet later. The wire format only speaks binary
 OTLP protobuf and requires a non-empty `LogRecord.event_name` per record, so the
-producer is a small Rust binary in `packages/system-metrics` built on the same
-`opentelemetry-proto` crate the receiver decodes with, rather than a shell
+producer is a small Rust binary in `packages/system-metrics` built on
+`opentelemetry-proto`, the crate the receiver decodes with, rather than a shell
 script. It runs under `DynamicUser` whose only privilege is membership of the
 collector's group, and `RestrictAddressFamilies = [ "AF_UNIX" ]` makes "this
 never talks to the network" a kernel guarantee on the producer side too. Two
@@ -643,9 +643,11 @@ has not happened yet changes nothing. That ticket is also the one operators
 distribute, so the probe exercises the path clients actually use — endpoint-id
 discovery — rather than a relay url that no distributed ticket contains. The
 flip side is that the failsafe is fate-shared with that discovery: while
-`dns.iroh.link` is not answering, the tunnel reads as down, which is why the
-window is 15 minutes and not 5 (the negative-TTL story is in the `delaySeconds`
-option doc). Tune or disable with
+`dns.iroh.link` answers neither the DNS lookup nor the HTTPS fetch of the
+published record (iroh runs both), the tunnel reads as down. The window is 15
+minutes rather than 5 because of a negative-caching problem on the DNS side
+that the HTTPS path now sidesteps; the history is in the `delaySeconds` option
+doc. Tune or disable with
 `common.irohSsh.failsafe.{enable,delaySeconds,probeIntervalSeconds,recheckIntervalSeconds}`;
 the monitoring check reports when the failsafe is engaged.
 
@@ -662,7 +664,8 @@ is what lets the VM test stay hermetic while server and client run *completely
 stock* configuration: the test intercepts the DoH upstream traffic (the same
 technique as the `doh-upstream` test), answering the real n0 relay hostnames
 with a stand-in `iroh-relay` node whose TLS is trusted via a `security.pki`
-test CA. Nothing on the tested node is reconfigured — its real dnscrypt/DoH
+test CA, and `dns.iroh.link` with a stand-in pkarr relay for the HTTPS
+discovery path. Nothing on the tested node is reconfigured — its real dnscrypt/DoH
 resolver, firewall, and default relay selection are exercised as shipped. The
 trust-store behavior also means hosts can front a self-hosted relay with a
 normally-issued certificate.

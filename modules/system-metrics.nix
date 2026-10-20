@@ -16,8 +16,8 @@
 # the defaults below describe.
 #
 # The wire format only accepts binary OTLP (protobuf, logs signal, Events), so the producer cannot
-# be a shell script -- it is a small Rust binary in packages/system-metrics built on the same
-# opentelemetry-proto crate the receiver decodes with.
+# be a shell script -- it is a small Rust binary in packages/system-metrics built on
+# opentelemetry-proto, the crate the receiver decodes with.
 
 let
   cfg = config.common.systemMetrics;

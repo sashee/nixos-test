@@ -1,7 +1,7 @@
 //! `Record` -> OTLP `ExportLogsServiceRequest`, and the receiver's response back.
 //!
 //! The same encoding as `packages/system-metrics/src/otlp.rs`, against the same receiver, built
-//! on the same `opentelemetry-proto` crate the receiver decodes with. Duplicated rather than
+//! on `opentelemetry-proto`, the crate the receiver decodes with. Duplicated rather than
 //! shared because these are three standalone crates with no workspace between them -- the
 //! convention in this repo -- but the three properties the receiver enforces (non-empty
 //! `event_name`, non-zero timestamp, kvlist body) are re-asserted in the tests below so the two
