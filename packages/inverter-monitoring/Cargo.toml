@@ -6,9 +6,10 @@ license = "MIT OR Apache-2.0"
 description = "Poll a Voltronic-protocol solar inverter over USB serial and report it to a local monitoring-platform receiver"
 
 [dependencies]
-# The same crate the receiver decodes with, so the message definitions cannot drift. Identical
-# reasoning (and identical features) to packages/system-metrics -- the two producers speak the
-# same wire format to the same socket.
+# The crate the receiver decodes with, though not pinned to its release (see
+# packages/system-metrics/Cargo.toml for why that holds). Identical reasoning (and identical
+# features) to packages/system-metrics -- the two producers speak the same wire format to the same
+# socket.
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs"] }
 prost = "0.14"
 # Safe termios, poll and clock wrappers. AGENTS.md asks for no unsafe blocks, and configuring a

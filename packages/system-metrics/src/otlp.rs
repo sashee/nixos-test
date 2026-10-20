@@ -1,7 +1,9 @@
 //! `Record` -> OTLP `ExportLogsServiceRequest`, and the receiver's response back.
 //!
-//! The message types come from the same `opentelemetry-proto` crate the receiver decodes with,
-//! so a field this producer sets cannot mean something else on the other side.
+//! The message types come from `opentelemetry-proto`, the crate the receiver decodes with. The two
+//! are not pinned to one release, but both generate from the stable OTLP logs protos, so a field
+//! this producer sets means the same thing on the other side -- and the VM test's round trip
+//! through the real receiver is what checks it.
 
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,

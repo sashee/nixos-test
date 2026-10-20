@@ -184,10 +184,16 @@ in
           Only active when this host runs the nftables firewall.
 
           Readiness is measured on the operator's own connect path: the
-          canonical id-only ticket, dialed through endpoint-id discovery. A
-          discovery outage therefore also reads as not-ready -- correctly, since
-          a distributed ticket is unresolvable then too, but it does make the
-          failsafe fate-shared with n0 DNS (see delaySeconds).
+          canonical id-only ticket, dialed through endpoint-id discovery. iroh
+          runs discovery two ways at once and takes whichever answers: a DNS TXT
+          lookup of `_iroh.<id>.dns.iroh.link`, and an HTTPS fetch of the signed
+          record from the pkarr relay at dns.iroh.link that the listener
+          publishes to. A discovery outage reads as not-ready only when both
+          fail -- correctly, since a distributed ticket is unresolvable then for
+          every client built on this binary too. So the failsafe is fate-shared
+          with dns.iroh.link, but no longer with any resolver's cache of it (see
+          delaySeconds). A client that only does DNS discovery (stock dumbpipe on
+          an iroh older than 1.3) can still fail while this reads ready.
         '';
       };
 
@@ -197,17 +203,21 @@ in
         description = ''
           Continuous not-ready seconds before port 22 is opened. Must exceed
           the self-healing window of a lost relay race at boot: a relay-less
-          ticket makes probes depend on n0 DNS discovery, and dns.iroh.link
-          serves not-found with a 600s negative TTL that LAN resolvers cache
-          (observed ~11 min outage on the rpi5, 2026-07-18).
+          ticket makes probes depend on endpoint-id discovery, which cannot
+          succeed until the listener has published its record.
 
-          The probe is what poisons that cache: it queries the endpoint's
-          `_iroh.*.dns.iroh.link` name before the listener has published, gets
-          NXDOMAIN, and then keeps hitting the cached negative for its full
-          600s however often it rechecks. So the budget is time-to-publish plus
-          600s -- ~660s observed -- against this 900s default. Roughly four
-          minutes of headroom, and it is spent by any boot that takes longer to
-          publish. Tune downward only with that arithmetic redone.
+          That window used to include a resolver's negative cache. The probe
+          queried the endpoint's `_iroh.*.dns.iroh.link` name before the
+          listener had published, got NXDOMAIN, and dns.iroh.link's 600s
+          negative TTL then kept it failing for the full 600s however often it
+          rechecked: time-to-publish plus 600s, ~660s observed (an ~11 min
+          outage on the rpi5, 2026-07-18), which is what this 900s default was
+          sized against. Since iroh 1.3 the probe also fetches the record over
+          HTTPS from the pkarr relay the listener publishes to, with no cache in
+          between, so discovery recovers as soon as the publish lands and the
+          budget is time-to-publish alone. 900s is therefore generous rather
+          than tight. Lower it only after measuring time-to-publish on the
+          slowest host, under boot load.
         '';
       };
 

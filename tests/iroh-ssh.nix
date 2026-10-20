@@ -10,9 +10,26 @@ let
   relayDomain = "relay.n0.iroh.link";
 
   # Endpoint-id discovery lives under this domain: the canonical (id-only) ticket
-  # carries no relay url, so the dialing side resolves
-  # `_iroh.<z32-endpoint-id>.dns.iroh.link TXT` to find the endpoint.
+  # carries no relay url, so the dialing side has to look the endpoint up. iroh
+  # (>= 1.3) does that two ways at once and takes whichever answers first: a TXT
+  # query for `_iroh.<z32-endpoint-id>.dns.iroh.link`, and an HTTPS GET of the
+  # endpoint's signed packet from `https://dns.iroh.link/pkarr/<z32>` -- the same
+  # pkarr relay the listener PUTs it to.
   discoveryDomain = "dns.iroh.link";
+
+  # Where dns.iroh.link points once the HTTPS path is switched on: an address held
+  # by the relay node, which serves the stand-in pkarr relay on it. TEST-NET-3
+  # (RFC 5737), routed to the relay node the same way the DoH provider IPs are
+  # routed to the interceptor, because both helper nodes already hold
+  # 0.0.0.0:443 for something else.
+  pkarrAddress = "203.0.113.53";
+
+  # Present on the interceptor node from the HTTPS-discovery phase on (the end of
+  # the testScript). Until then dns.iroh.link is NXDOMAIN, so the HTTPS path
+  # fails at once and every discovery before it is the DNS path; after it, the
+  # `_iroh` TXT records are NXDOMAIN and dns.iroh.link resolves, so discovery can
+  # only be the HTTPS path. One switch for both, so neither phase can be half in.
+  httpsDiscoveryFlag = "/run/iroh-ssh-test-https-discovery";
 
   # Handed back as the discovered home relay. Every relay hostname resolves to the
   # one impersonated relay node, so which region label we advertise does not
@@ -28,15 +45,22 @@ let
     respond = ''
       def respond(query, meta):
           name, qtype, _, _ = read_question(query)
+          https_discovery = pathlib.Path("${httpsDiscoveryFlag}").exists()
           if name.endswith(".${relayDomain}") and qtype == 1:
               return a(query, ARGS[0])   # ARGS[0] = the relay node's IP
           if name.endswith(".${relayDomain}"):
               return nodata(query)       # fall back to A
-          # Endpoint-id discovery, for any id: the canonical ticket has no relay
-          # url, so this is the only way the dialing side finds the listener.
-          # Answering statically keeps the node stock -- it still publishes to the
-          # (unreachable) real pkarr relay and resolves through its own DoH path.
-          if name.startswith("_iroh.") and name.endswith(".${discoveryDomain}"):
+          # The pkarr relay's own hostname, which both the listener's PUTs and the
+          # dialing side's GETs resolve. NXDOMAIN (below) until the switch.
+          if https_discovery and name == "${discoveryDomain}":
+              if qtype == 1:
+                  return a(query, "${pkarrAddress}")
+              return nodata(query)       # fall back to A
+          # DNS endpoint-id discovery, for any id. Answering statically keeps the
+          # node stock -- it resolves through its own DoH path -- at the price of
+          # not reflecting what the listener published; the HTTPS phase is what
+          # covers the published packet.
+          if not https_discovery and name.startswith("_iroh.") and name.endswith(".${discoveryDomain}"):
               if qtype == 16:
                   return txt(query, "relay=${discoveredRelayUrl}")
               return nodata(query)       # fall back to TXT
@@ -54,19 +78,91 @@ let
     sans = [ "*.${relayDomain}" ];
   };
 
-  relayConfig = pkgs.writeText "iroh-relay.toml" ''
+  # Bound to the relay node's own address rather than 0.0.0.0, which would take
+  # port 443 on pkarrAddress as well.
+  relayConfig = bindAddress: pkgs.writeText "iroh-relay.toml" ''
     http_bind_addr = "127.0.0.1:3340"
 
     [tls]
-    https_bind_addr = "0.0.0.0:443"
+    https_bind_addr = "${bindAddress}:443"
     cert_mode = "Manual"
     manual_cert_path = "${relayCert.certFile}"
     manual_key_path = "${relayCert.keyFile}"
   '';
 
-  # Applied to the stock nodes: trust both test CAs (DoH upstream + relay). No
-  # DNS/hosts/relay config change -- resolution and relay selection stay as shipped.
-  trustTestCa = { security.pki.certificateFiles = [ interceptor.caFile relayCert.caFile ]; };
+  # The stand-in pkarr relay: its own cert + CA, same reasoning as the relay's.
+  pkarrCert = import ./test-cert.nix { inherit pkgs; } {
+    name = "pkarr-relay";
+    sans = [ discoveryDomain ];
+  };
+
+  # A pkarr relay is a store of opaque signed packets keyed by z32 endpoint id:
+  # PUT /pkarr/<z32> stores the body, GET returns it or 404s. Nothing to verify or
+  # sign here -- the listener signs what it PUTs and the dialing side checks the
+  # signature against the id it asked for, so serving the bytes back unchanged is
+  # the whole job. Every request is logged as `<client ip> "<request line>" <status>`,
+  # which is what the testScript reads to tell the client's lookups from the probe's.
+  #
+  # do_handshake_on_connect=False moves the TLS handshake out of the accept loop and
+  # into the connection's own thread (tests/doh-interceptor.nix has the story of what
+  # a handshake in the accept loop does to the other clients), and the handler's
+  # timeout bounds it there.
+  pkarrServer = pkgs.writeText "fake-pkarr.py" ''
+    import http.server, ssl, sys, threading
+
+    CERT, KEY, ADDRESS = sys.argv[1:4]
+    packets = {}
+    lock = threading.Lock()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        timeout = 30
+
+        def setup(self):
+            self.request.settimeout(self.timeout)
+            self.request.do_handshake()
+            super().setup()
+
+        def log_message(self, fmt, *args):
+            print(f"{self.client_address[0]} {fmt % args}", file=sys.stderr, flush=True)
+
+        def endpoint(self):
+            parts = self.path.split("/")
+            return parts[2] if len(parts) == 3 and parts[1] == "pkarr" and parts[2] else None
+
+        def reply(self, status, body=b""):
+            self.send_response(status)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_PUT(self):
+            body = self.rfile.read(int(self.headers.get("content-length", "0")))
+            key = self.endpoint()
+            if key is None:
+                return self.reply(404)
+            with lock:
+                packets[key] = body
+            self.reply(204)
+
+        def do_GET(self):
+            with lock:
+                body = packets.get(self.endpoint())
+            self.reply(404) if body is None else self.reply(200, body)
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(CERT, KEY)
+    httpd = http.server.ThreadingHTTPServer((ADDRESS, 443), Handler)
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
+    httpd.serve_forever()
+  '';
+
+  # Applied to the stock nodes: trust the three test CAs (DoH upstream, relay,
+  # pkarr relay). No DNS/hosts/relay config change -- resolution and relay
+  # selection stay as shipped.
+  trustTestCa = {
+    security.pki.certificateFiles = [ interceptor.caFile relayCert.caFile pkarrCert.caFile ];
+  };
 in
 nixpkgs.lib.nixos.runTest {
   name = "iroh-ssh";
@@ -97,19 +193,38 @@ nixpkgs.lib.nixos.runTest {
     system.stateVersion = stateVersion;
   };
 
-  # The impersonated relay. Plain node, 443 free for iroh-relay.
-  nodes.relay = { ... }: {
+  # The impersonated relay, and the impersonated pkarr relay on a second address.
+  nodes.relay = { config, lib, ... }: {
     networking.hostName = "relay";
 
     # Helper node, tiny workload: keep the 4-node test within the 4 GB Pi.
     virtualisation.memorySize = 512;
+
+    # Both servers bind a specific address, and eth1's static address can land
+    # seconds after network.target under slow TCG boots (see vlan_ip in the
+    # testScript); non-local binds take that race out of their startup.
+    boot.kernel.sysctl."net.ipv4.ip_nonlocal_bind" = 1;
 
     networking.firewall.allowedTCPPorts = [ 443 ];
     systemd.services.iroh-relay = {
       description = "iroh relay impersonating the n0 relays";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
-      serviceConfig.ExecStart = "${pkgs.iroh-relay}/bin/iroh-relay -c ${relayConfig}";
+      serviceConfig.ExecStart =
+        "${pkgs.iroh-relay}/bin/iroh-relay -c ${relayConfig config.networking.primaryIPAddress}";
+    };
+    systemd.services.fake-pkarr = {
+      description = "pkarr relay impersonating ${discoveryDomain}";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network.target" ];
+      preStart = "${pkgs.iproute2}/bin/ip addr add ${pkarrAddress}/32 dev eth1 || true";
+      serviceConfig.ExecStart = lib.concatStringsSep " " [
+        "${pkgs.python3}/bin/python3"
+        "${pkarrServer}"
+        "${pkarrCert.certFile}"
+        "${pkarrCert.keyFile}"
+        pkarrAddress
+      ];
     };
 
     system.stateVersion = stateVersion;
@@ -152,6 +267,7 @@ nixpkgs.lib.nixos.runTest {
   testScript = ''
     import json
     import os
+    import re
 
     doh_ipv4 = json.loads('${dohIpv4Json}')
     doh_ipv6 = json.loads('${dohIpv6Json}')
@@ -160,6 +276,7 @@ nixpkgs.lib.nixos.runTest {
     relay.start()
     dohpeer.wait_for_unit("fake-doh.service")
     relay.wait_for_unit("iroh-relay.service")
+    relay.wait_for_unit("fake-pkarr.service")
 
     def vlan_ip(node):
         # eth1's static address is assigned by network-addresses-eth1.service,
@@ -174,6 +291,7 @@ nixpkgs.lib.nixos.runTest {
         ).strip()
 
     dohpeer_ip = vlan_ip(dohpeer)
+    relay_ip = vlan_ip(relay)
 
     def redirect_doh(node):
         # Route the DoH upstream IPs to the interceptor. dnscrypt-proxy then
@@ -187,7 +305,13 @@ nixpkgs.lib.nixos.runTest {
         node.start()
         node.wait_for_unit("multi-user.target")
         redirect_doh(node)
+        # The pkarr relay's address, the same way. Routed from the start but
+        # unreachable by name until the HTTPS-discovery phase.
+        node.succeed(f"${pkgs.iproute2}/bin/ip route replace ${pkarrAddress}/32 via {relay_ip} dev eth1")
         node.succeed("systemctl restart dnscrypt-proxy.service")
+
+    server_ip = vlan_ip(server)
+    client_ip = vlan_ip(client)
 
     server.wait_for_unit("sshd.service")
 
@@ -393,7 +517,8 @@ nixpkgs.lib.nixos.runTest {
     assert hostname == "iroh-server", f"unexpected hostname: {hostname}"
 
     # End-to-end on the operator's actual path: the canonical id-only ticket, which
-    # has no relay url and so must be resolved through endpoint-id discovery.
+    # has no relay url and so must be resolved through endpoint-id discovery -- the
+    # DNS path here; the HTTPS path has its own phase further down.
     hostname = client.wait_until_succeeds(
         "ssh -o StrictHostKeyChecking=no"
         f" -o ProxyCommand='iroh-ssh-connect {published}' root@tunnel hostname",
@@ -490,6 +615,66 @@ nixpkgs.lib.nixos.runTest {
     server.wait_until_succeeds(
         f"test -z \"$({nft_chain} | grep -F 'iroh-ssh-failsafe' || true)\"",
         timeout=60,
+    )
+
+    # Endpoint-id discovery over HTTPS alone: the path with no resolver cache in it, which is
+    # what the failsafe's delaySeconds doc now leans on. Until here dns.iroh.link has been
+    # NXDOMAIN, so every discovery above was the DNS path. The switch points dns.iroh.link at
+    # the pkarr relay and takes the `_iroh` TXT records away, so from here on a dial that finds
+    # the listener found it over HTTPS.
+    #
+    # Shaped as an engagement and a recovery, like the sshd block above: a successful probe
+    # leaves no trace, but closing an open port does, and that close can only come from a probe
+    # that resolved the listener with DNS discovery gone. The listener goes down first so it
+    # cannot publish before the failsafe has engaged.
+    server.succeed("systemctl stop iroh-ssh.service")
+    dohpeer.succeed("touch ${httpsDiscoveryFlag}")
+    for node in [server, client]:
+        # Restarting drops dnscrypt-proxy's cache: the NXDOMAIN it holds for dns.iroh.link, and
+        # the TXT answers for the ids dialed above.
+        node.succeed("systemctl restart dnscrypt-proxy.service")
+        node.wait_until_succeeds(
+            "${pkgs.dig}/bin/dig +short +time=3 +tries=1 @127.0.0.1 A ${discoveryDomain}"
+            " | grep -qxF ${pkarrAddress}",
+            timeout=60,
+        )
+    server.wait_until_succeeds(f"{nft_chain} | grep -F 'iroh-ssh-failsafe'", timeout=120)
+
+    # A restart rather than a start: relay_ticket also waits for a clean relay connection, and
+    # the publish follows it.
+    relay_ticket()
+
+    # The probe's lookup of the listener, answered. The server looks up exactly one id, and the
+    # request path names it in the z32 form the DNS name uses.
+    probe_gets = relay.wait_until_succeeds(
+        "journalctl -u fake-pkarr.service -o cat"
+        f" | grep -E '^{server_ip} \"GET /pkarr/[a-z0-9]+ HTTP/1.1\" 200 '",
+        timeout=120,
+    )
+    endpoint_z32 = re.search(r"/pkarr/([a-z0-9]+) ", probe_gets).group(1)
+    server.wait_until_succeeds(
+        f"test -z \"$({nft_chain} | grep -F 'iroh-ssh-failsafe' || true)\"",
+        timeout=120,
+    )
+
+    # The client's side of the same claim. DNS has nothing for this id...
+    txt_lookup = client.succeed(
+        "${pkgs.dig}/bin/dig +time=3 +tries=1 @127.0.0.1"
+        f" TXT _iroh.{endpoint_z32}.${discoveryDomain}"
+    )
+    assert "status: NXDOMAIN" in txt_lookup, f"DNS discovery still answers:\n{txt_lookup}"
+    current = server.succeed("grep . /run/iroh-ssh/ticket").strip()
+    hostname = client.wait_until_succeeds(
+        "ssh -o StrictHostKeyChecking=no"
+        f" -o ProxyCommand='iroh-ssh-connect {current}' root@tunnel hostname",
+        timeout=180,
+    ).strip()
+    assert hostname == "iroh-server", f"unexpected hostname: {hostname}"
+    # ...and the dial got the listener's packet from the pkarr relay instead.
+    relay.wait_until_succeeds(
+        "journalctl -u fake-pkarr.service -o cat"
+        f" | grep -E '^{client_ip} \"GET /pkarr/{endpoint_z32} HTTP/1.1\" 200 '",
+        timeout=30,
     )
 
     # A ticket derivation that fails must leave the previous ticket alone. The
