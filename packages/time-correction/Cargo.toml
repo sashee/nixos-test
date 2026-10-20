@@ -1,7 +1,7 @@
 [package]
 name = "time-correction"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Correct the system clock from an authenticated NTS timestamp, resolving the server over DoH"
 
@@ -25,14 +25,14 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = "0.8"
 # notBefore/notAfter, to intersect the chain's validity window. rustls parses certificates
 # only inside its verifier, and does not hand the dates back.
-x509-parser = "0.16"
+x509-parser = "0.18"
 # clock_settime. AGENTS.md asks for no unsafe blocks, and std cannot set the clock.
 rustix = { version = "1", features = ["time"] }
 # AEAD_AES_SIV_CMAC_256, the only algorithm NTS requires a client to implement. RustCrypto,
 # but note its own README says no security audit has been performed and constant-time
 # operation has not been thoroughly assessed -- worth knowing for a boot-critical path, and
 # there is no alternative implementation of this construction in the ecosystem.
-aes-siv = "0.7"
+aes-siv = "0.8"
 
 [[bin]]
 name = "time-correction"
