@@ -1,7 +1,7 @@
 [package]
 name = "system-metrics"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Collect basic host metrics and report them to a local monitoring-platform receiver over its unix socket"
 
@@ -9,7 +9,7 @@ description = "Collect basic host metrics and report them to a local monitoring-
 # The same crate the receiver decodes with, so the message definitions cannot drift.
 # `gen-tonic-messages` gives the prost message structs without the gRPC transport;
 # `logs` is what unlocks the logs/collector modules (this receiver only takes logs).
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs"] }
 prost = "0.14"
 # Safe statvfs and clock_gettime wrappers: AGENTS.md asks for no unsafe blocks, and std has
 # neither statvfs nor a way to read CLOCK_MONOTONIC as an absolute value -- which systemd's
