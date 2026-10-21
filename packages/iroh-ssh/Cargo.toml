@@ -6,7 +6,9 @@ license = "MIT OR Apache-2.0"
 description = "Expose a local sshd or unix socket over an iroh endpoint; wire-compatible with dumbpipe"
 
 [dependencies]
-iroh = { version = "1.3", default-features = false, features = ["tls-ring", "platform-verifier"] }
+# Exact: create_dialer_endpoint (src/lib.rs) hand-copies the n0 preset's lookup list, so a
+# bump has to be an edit here, made with that copy re-diffed against the new preset.
+iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring", "platform-verifier"] }
 iroh-tickets = "1.0.0"
 n0-error = "1.0.0"
 noq = "1.0.0"

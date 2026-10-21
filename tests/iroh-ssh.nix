@@ -17,12 +17,12 @@ let
   # pkarr relay the listener PUTs it to.
   discoveryDomain = "dns.iroh.link";
 
-  # Where dns.iroh.link points once the HTTPS path is switched on: a second address
-  # on the relay node, where the stand-in pkarr relay gets a port 443 of its own
-  # (iroh-relay holds 443 on the node's primary address). TEST-NET-3 (RFC 5737),
-  # routed to the relay node the same way the DoH provider IPs are routed to the
-  # interceptor.
+  # Where dns.iroh.link points once the HTTPS path is switched on. TEST-NET-3
+  # (RFC 5737), routed to the relay node the same way the DoH provider IPs are
+  # routed to the interceptor, and redirected there from port 443 to the stand-in
+  # pkarr relay's own port (iroh-relay holds 443 on every address).
   pkarrAddress = "203.0.113.53";
+  pkarrPort = 8443;
 
   # Present on the interceptor node from the HTTPS-discovery phase on (the end of
   # the testScript). Until then dns.iroh.link is NXDOMAIN, so the HTTPS path
@@ -78,13 +78,11 @@ let
     sans = [ "*.${relayDomain}" ];
   };
 
-  # Bound to the relay node's own address rather than 0.0.0.0, which would take
-  # port 443 on pkarrAddress as well.
-  relayConfig = bindAddress: pkgs.writeText "iroh-relay.toml" ''
+  relayConfig = pkgs.writeText "iroh-relay.toml" ''
     http_bind_addr = "127.0.0.1:3340"
 
     [tls]
-    https_bind_addr = "${bindAddress}:443"
+    https_bind_addr = "0.0.0.0:443"
     cert_mode = "Manual"
     manual_cert_path = "${relayCert.certFile}"
     manual_key_path = "${relayCert.keyFile}"
@@ -105,9 +103,9 @@ let
   pkarrServer = pkgs.writeText "fake-pkarr.py" ''
     import http.server, ssl, sys, threading
 
-    ${builtins.readFile ./tls-http-server.py}
+    ${interceptor.tlsHttpServer}
 
-    CERT, KEY, ADDRESS = sys.argv[1:4]
+    CERT, KEY, PORT = sys.argv[1:4]
     packets = {}
     lock = threading.Lock()
 
@@ -141,7 +139,7 @@ let
                 body = packets.get(self.endpoint())
             self.reply(404) if body is None else self.reply(200, body)
 
-    httpd = QueuedTlsServer((ADDRESS, 443), Handler)
+    httpd = QueuedTlsServer(("0.0.0.0", int(PORT)), Handler)
     httpd.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     httpd.tls.load_cert_chain(CERT, KEY)
     httpd.serve_forever()
@@ -153,18 +151,8 @@ let
   trustTestCa = {
     security.pki.certificateFiles = [ interceptor.caFile relayCert.caFile pkarrCert.caFile ];
   };
-
-  # Everything the testScript interpolates, held in the stock nodes' system closure. The
-  # guest's store registers only that closure, so anything else is garbage to the boot-armed
-  # nix-gc (OnBootSec=15min) -- and the late phases run well past that on a slow runner.
-  # Taken from the script's own references rather than a hand-kept list: a tool that goes
-  # missing under a `fail(...)` or a `test -z "$(... || true)"` does not fail the check, it
-  # passes it.
-  rootScriptReferences = script: {
-    system.extraDependencies = [ (pkgs.writeStringReferencesToFile script) ];
-  };
 in
-nixpkgs.lib.nixos.runTest (test@{ config, ... }: {
+nixpkgs.lib.nixos.runTest {
   name = "iroh-ssh";
   hostPkgs = pkgs;
   skipTypeCheck = true;
@@ -193,42 +181,48 @@ nixpkgs.lib.nixos.runTest (test@{ config, ... }: {
     system.stateVersion = stateVersion;
   };
 
-  # The impersonated relay, and the impersonated pkarr relay on a second address.
-  nodes.relay = { config, lib, ... }: {
+  # The impersonated relay, and the impersonated pkarr relay behind a redirect.
+  nodes.relay = { lib, ... }: {
     networking.hostName = "relay";
 
     # Helper node, tiny workload: keep the 4-node test within the 4 GB Pi.
     virtualisation.memorySize = 512;
 
-    # iroh-relay binds eth1's static address, which can land seconds after
-    # network.target under slow TCG boots (see vlan_ip in the testScript); a
-    # non-local bind takes that race out of its startup.
-    boot.kernel.sysctl."net.ipv4.ip_nonlocal_bind" = 1;
-
-    networking.firewall.allowedTCPPorts = [ 443 ];
+    # Both servers want port 443 and iroh-relay holds it on every address, so the
+    # pkarr relay listens on a port of its own and connections to pkarrAddress:443
+    # are redirected to it. The address is routed here but never assigned: the
+    # redirect rewrites the destination before the routing decision, so the packet
+    # is delivered locally all the same.
+    networking.nftables = {
+      enable = true;
+      tables.pkarr-redirect = {
+        family = "ip";
+        content = ''
+          chain prerouting {
+            type nat hook prerouting priority dstnat;
+            ip daddr ${pkarrAddress} tcp dport 443 redirect to :${toString pkarrPort}
+          }
+        '';
+      };
+    };
+    # The firewall sees the redirected port, not 443.
+    networking.firewall.allowedTCPPorts = [ 443 pkarrPort ];
     systemd.services.iroh-relay = {
       description = "iroh relay impersonating the n0 relays";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
-      serviceConfig.ExecStart =
-        "${pkgs.iroh-relay}/bin/iroh-relay -c ${relayConfig config.networking.primaryIPAddress}";
+      serviceConfig.ExecStart = "${pkgs.iroh-relay}/bin/iroh-relay -c ${relayConfig}";
     };
-    # Assigns its own address before binding it, and fails if it cannot: the
-    # non-local bind above would otherwise start the server on an address the node
-    # does not hold, and the first symptom would be a probe timing out much later.
-    # `replace` rather than `add` so a restart finds the address already there.
     systemd.services.fake-pkarr = {
       description = "pkarr relay impersonating ${discoveryDomain}";
       wantedBy = [ "multi-user.target" ];
-      bindsTo = [ "sys-subsystem-net-devices-eth1.device" ];
-      after = [ "network.target" "sys-subsystem-net-devices-eth1.device" ];
-      preStart = "${pkgs.iproute2}/bin/ip addr replace ${pkarrAddress}/32 dev eth1";
+      after = [ "network.target" ];
       serviceConfig.ExecStart = lib.concatStringsSep " " [
         "${pkgs.python3}/bin/python3"
         "${pkarrServer}"
         "${pkarrCert.certFile}"
         "${pkarrCert.keyFile}"
-        pkarrAddress
+        (toString pkarrPort)
       ];
     };
 
@@ -239,7 +233,7 @@ nixpkgs.lib.nixos.runTest (test@{ config, ... }: {
   # except for the required credential dir and trusting the test CA.
   # Default-deny firewall ON. mkForce: the rpi config enables auto-upgrade.
   nodes.server = { lib, ... }: {
-    imports = [ machineModule trustTestCa (rootScriptReferences test.config.testScriptString) ];
+    imports = [ machineModule trustTestCa ];
 
     networking.hostName = "iroh-server";
     common.autoUpgrade.enable = lib.mkForce false;
@@ -258,7 +252,7 @@ nixpkgs.lib.nixos.runTest (test@{ config, ... }: {
   # The connecting machine: the same stock config (so it resolves and dials
   # the relay through the same real path), plus the iroh-ssh client.
   nodes.client = { lib, ... }: {
-    imports = [ machineModule trustTestCa (rootScriptReferences test.config.testScriptString) ];
+    imports = [ machineModule trustTestCa ];
 
     networking.hostName = "iroh-client";
     common.autoUpgrade.enable = lib.mkForce false;
@@ -286,7 +280,7 @@ nixpkgs.lib.nixos.runTest (test@{ config, ... }: {
     # not exercised until the last phase, so prove it is listening now. Bounded well below the
     # driver's 900s default: it has no Restart=, so once dead it stays dead and the wait only
     # postpones the failure.
-    relay.wait_for_open_port(443, "${pkarrAddress}", timeout=120)
+    relay.wait_for_open_port(${toString pkarrPort}, timeout=120)
 
     def vlan_ip(node):
         # eth1's static address is assigned by network-addresses-eth1.service,
@@ -302,11 +296,6 @@ nixpkgs.lib.nixos.runTest (test@{ config, ... }: {
 
     dohpeer_ip = vlan_ip(dohpeer)
     relay_ip = vlan_ip(relay)
-
-    # The relay's bind is non-local (see the node), so it starts cleanly on an address the node
-    # does not hold; prove it answers on the one the relay hostnames resolve to. Otherwise the
-    # first symptom is relay_ticket() giving up minutes later.
-    relay.wait_for_open_port(443, relay_ip, timeout=120)
 
     def redirect_doh(node):
         # Route the DoH upstream IPs to the interceptor. dnscrypt-proxy then
@@ -758,4 +747,4 @@ nixpkgs.lib.nixos.runTest (test@{ config, ... }: {
     # stale ticket, so the failsafe reopens port 22 over the LAN.
     server.wait_until_succeeds(f"{nft_chain} | grep -F 'iroh-ssh-failsafe'", timeout=120)
   '';
-})
+}

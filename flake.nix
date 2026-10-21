@@ -119,6 +119,18 @@
       testNodeCollectorHealthOff = { lib, ... }: {
         services.mp-collector.healthIntervalSecs = lib.mkOverride 90 0;
       };
+      # The post-boot GC, pushed past the end of any run. A guest's Nix DB registers only the
+      # system closure, so a GC there deletes every tool a testScript interpolates -- and a tool
+      # gone from under a `fail(...)` or a `test -z "$(... || true)"` passes the check instead of
+      # failing it. The production 15min is well inside what the long suites take under TCG
+      # (ceilings up to an hour), so it cannot be what keeps the GC out of a test.
+      #
+      # Only the delay moves: the timer and its OnBootSec= stay, which tests/nix-settings.nix
+      # asserts. The tests about the GC either build their own node (nix-gc-boot-trigger sets a
+      # 5s delay) or start nix-gc.service by hand. Priority 90 like the overrides above.
+      testNodeBootGcDeferred = { lib, ... }: {
+        common.nixSettings.gcOnBootDelay = lib.mkOverride 90 "1d";
+      };
       # The collector's API key, which hosts/rpi5 loads with LoadCredentialEncrypted= from
       # /etc/credentials/mp-collector/mp-api-key. That blob is provisioned out-of-band on the Pi
       # and a guest has none, and a named-but-missing LoadCredential* is FATAL: the unit dies at
@@ -225,6 +237,7 @@
           testNodeTimeSyncOff
           testNodeClockGateOff
           testNodeCollectorHealthOff
+          testNodeBootGcDeferred
         ];
         virtualisation.qemu.options = [ (testRtcBase pkgs.coreutils) ];
       };
@@ -493,6 +506,7 @@
           testNodeTimeSyncOff
           testNodeClockGateOff
           testNodeCollectorHealthOff
+          testNodeBootGcDeferred
           testNodeCollectorApiKey
           testNodeMpTunnelOff
         ];
@@ -1026,6 +1040,7 @@
           testNodeTimeSyncOff
           testNodeClockGateOff
           testNodeCollectorHealthOff
+          testNodeBootGcDeferred
           testNodeCollectorApiKey
           testNodeMpTunnelOff
         ];
@@ -1362,7 +1377,7 @@
       # tests run against it so a host-config change that breaks a feature fails that
       # feature's -anya variant.
       anyaFeherLaptopSystemModule = { ... }: {
-        imports = [ anyaFeherLaptopHostModule testNodeTimeSyncOff ];
+        imports = [ anyaFeherLaptopHostModule testNodeTimeSyncOff testNodeBootGcDeferred ];
         virtualisation.qemu.options = [ (testRtcBase pkgs.coreutils) ];
       };
       # Stand-in for the machine-unique parts that live on the device, so the deployable laptop

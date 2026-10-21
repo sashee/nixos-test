@@ -186,7 +186,8 @@ pub async fn create_listener_endpoint(
 ///
 /// The lookup list is a hand copy of `presets::N0` as of iroh 1.3.0, minus its
 /// `PkarrPublisher`; the listener takes the preset as-is. Nothing flags a
-/// divergence, so re-diff against the preset on every iroh bump.
+/// divergence, so Cargo.toml pins iroh exactly: every bump is an edit there,
+/// and this list gets re-diffed against the new preset as part of it.
 pub async fn create_dialer_endpoint() -> Result<Endpoint> {
     endpoint_builder()
         .clear_address_lookup()
