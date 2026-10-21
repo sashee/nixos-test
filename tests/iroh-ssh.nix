@@ -154,15 +154,17 @@ let
     security.pki.certificateFiles = [ interceptor.caFile relayCert.caFile pkarrCert.caFile ];
   };
 
-  # Tools the testScript runs on the stock nodes that their closure does not carry. The
-  # guest's store registers only the system closure, so anything else is garbage to the
-  # boot-armed nix-gc (OnBootSec=15min) -- and the HTTPS-discovery phase that uses dig runs
-  # last, well past that on a slow runner.
-  rootTestTools = {
-    system.extraDependencies = [ pkgs.dig ];
+  # Everything the testScript interpolates, held in the stock nodes' system closure. The
+  # guest's store registers only that closure, so anything else is garbage to the boot-armed
+  # nix-gc (OnBootSec=15min) -- and the late phases run well past that on a slow runner.
+  # Taken from the script's own references rather than a hand-kept list: a tool that goes
+  # missing under a `fail(...)` or a `test -z "$(... || true)"` does not fail the check, it
+  # passes it.
+  rootScriptReferences = script: {
+    system.extraDependencies = [ (pkgs.writeStringReferencesToFile script) ];
   };
 in
-nixpkgs.lib.nixos.runTest {
+nixpkgs.lib.nixos.runTest (test@{ config, ... }: {
   name = "iroh-ssh";
   hostPkgs = pkgs;
   skipTypeCheck = true;
@@ -237,7 +239,7 @@ nixpkgs.lib.nixos.runTest {
   # except for the required credential dir and trusting the test CA.
   # Default-deny firewall ON. mkForce: the rpi config enables auto-upgrade.
   nodes.server = { lib, ... }: {
-    imports = [ machineModule trustTestCa rootTestTools ];
+    imports = [ machineModule trustTestCa (rootScriptReferences test.config.testScriptString) ];
 
     networking.hostName = "iroh-server";
     common.autoUpgrade.enable = lib.mkForce false;
@@ -256,7 +258,7 @@ nixpkgs.lib.nixos.runTest {
   # The connecting machine: the same stock config (so it resolves and dials
   # the relay through the same real path), plus the iroh-ssh client.
   nodes.client = { lib, ... }: {
-    imports = [ machineModule trustTestCa rootTestTools ];
+    imports = [ machineModule trustTestCa (rootScriptReferences test.config.testScriptString) ];
 
     networking.hostName = "iroh-client";
     common.autoUpgrade.enable = lib.mkForce false;
@@ -281,8 +283,10 @@ nixpkgs.lib.nixos.runTest {
     relay.wait_for_unit("iroh-relay.service")
     relay.wait_for_unit("fake-pkarr.service")
     # Active only means spawned: the server can still die loading the cert or binding. It is
-    # not exercised until the last phase, so prove it is listening now.
-    relay.wait_for_open_port(443, "${pkarrAddress}")
+    # not exercised until the last phase, so prove it is listening now. Bounded well below the
+    # driver's 900s default: it has no Restart=, so once dead it stays dead and the wait only
+    # postpones the failure.
+    relay.wait_for_open_port(443, "${pkarrAddress}", timeout=120)
 
     def vlan_ip(node):
         # eth1's static address is assigned by network-addresses-eth1.service,
@@ -298,6 +302,11 @@ nixpkgs.lib.nixos.runTest {
 
     dohpeer_ip = vlan_ip(dohpeer)
     relay_ip = vlan_ip(relay)
+
+    # The relay's bind is non-local (see the node), so it starts cleanly on an address the node
+    # does not hold; prove it answers on the one the relay hostnames resolve to. Otherwise the
+    # first symptom is relay_ticket() giving up minutes later.
+    relay.wait_for_open_port(443, relay_ip, timeout=120)
 
     def redirect_doh(node):
         # Route the DoH upstream IPs to the interceptor. dnscrypt-proxy then
@@ -691,6 +700,20 @@ nixpkgs.lib.nixos.runTest {
         timeout=30,
     )
 
+    # Dialers look up and publish nothing (create_dialer_endpoint drops the preset's publisher).
+    # One that published would PUT a record under its own throwaway key, so every PUT the pkarr
+    # relay has seen must name the listener -- across the failsafe's probes since the switch and
+    # the client's sessions just above. iroh's publisher sends as soon as the endpoint has
+    # something to publish, with no debounce.
+    puts = relay.succeed(
+        "journalctl -u fake-pkarr.service -o cat | grep -F '\"PUT /pkarr/' || true"
+    ).splitlines()
+    # Not vacuous: the listener's own publish is in there, or the GETs above could not be 200.
+    assert any(f"/pkarr/{endpoint_z32} " in line for line in puts), \
+        "no PUT for the listener in the pkarr relay's log:\n" + "\n".join(puts)
+    strays = [line for line in puts if f"/pkarr/{endpoint_z32} " not in line]
+    assert not strays, "a dialer published a record:\n" + "\n".join(strays)
+
     # A ticket derivation that fails must leave the previous ticket alone. The
     # write is a mktemp + rename for exactly this: truncating in place would
     # briefly publish an empty ticket (reads as no credential) and a partial
@@ -735,4 +758,4 @@ nixpkgs.lib.nixos.runTest {
     # stale ticket, so the failsafe reopens port 22 over the LAN.
     server.wait_until_succeeds(f"{nft_chain} | grep -F 'iroh-ssh-failsafe'", timeout=120)
   '';
-}
+})
