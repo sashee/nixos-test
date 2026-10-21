@@ -39,7 +39,8 @@ aes-siv = { version = "0.8", default-features = false, features = ["alloc", "zer
 # Not used directly: here only to turn on `zeroize` in aes-siv's own dependencies, which its
 # feature does not forward. aes-siv's covers only the raw CTR key; the expanded AES key
 # schedules (the MAC key's, and the CTR key's per operation) are wiped by aes's, and the CMAC
-# chaining state by cmac's. Versions track what aes-siv requires, so features unify.
+# chaining state by cmac's. Versions track what aes-siv requires, so features unify;
+# package.nix fails evaluation if they stop doing so.
 aes = { version = "0.9", features = ["zeroize"] }
 cmac = { version = "0.8", features = ["zeroize"] }
 

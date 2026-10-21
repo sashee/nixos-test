@@ -640,9 +640,14 @@ dumbpipe unchanged, and the probed ticket can never name an endpoint the running
 listener does not answer on: both come from the same credential, so rotation
 moves them together or not at all, and a credential staged for a rotation that
 has not happened yet changes nothing. That ticket is also the one operators
-distribute, so the probe exercises the path clients actually use — endpoint-id
-discovery — rather than a relay url that no distributed ticket contains. The
-flip side is that the failsafe is fate-shared with that discovery: while
+distribute, so the probe exercises the path clients use — endpoint-id
+discovery — rather than a relay url that no distributed ticket contains. It is
+the path of clients built on the same iroh, though: the probe discovers over DNS
+and HTTPS at once, while a client on iroh 1.0.2 or older (an older `dumbpipe`,
+say) only does DNS. Such a client can fail on a cached NXDOMAIN for the
+endpoint's `_iroh` name while the failsafe reads ready and keeps port 22 closed;
+`iroh-ssh-connect` from this repo resolves exactly as the probe does. The flip
+side is that the failsafe is fate-shared with that discovery: while
 `dns.iroh.link` answers neither the DNS lookup nor the HTTPS fetch of the
 published record (iroh runs both), the tunnel reads as down. The window is 15
 minutes rather than 5 because of a negative-caching problem on the DNS side
@@ -717,7 +722,9 @@ flow.
 
 Connect from any machine, no IP address needed (`nix run
 github:sashee/nixos-test#iroh-ssh` works in place of an installed
-`iroh-ssh-connect`; stock `dumbpipe connect` also accepts the same ticket):
+`iroh-ssh-connect`; stock `dumbpipe connect` also accepts the same ticket, but
+one built on iroh 1.0.2 or older resolves it over DNS only — see the failsafe
+caveat above):
 
 ```bash
 ssh -o ProxyCommand='iroh-ssh-connect <ticket>' user@laptop

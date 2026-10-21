@@ -23,9 +23,10 @@ nixpkgs.lib.nixos.runTest {
 
     networking.hostName = "nix-gc-boot-trigger";
 
-    # Short enough for a test to observe. On real hosts this is 15min, deliberately longer
-    # than a VM test's guest runtime so the boot GC does not gatecrash unrelated tests --
-    # which is exactly why the behaviour needs a test that opts into it.
+    # Short enough for a test to observe. On real hosts this is 15min, and every test node
+    # built on a host config pushes it past the end of the run (testNodeBootGcDeferred in
+    # flake.nix) so the boot GC does not gatecrash unrelated tests -- which is exactly why
+    # the behaviour needs a test that opts into it.
     common.nixSettings.gcOnBootDelay = "5s";
 
     # The guest sees the host's whole /nix/store over 9p; an unbounded collect would scale

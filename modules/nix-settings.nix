@@ -79,10 +79,10 @@ in
       default = "15min";
       description = ''
         Delay after boot before the GC runs (spec/features/gc.md: "after boot it deletes
-        old generations and runs gc"). Deliberately longer than a VM test's guest runtime:
-        the boot trigger fires in every test that boots, so a short delay would have GC
-        competing with tests that previously only had to dodge a fixed clock slot (see the
-        note in lib/test-rtc-base.nix).
+        old generations and runs gc"). Not longer than every VM test's guest runtime --
+        the long suites run past it under TCG -- so the test nodes built on a host config
+        push it past the end of the run instead (testNodeBootGcDeferred in flake.nix, see
+        the note in lib/test-rtc-base.nix).
 
         Note this is additive to the timer's Persistent=true, which already replays a
         *missed* periodic slot after boot; OnBootSec covers boots where nothing was missed.

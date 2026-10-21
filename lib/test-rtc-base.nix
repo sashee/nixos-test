@@ -8,9 +8,9 @@
 #
 # 10:00 no longer dodges the GC on its own: since spec/features/gc.md moved it to
 # "after boot" plus a weekly backstop, what keeps it out of a test is
-# common.nixSettings.gcOnBootDelay being longer than the test's guest runtime, not
-# the wall-clock hour. A test that warps the clock across days (or that needs to run
-# for a quarter of an hour) has to stop nix-gc.timer explicitly -- see
+# testNodeBootGcDeferred in flake.nix, which pushes common.nixSettings.gcOnBootDelay
+# past the end of any run, not the wall-clock hour. A test that warps the clock across
+# days still wakes the weekly slot and has to stop nix-gc.timer explicitly -- see
 # tests/nix-gc-retention.nix and tests/monitoring/restic.nix.
 # The coreutils must match the platform the test driver runs on.
 #

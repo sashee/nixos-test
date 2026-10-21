@@ -204,5 +204,5 @@ let
   };
 in
 {
-  inherit dohDomains dohIpv4 dohIpv6 dnsQuery caFile certFile keyFile serverScript mkService;
+  inherit dohDomains dohIpv4 dohIpv6 dnsQuery caFile certFile keyFile serverScript mkService tlsHttpServer;
 }
