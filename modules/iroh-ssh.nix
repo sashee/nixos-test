@@ -191,9 +191,11 @@ in
           publishes to. A discovery outage reads as not-ready only when both
           fail -- correctly, since a distributed ticket is unresolvable then for
           every client built on this binary too. So the failsafe is fate-shared
-          with dns.iroh.link, but no longer with any resolver's cache of it (see
-          delaySeconds). A client that only does DNS discovery (stock dumbpipe on
-          an iroh older than 1.3) can still fail while this reads ready.
+          with dns.iroh.link, but no longer with cached negative answers for the
+          endpoint's `_iroh` name (see delaySeconds); the HTTPS path still
+          resolves dns.iroh.link itself through the system resolver. A client
+          that only does DNS discovery (stock dumbpipe on an iroh older than 1.3)
+          can still fail while this reads ready.
         '';
       };
 
@@ -208,16 +210,17 @@ in
 
           That window used to include a resolver's negative cache. The probe
           queried the endpoint's `_iroh.*.dns.iroh.link` name before the
-          listener had published, got NXDOMAIN, and dns.iroh.link's 600s
-          negative TTL then kept it failing for the full 600s however often it
-          rechecked: time-to-publish plus 600s, ~660s observed (an ~11 min
-          outage on the rpi5, 2026-07-18), which is what this 900s default was
-          sized against. Since iroh 1.3 the probe also fetches the record over
-          HTTPS from the pkarr relay the listener publishes to, with no cache in
-          between, so discovery recovers as soon as the publish lands and the
-          budget is time-to-publish alone. 900s is therefore generous rather
-          than tight. Lower it only after measuring time-to-publish on the
-          slowest host, under boot load.
+          listener had published and got NXDOMAIN, which dnscrypt-proxy then
+          served from its cache for 600s (its `cache_neg_max_ttl` default)
+          however often the probe rechecked: time-to-publish plus 600s, ~660s
+          observed (an ~11 min outage on the rpi5, 2026-07-18), which is what
+          this 900s default was sized against. Since iroh 1.3 the probe also
+          fetches the record over HTTPS from the pkarr relay the listener
+          publishes to, with no cache of the record in between, so discovery
+          recovers as soon as the publish lands and the budget is
+          time-to-publish alone. 900s is therefore generous rather than tight.
+          Lower it only after measuring time-to-publish on the slowest host,
+          under boot load.
         '';
       };
 

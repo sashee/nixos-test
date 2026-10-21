@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "Expose a local sshd or unix socket over an iroh endpoint; wire-compatible with dumbpipe"
 
 [dependencies]
-iroh = { version = "1.0.0", default-features = false, features = ["tls-ring", "platform-verifier"] }
+iroh = { version = "1.3", default-features = false, features = ["tls-ring", "platform-verifier"] }
 iroh-tickets = "1.0.0"
 n0-error = "1.0.0"
 noq = "1.0.0"

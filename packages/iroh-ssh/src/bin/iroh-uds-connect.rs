@@ -29,10 +29,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use iroh::{endpoint::Connection, SecretKey};
+use iroh::endpoint::Connection;
 use iroh_ssh::{
-    closed_normally, create_endpoint, forward_bidi, load_ticket, notify, shutdown_signal, ALPN,
-    HANDSHAKE, ONLINE_TIMEOUT,
+    closed_normally, create_dialer_endpoint, forward_bidi, load_ticket, notify, shutdown_signal,
+    ALPN, HANDSHAKE, ONLINE_TIMEOUT,
 };
 use n0_error::{bail_any, Result, StdResultExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -58,8 +58,7 @@ async fn connect() -> Result<()> {
     let addr = load_ticket(args.next())?.endpoint_addr().clone();
     let remote = addr.id;
 
-    // the connecting side needs no stable identity
-    let endpoint = create_endpoint(SecretKey::generate(), vec![]).await?;
+    let endpoint = create_dialer_endpoint().await?;
     // As dumbpipe does before it dials: until the home relay is known, a far side
     // reachable only through a relay has nowhere for the handshake to go. Bounded,
     // because a direct path may well work without one.
