@@ -14,16 +14,25 @@ let
   interceptor = import ./doh-interceptor.nix {
     inherit pkgs dohStamps;
     name = "mp-tunnel";
+    # The answers never change during a run, so they are served with a TTL past
+    # globalTimeout: fetched once, then answered from dnscrypt-proxy's cache. At the
+    # helpers' 60s default they expired between subtests. Under TCG a dial that has to
+    # re-fetch them sets off iroh's staggered retries (up to seven per name). Each one
+    # is a fresh TLS handshake at this server, taking 5-10s apiece, so lookups pile up
+    # past dnscrypt-proxy's max_clients=250. The dial runs out its ~10s discovery
+    # budget and fails "No addressing information available". The client units ride
+    # that out by restarting; the one-shot iroh-ssh-connect below cannot. It failed
+    # whenever its dial landed just after the 60s expiry, and passed just before it.
     respond = ''
       def respond(query, meta):
           name, qtype, _, _ = read_question(query)
           if name.endswith(".${relayDomain}") and qtype == 1:
-              return a(query, ARGS[0])   # ARGS[0] = the relay node's IP
+              return a(query, ARGS[0], ttl=3600)   # ARGS[0] = the relay node's IP
           if name.endswith(".${relayDomain}"):
               return nodata(query)       # fall back to A
           if name.startswith("_iroh.") and name.endswith(".${discoveryDomain}"):
               if qtype == 16:
-                  return txt(query, "relay=${discoveredRelayUrl}")
+                  return txt(query, "relay=${discoveredRelayUrl}", ttl=3600)
               return nodata(query)       # fall back to TXT
           return nxdomain(query)         # bootstrap, everything else
     '';
