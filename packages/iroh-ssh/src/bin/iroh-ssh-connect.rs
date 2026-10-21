@@ -4,8 +4,7 @@
 //!   ssh -o ProxyCommand='iroh-ssh-connect <ticket>' user@host
 use std::str::FromStr;
 
-use iroh::SecretKey;
-use iroh_ssh::{create_endpoint, forward_bidi, ALPN, HANDSHAKE};
+use iroh_ssh::{create_dialer_endpoint, forward_bidi, ALPN, HANDSHAKE};
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_error::{bail_any, Result, StdResultExt};
 use tokio::io::AsyncWriteExt;
@@ -20,8 +19,7 @@ async fn connect() -> Result<()> {
         None => bail_any!("usage: iroh-ssh-connect <ticket>"),
     };
 
-    // the connecting side needs no stable identity
-    let endpoint = create_endpoint(SecretKey::generate(), vec![]).await?;
+    let endpoint = create_dialer_endpoint().await?;
     let addr = ticket.endpoint_addr().clone();
     let connection = endpoint.connect(addr, ALPN).await.anyerr()?;
     let (mut s, r) = connection.open_bi().await.anyerr()?;

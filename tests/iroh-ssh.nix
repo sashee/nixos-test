@@ -17,11 +17,11 @@ let
   # pkarr relay the listener PUTs it to.
   discoveryDomain = "dns.iroh.link";
 
-  # Where dns.iroh.link points once the HTTPS path is switched on: an address held
-  # by the relay node, which serves the stand-in pkarr relay on it. TEST-NET-3
-  # (RFC 5737), routed to the relay node the same way the DoH provider IPs are
-  # routed to the interceptor, because both helper nodes already hold
-  # 0.0.0.0:443 for something else.
+  # Where dns.iroh.link points once the HTTPS path is switched on: a second address
+  # on the relay node, where the stand-in pkarr relay gets a port 443 of its own
+  # (iroh-relay holds 443 on the node's primary address). TEST-NET-3 (RFC 5737),
+  # routed to the relay node the same way the DoH provider IPs are routed to the
+  # interceptor.
   pkarrAddress = "203.0.113.53";
 
   # Present on the interceptor node from the HTTPS-discovery phase on (the end of
@@ -102,13 +102,10 @@ let
   # signature against the id it asked for, so serving the bytes back unchanged is
   # the whole job. Every request is logged as `<client ip> "<request line>" <status>`,
   # which is what the testScript reads to tell the client's lookups from the probe's.
-  #
-  # do_handshake_on_connect=False moves the TLS handshake out of the accept loop and
-  # into the connection's own thread (tests/doh-interceptor.nix has the story of what
-  # a handshake in the accept loop does to the other clients), and the handler's
-  # timeout bounds it there.
   pkarrServer = pkgs.writeText "fake-pkarr.py" ''
     import http.server, ssl, sys, threading
+
+    ${builtins.readFile ./tls-http-server.py}
 
     CERT, KEY, ADDRESS = sys.argv[1:4]
     packets = {}
@@ -116,12 +113,6 @@ let
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        timeout = 30
-
-        def setup(self):
-            self.request.settimeout(self.timeout)
-            self.request.do_handshake()
-            super().setup()
 
         def log_message(self, fmt, *args):
             print(f"{self.client_address[0]} {fmt % args}", file=sys.stderr, flush=True)
@@ -150,10 +141,9 @@ let
                 body = packets.get(self.endpoint())
             self.reply(404) if body is None else self.reply(200, body)
 
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(CERT, KEY)
-    httpd = http.server.ThreadingHTTPServer((ADDRESS, 443), Handler)
-    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
+    httpd = QueuedTlsServer((ADDRESS, 443), Handler)
+    httpd.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    httpd.tls.load_cert_chain(CERT, KEY)
     httpd.serve_forever()
   '';
 
@@ -200,9 +190,9 @@ nixpkgs.lib.nixos.runTest {
     # Helper node, tiny workload: keep the 4-node test within the 4 GB Pi.
     virtualisation.memorySize = 512;
 
-    # Both servers bind a specific address, and eth1's static address can land
-    # seconds after network.target under slow TCG boots (see vlan_ip in the
-    # testScript); non-local binds take that race out of their startup.
+    # iroh-relay binds eth1's static address, which can land seconds after
+    # network.target under slow TCG boots (see vlan_ip in the testScript); a
+    # non-local bind takes that race out of its startup.
     boot.kernel.sysctl."net.ipv4.ip_nonlocal_bind" = 1;
 
     networking.firewall.allowedTCPPorts = [ 443 ];
@@ -213,11 +203,16 @@ nixpkgs.lib.nixos.runTest {
       serviceConfig.ExecStart =
         "${pkgs.iroh-relay}/bin/iroh-relay -c ${relayConfig config.networking.primaryIPAddress}";
     };
+    # Assigns its own address before binding it, and fails if it cannot: the
+    # non-local bind above would otherwise start the server on an address the node
+    # does not hold, and the first symptom would be a probe timing out much later.
+    # `replace` rather than `add` so a restart finds the address already there.
     systemd.services.fake-pkarr = {
       description = "pkarr relay impersonating ${discoveryDomain}";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
-      preStart = "${pkgs.iproute2}/bin/ip addr add ${pkarrAddress}/32 dev eth1 || true";
+      bindsTo = [ "sys-subsystem-net-devices-eth1.device" ];
+      after = [ "network.target" "sys-subsystem-net-devices-eth1.device" ];
+      preStart = "${pkgs.iproute2}/bin/ip addr replace ${pkarrAddress}/32 dev eth1";
       serviceConfig.ExecStart = lib.concatStringsSep " " [
         "${pkgs.python3}/bin/python3"
         "${pkarrServer}"
@@ -658,9 +653,17 @@ nixpkgs.lib.nixos.runTest {
     )
 
     # The client's side of the same claim. DNS has nothing for this id...
-    txt_lookup = client.succeed(
-        "${pkgs.dig}/bin/dig +time=3 +tries=1 @127.0.0.1"
-        f" TXT _iroh.{endpoint_z32}.${discoveryDomain}"
+    #
+    # Retried until a definitive answer: the name has never been queried, so each attempt is a
+    # fresh round trip through dnscrypt-proxy to the interceptor, which under TCG can outlast
+    # dig's 3s or come back SERVFAIL. Either answer ends the wait, so a NOERROR still reaches
+    # the assert below with its output.
+    txt_lookup = client.wait_until_succeeds(
+        "out=$(${pkgs.dig}/bin/dig +time=3 +tries=1 @127.0.0.1"
+        f" TXT _iroh.{endpoint_z32}.${discoveryDomain})"
+        " && printf '%s' \"$out\" | grep -qE 'status: (NOERROR|NXDOMAIN)'"
+        " && printf '%s' \"$out\"",
+        timeout=60,
     )
     assert "status: NXDOMAIN" in txt_lookup, f"DNS discovery still answers:\n{txt_lookup}"
     current = server.succeed("grep . /run/iroh-ssh/ticket").strip()

@@ -18,8 +18,8 @@ use std::path::PathBuf;
 
 use iroh::endpoint::{Accepting, RecvStream, SendStream};
 use iroh_ssh::{
-    closed_normally, create_endpoint, forward_bidi, load_secret, short_ticket, shutdown_signal,
-    ALPN, HANDSHAKE, ONLINE_TIMEOUT,
+    closed_normally, create_listener_endpoint, forward_bidi, load_secret, short_ticket,
+    shutdown_signal, ALPN, HANDSHAKE, ONLINE_TIMEOUT,
 };
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_error::{bail_any, ensure_any, Result, StdResultExt};
@@ -38,7 +38,7 @@ async fn listen() -> Result<()> {
     };
 
     let secret_key = load_secret(None)?;
-    let endpoint = create_endpoint(secret_key, vec![ALPN.to_vec()]).await?;
+    let endpoint = create_listener_endpoint(secret_key, vec![ALPN.to_vec()]).await?;
     // wait for the endpoint to figure out its addresses before making a ticket
     if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
         eprintln!("Warning: Failed to connect to the home relay");

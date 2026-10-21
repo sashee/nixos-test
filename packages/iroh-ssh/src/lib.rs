@@ -27,8 +27,9 @@ use std::{
 };
 
 use iroh::{
+    address_lookup::{DnsAddressLookup, PkarrResolver},
     dns::DnsResolver,
-    endpoint::{presets, ConnectionError},
+    endpoint::{presets, Builder, ConnectionError},
     tls::CaTlsConfig,
     Endpoint, EndpointAddr, SecretKey,
 };
@@ -136,9 +137,9 @@ fn parse_ticket(ticket: &str) -> Result<EndpointTicket> {
 /// a third party's cache.
 const PUBLISHED_USER_DATA: &str = ".";
 
-/// Create an iroh endpoint that verifies relay TLS against the OS trust store
-/// (`rustls-platform-verifier`) rather than compiled-in Mozilla roots, so
-/// `security.pki`-installed CAs are honored.
+/// The n0 preset (relays, endpoint-id discovery) with relay TLS verified against
+/// the OS trust store (`rustls-platform-verifier`) rather than compiled-in
+/// Mozilla roots, so `security.pki`-installed CAs are honored.
 ///
 /// DNS goes through the system resolver only. Since iroh 1.3 the endpoint's
 /// default resolver keeps Cloudflare, Google and Quad9 (UDP and DoH) as a
@@ -148,10 +149,7 @@ const PUBLISHED_USER_DATA: &str = ".";
 /// curated upstream set (including Quad9's filtering resolver, which
 /// `require_nofilter` excludes) exactly when dnscrypt-proxy is broken. Failing
 /// the lookup is the honest outcome then.
-pub async fn create_endpoint(secret_key: SecretKey, alpns: Vec<Vec<u8>>) -> Result<Endpoint> {
-    let user_data = PUBLISHED_USER_DATA
-        .parse()
-        .expect("one byte, well inside UserData's 245 byte limit");
+fn endpoint_builder() -> Builder {
     Endpoint::builder(presets::N0)
         .dns_resolver(
             DnsResolver::builder()
@@ -160,9 +158,36 @@ pub async fn create_endpoint(secret_key: SecretKey, alpns: Vec<Vec<u8>>) -> Resu
                 .build(),
         )
         .ca_tls_config(CaTlsConfig::system())
+}
+
+/// The listening side: a stable identity, published to the pkarr relay so that
+/// id-only tickets resolve.
+pub async fn create_listener_endpoint(
+    secret_key: SecretKey,
+    alpns: Vec<Vec<u8>>,
+) -> Result<Endpoint> {
+    let user_data = PUBLISHED_USER_DATA
+        .parse()
+        .expect("one byte, well inside UserData's 245 byte limit");
+    endpoint_builder()
         .secret_key(secret_key)
         .alpns(alpns)
         .user_data_for_address_lookup(user_data)
+        .bind()
+        .await
+        .anyerr()
+}
+
+/// The dialing side: a throwaway identity that resolves the far side the same
+/// two ways the n0 preset does (DNS TXT and an HTTPS fetch from the pkarr relay)
+/// but publishes nothing. The preset's publisher would sign and PUT a record for
+/// every dial -- one per failsafe recheck, per thingspeak report, per operator
+/// session -- naming a key nobody will ever look up.
+pub async fn create_dialer_endpoint() -> Result<Endpoint> {
+    endpoint_builder()
+        .clear_address_lookup()
+        .address_lookup(PkarrResolver::n0_dns())
+        .address_lookup(DnsAddressLookup::n0_dns())
         .bind()
         .await
         .anyerr()
