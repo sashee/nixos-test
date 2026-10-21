@@ -181,8 +181,12 @@ pub async fn create_listener_endpoint(
 /// The dialing side: a throwaway identity that resolves the far side the same
 /// two ways the n0 preset does (DNS TXT and an HTTPS fetch from the pkarr relay)
 /// but publishes nothing. The preset's publisher would sign and PUT a record for
-/// every dial -- one per failsafe recheck, per thingspeak report, per operator
-/// session -- naming a key nobody will ever look up.
+/// every dialer endpoint -- one per failsafe recheck, per operator session, per
+/// iroh-uds-connect (re)connect -- naming a key nobody will ever look up.
+///
+/// The lookup list is a hand copy of `presets::N0` as of iroh 1.3.0, minus its
+/// `PkarrPublisher`; the listener takes the preset as-is. Nothing flags a
+/// divergence, so re-diff against the preset on every iroh bump.
 pub async fn create_dialer_endpoint() -> Result<Endpoint> {
     endpoint_builder()
         .clear_address_lookup()

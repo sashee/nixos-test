@@ -194,8 +194,9 @@ in
           with dns.iroh.link, but no longer with cached negative answers for the
           endpoint's `_iroh` name (see delaySeconds); the HTTPS path still
           resolves dns.iroh.link itself through the system resolver. A client
-          that only does DNS discovery (stock dumbpipe on an iroh older than 1.3)
-          can still fail while this reads ready.
+          that only does DNS discovery (anything on iroh 1.0.2 or older, which
+          fetched over HTTPS only in browsers) can still fail while this reads
+          ready.
         '';
       };
 
@@ -214,7 +215,8 @@ in
           served from its cache for 600s (its `cache_neg_max_ttl` default)
           however often the probe rechecked: time-to-publish plus 600s, ~660s
           observed (an ~11 min outage on the rpi5, 2026-07-18), which is what
-          this 900s default was sized against. Since iroh 1.3 the probe also
+          this 900s default was sized against. Since this binary moved off iroh
+          1.0.2 (1.0.3 extended HTTPS discovery past browsers) the probe also
           fetches the record over HTTPS from the pkarr relay the listener
           publishes to, with no cache of the record in between, so discovery
           recovers as soon as the publish lands and the budget is

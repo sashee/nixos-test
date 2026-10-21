@@ -32,7 +32,10 @@ rustix = { version = "1", features = ["time"] }
 # but note its own README says no security audit has been performed and constant-time
 # operation has not been thoroughly assessed -- worth knowing for a boot-critical path, and
 # there is no alternative implementation of this construction in the ecosystem.
-aes-siv = "0.8"
+# `zeroize` wipes the session keys when the cipher is dropped; since 0.8 it is opt-in. Default
+# features off drops getrandom: nonces come from /dev/urandom in main.rs. `alloc` is for the
+# Vec-returning encrypt.
+aes-siv = { version = "0.8", default-features = false, features = ["alloc", "zeroize"] }
 
 [[bin]]
 name = "time-correction"
