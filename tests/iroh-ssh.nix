@@ -11,7 +11,7 @@ let
 
   # Endpoint-id discovery lives under this domain: the canonical (id-only) ticket
   # carries no relay url, so the dialing side has to look the endpoint up. iroh
-  # (>= 1.3) does that two ways at once and takes whichever answers first: a TXT
+  # (>= 1.0.3) does that two ways at once and takes whichever answers first: a TXT
   # query for `_iroh.<z32-endpoint-id>.dns.iroh.link`, and an HTTPS GET of the
   # endpoint's signed packet from `https://dns.iroh.link/pkarr/<z32>` -- the same
   # pkarr relay the listener PUTs it to.
@@ -153,6 +153,14 @@ let
   trustTestCa = {
     security.pki.certificateFiles = [ interceptor.caFile relayCert.caFile pkarrCert.caFile ];
   };
+
+  # Tools the testScript runs on the stock nodes that their closure does not carry. The
+  # guest's store registers only the system closure, so anything else is garbage to the
+  # boot-armed nix-gc (OnBootSec=15min) -- and the HTTPS-discovery phase that uses dig runs
+  # last, well past that on a slow runner.
+  rootTestTools = {
+    system.extraDependencies = [ pkgs.dig ];
+  };
 in
 nixpkgs.lib.nixos.runTest {
   name = "iroh-ssh";
@@ -229,7 +237,7 @@ nixpkgs.lib.nixos.runTest {
   # except for the required credential dir and trusting the test CA.
   # Default-deny firewall ON. mkForce: the rpi config enables auto-upgrade.
   nodes.server = { lib, ... }: {
-    imports = [ machineModule trustTestCa ];
+    imports = [ machineModule trustTestCa rootTestTools ];
 
     networking.hostName = "iroh-server";
     common.autoUpgrade.enable = lib.mkForce false;
@@ -248,7 +256,7 @@ nixpkgs.lib.nixos.runTest {
   # The connecting machine: the same stock config (so it resolves and dials
   # the relay through the same real path), plus the iroh-ssh client.
   nodes.client = { lib, ... }: {
-    imports = [ machineModule trustTestCa ];
+    imports = [ machineModule trustTestCa rootTestTools ];
 
     networking.hostName = "iroh-client";
     common.autoUpgrade.enable = lib.mkForce false;
@@ -272,6 +280,9 @@ nixpkgs.lib.nixos.runTest {
     dohpeer.wait_for_unit("fake-doh.service")
     relay.wait_for_unit("iroh-relay.service")
     relay.wait_for_unit("fake-pkarr.service")
+    # Active only means spawned: the server can still die loading the cert or binding. It is
+    # not exercised until the last phase, so prove it is listening now.
+    relay.wait_for_open_port(443, "${pkarrAddress}")
 
     def vlan_ip(node):
         # eth1's static address is assigned by network-addresses-eth1.service,
