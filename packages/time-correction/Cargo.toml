@@ -32,10 +32,16 @@ rustix = { version = "1", features = ["time"] }
 # but note its own README says no security audit has been performed and constant-time
 # operation has not been thoroughly assessed -- worth knowing for a boot-critical path, and
 # there is no alternative implementation of this construction in the ecosystem.
-# `zeroize` wipes the session keys when the cipher is dropped; since 0.8 it is opt-in. Default
-# features off drops getrandom: nonces come from /dev/urandom in main.rs. `alloc` is for the
-# Vec-returning encrypt.
+# `zeroize` wipes the cipher's copies of the session keys when it is dropped; since 0.8 it is
+# opt-in. Default features off drops getrandom: nonces come from /dev/urandom in main.rs.
+# `alloc` is for the Vec-returning encrypt.
 aes-siv = { version = "0.8", default-features = false, features = ["alloc", "zeroize"] }
+# Not used directly: here only to turn on `zeroize` in aes-siv's own dependencies, which its
+# feature does not forward. aes-siv's covers only the raw CTR key; the expanded AES key
+# schedules (the MAC key's, and the CTR key's per operation) are wiped by aes's, and the CMAC
+# chaining state by cmac's. Versions track what aes-siv requires, so features unify.
+aes = { version = "0.9", features = ["zeroize"] }
+cmac = { version = "0.8", features = ["zeroize"] }
 
 [[bin]]
 name = "time-correction"
