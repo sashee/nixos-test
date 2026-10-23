@@ -162,11 +162,11 @@
     "pw-mgr": {
       "flake": false,
       "locked": {
-        "lastModified": 1792773975,
-        "narHash": "sha256-wYuoncGAOjNlHbQczkQG5O0qaURmXFykXIrQcrKcWns=",
+        "lastModified": 1792793365,
+        "narHash": "sha256-E6wQA+XIs1CDpdVEqRAYZ5OuILcyeOWsSZO/oG4rzJU=",
         "owner": "sashee",
         "repo": "pw-mgr",
-        "rev": "6087205796106d84d9af2832dbcfa69860393de2",
+        "rev": "9995fbd18ad4ea94056580be03cc1e9f29539b62",
         "type": "github"
       },
       "original": {

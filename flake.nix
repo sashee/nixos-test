@@ -323,9 +323,10 @@
           }
         ];
       };
-      # pw-mgr's own VM test on x86, against the same node and for the same reasons as
+      # Every pw-mgr check on x86 (its VM test, its browser and unit tests, and the e2ee-store
+      # ones it reruns), the VM tests against the same node and for the same reasons as
       # monitoringPlatformTestsX86 above: the fast companion of the aarch64 run, which decides.
-      pwMgrTestX86 = import "${pw-mgr}/nix/tests/lib.nix" {
+      pwMgrChecksX86 = import "${pw-mgr}/nix/tests" {
         inherit pkgs;
         machineModules = [
           rpi5X86QuiescedModule
@@ -750,11 +751,11 @@
           }
         ];
       };
-      # pw-mgr's own VM test against the REAL rpi config, for the reason given on
-      # monitoringPlatformTestsRpi: its sandbox assertions only decide anything against the
-      # systemd the Pi boots, so this consumer-side run is the one that counts. One test, not
-      # a suite of cases, so it maps to one check of the same name.
-      pwMgrTestRpi = import "${pw-mgr}/nix/tests/lib.nix" {
+      # Every pw-mgr check, the VM tests against the REAL rpi config, for the reason given on
+      # monitoringPlatformTestsRpi: their sandbox assertions only decide anything against the
+      # systemd the Pi boots, so this consumer-side run is the one that counts. An attrset of
+      # derivations, one per check; pwMgrNames maps it into the check sets.
+      pwMgrChecksRpi = import "${pw-mgr}/nix/tests" {
         pkgs = pkgsRpi;
         machineModules = [
           rpiQuiescedSystemModule
@@ -918,9 +919,17 @@
       # free aarch64 CI runner) while QEMU's accel=kvm:tcg still uses KVM wherever it
       # exists (x86 runner, and the Pi itself: the rpi5 kernel ships KVM), falling
       # back to slow TCG only where /dev/kvm is missing (the aarch64 CI runner).
-      dropKvm = test: test.overrideTestDerivation (old: {
+      # Anything that isn't a NixOS test (pw-mgr's browser and unit tests) passes through.
+      dropKvm = test: if test ? overrideTestDerivation then test.overrideTestDerivation (old: {
         requiredSystemFeatures = builtins.filter (f: f != "kvm") old.requiredSystemFeatures;
-      });
+      }) else test;
+      # pw-mgr's checks under their check names: its VM test keeps the bare name, the rest
+      # get prefixed. The same names on both arches, like monitoring-platform's.
+      pwMgrNames = checks: nixpkgs.lib.mapAttrs'
+        (name: check: nixpkgs.lib.nameValuePair
+          (if name == "vm" then "pw-mgr" else "pw-mgr-${name}")
+          check)
+        checks;
       # All aarch64 (Raspberry Pi 5) checks in one place. Add new rpi tests here;
       # CI builds the aggregate below, so the workflow never needs editing.
       aarch64TestResults = builtins.mapAttrs (_: dropKvm) ({
@@ -950,8 +959,8 @@
         # Not "monitoring-platform-tunnel": the monitoring-platform-* names in this
         # set are upstream's own suite, mapped in below, and this is not one of them.
         mp-tunnel = mpTunnelTestRpi;
-        # Upstream's VM test, and our end-to-end run of the iroh path in front of it.
-        pw-mgr = pwMgrTestRpi;
+        # Our end-to-end run of the iroh path in front of pw-mgr; upstream's checks are
+        # mapped in below.
         pw-mgr-tunnel = pwMgrTunnelTestRpi;
         restic = resticTestRpi;
         boot-clock = bootClockTestRpi;
@@ -962,6 +971,7 @@
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
         rpiNixUtilsTests)
+      // pwMgrNames pwMgrChecksRpi
       # The harness's `platform` key is its shared-VM run, so it takes the bare name
       # and the isolated cases get suffixed. dropKvm applies because these are inside
       # the mapAttrs argument: upstream only drops it in its own nix/tests/default.nix,
@@ -1279,8 +1289,8 @@
           (if name == "platform" then "monitoring-platform" else "monitoring-platform-${name}")
           test)
         monitoringPlatformTestsX86)
-      # Upstream's one pw-mgr test, under its aarch64 twin's name for the same reason.
-      // { pw-mgr = pwMgrTestX86; });
+      # Upstream's pw-mgr checks, under their aarch64 twins' names for the same reason.
+      // pwMgrNames pwMgrChecksX86);
 
       # NOT CI COVERAGE. Everything from here down that runs on commonDesktopModule exists
       # only to back a <name>-driver / -driver-interactive package below: they are the
