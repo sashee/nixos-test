@@ -3,6 +3,7 @@
     ./nix-settings.nix
     ./locale.nix
     ./laptop-base.nix
+    ./wifi.nix
     ./audio.nix
     ./firewall.nix
     ./doh.nix

@@ -790,6 +790,19 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiConnectivitySystemModule;
       };
+      # Wifi power save on the REAL rpi config, through the deployed iwd. The fallback check's
+      # deadline is pushed out because the node sits unassociated until the test AP is up and
+      # again on purpose mid-test -- at the production bootGrace under TCG that can be long
+      # enough to raise the setup AP on the very radio under test.
+      wifiTestRpi = import ./tests/wifi.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = { ... }: {
+          imports = [ rpiConnectivitySystemModule ];
+          common.connectivityFallback.bootGrace = "3h";
+        };
+      };
       # The DNS-outage reboot failsafe on the REAL rpi config -- the valuable variant: the
       # deployed dnscrypt, the DoH egress rules that make a loopback-only probe the only
       # workable one, and the default-deny firewall are all live.
@@ -947,6 +960,7 @@
         nix-build-dir-cleanup = nixBuildDirCleanupTestRpi;
         monitoring = monitoringTestRpi;
         connectivity-fallback = connectivityFallbackTestRpi;
+        wifi = wifiTestRpi;
         connectivity-fallback-trigger = connectivityFallbackTriggerTestRpi;
         connectivity-watchdog = connectivityWatchdogTestRpi;
         time-correction = timeCorrectionTestRpi;
@@ -1243,6 +1257,13 @@
         rpi5-x86-connectivity-fallback = rpi5X86Test ./tests/connectivity-fallback.nix {
           machineModule = rpi5X86QuiescedModule;
         };
+        # bootGrace pushed out for the same reason as wifiTestRpi.
+        rpi5-x86-wifi = rpi5X86Test ./tests/wifi.nix {
+          machineModule = { ... }: {
+            imports = [ rpi5X86QuiescedModule ];
+            common.connectivityFallback.bootGrace = "3h";
+          };
+        };
         rpi5-x86-connectivity-fallback-trigger = rpi5X86Test ./tests/connectivity-fallback-trigger.nix {
           machineModule = rpi5X86QuiescedModule;
         };
@@ -1488,6 +1509,10 @@
         inherit nixpkgs pkgs stateVersion;
         commonDesktopModule = anyaFeherLaptopSystemModule;
       };
+      anyaFeherLaptopWifiTest = import ./tests/wifi.nix {
+        inherit nixpkgs pkgs stateVersion;
+        machineModule = anyaFeherLaptopSystemModule;
+      };
       anyaFeherLaptopFirewallTest = import ./tests/firewall.nix {
         inherit nixpkgs pkgs stateVersion;
         machineModule = anyaFeherLaptopSystemModule;
@@ -1662,6 +1687,7 @@
         anya-feher-laptop-doh-upstream = anyaFeherLaptopDohUpstreamTest;
         anya-feher-laptop-doh-captive = anyaFeherLaptopDohCaptiveTest;
         anya-feher-laptop-firewall = anyaFeherLaptopFirewallTest;
+        anya-feher-laptop-wifi = anyaFeherLaptopWifiTest;
         anya-feher-laptop-iroh-ssh = anyaFeherLaptopIrohSshTest;
         anya-feher-laptop-system = anyaFeherLaptopSystemTest;
         anya-feher-laptop-monitoring-auto-upgrade = anyaFeherLaptopMonitoringAutoUpgradeTest;

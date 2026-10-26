@@ -53,6 +53,7 @@ in
     ../../modules/inverter-monitoring.nix
     ../../modules/bms-monitoring.nix
     ../../modules/time-sync.nix
+    ../../modules/wifi.nix
     ../../modules/connectivity-fallback.nix
     ../../modules/connectivity-watchdog.nix
     ../../modules/iroh-ssh.nix
