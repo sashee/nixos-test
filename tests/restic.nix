@@ -816,7 +816,10 @@ nixpkgs.lib.nixos.runTest {
     client.wait_until_succeeds("systemctl show restic-hold-quiesce.service -p ActiveState --value | grep -Fqx active")
     client.succeed("rm /run/quiesce-fail-quiesced-crashing")
     client.sleep(6)
-    assert client.succeed("systemctl show quiesced-crashing.service -p ActiveState --value").strip() == "inactive"
+    # "failed" when the automatic restart came due between the quiesce unit's look and its stop: the
+    # stop then lands on a start under way, which fails, and a stop job leaves a failure as "failed".
+    crashing = client.succeed("systemctl show quiesced-crashing.service -p ActiveState --value").strip()
+    assert crashing in ("inactive", "failed"), crashing
     assert client.succeed("systemctl show restic-backups-quiesce.service -p ActiveState --value").strip() == "activating"
 
     backend.succeed("systemctl kill --signal=SIGCONT restic-rest-normal.service")
