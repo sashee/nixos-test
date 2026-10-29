@@ -67,6 +67,10 @@
 
 * [pw-mgr](./features/pw-mgr/pw-mgr.md)
 
+## Media-store
+
+* [media-store](./features/media-store/media-store.md)
+
 ## Thingspeak solar reporting
 
 * a timer that fires every minute
