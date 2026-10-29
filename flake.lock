@@ -48,6 +48,22 @@
         "type": "github"
       }
     },
+    "media-store": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793302079,
+        "narHash": "sha256-AFb49mduZJrGa6IIuRHo6SA3cf7+xAlxPVyNAm31nWQ=",
+        "owner": "sashee",
+        "repo": "media-store",
+        "rev": "714a96bb4709d268d22844235f6fc348dd68d288",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sashee",
+        "repo": "media-store",
+        "type": "github"
+      }
+    },
     "monitoring-platform": {
       "flake": false,
       "locked": {
@@ -162,11 +178,11 @@
     "pw-mgr": {
       "flake": false,
       "locked": {
-        "lastModified": 1793116391,
-        "narHash": "sha256-yAJ63lK7RCRUoiKvRUg3E7qfQ3aGh1HeGZRDCL5j8Zk=",
+        "lastModified": 1793302094,
+        "narHash": "sha256-F2fhsfNu+KovfOuvQsI9E+sMMM+IkM5ZcpFlfR+FVH0=",
         "owner": "sashee",
         "repo": "pw-mgr",
-        "rev": "07b06660298f3da7b6d74a0bccf1890e677fc236",
+        "rev": "987cc8505272816eb10fd30a5bd062c3a075d72e",
         "type": "github"
       },
       "original": {
@@ -178,6 +194,7 @@
     "root": {
       "inputs": {
         "dotfiles": "dotfiles",
+        "media-store": "media-store",
         "monitoring-platform": "monitoring-platform",
         "nixos-raspberrypi": "nixos-raspberrypi",
         "nixpkgs": "nixpkgs_2",

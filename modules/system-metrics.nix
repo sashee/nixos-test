@@ -106,6 +106,11 @@ let
     # backend because a dead vault is otherwise noticed only by whoever next needs a password.
     ++ lib.optional (config.services ? pw-mgr && config.services.pw-mgr.enable) "pw-mgr.service"
     ++ lib.optional (commonFeature [ "pwMgrTunnel" "enable" ] false) "pw-mgr-tunnel.service"
+    # The media library and its tunnel, for the same two reasons.
+    ++ lib.optional (config.services ? media-store && config.services.media-store.enable)
+      "media-store.service"
+    ++ lib.optional (commonFeature [ "mediaStoreTunnel" "enable" ] false)
+      "media-store-tunnel.service"
     # The DoH producer, which belongs here even though `system-metrics.service` deliberately does
     # not: that exclusion is about a oneshot observing ITSELF, always mid-run and so always
     # `activating`. This one is observed by the fifteen-minute unit while it sits idle between

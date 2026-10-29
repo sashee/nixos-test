@@ -24,9 +24,15 @@
       url = "github:sashee/pw-mgr";
       flake = false;
     };
+    # The media library for the Pi: the same backend as pw-mgr (e2ee-store, pinned inside it),
+    # consumed the same way.
+    media-store = {
+      url = "github:sashee/media-store";
+      flake = false;
+    };
   };
 
-  outputs = { nixpkgs, nixpkgs-unstable, dotfiles, nixos-raspberrypi, monitoring-platform, pw-mgr, ... }:
+  outputs = { nixpkgs, nixpkgs-unstable, dotfiles, nixos-raspberrypi, monitoring-platform, pw-mgr, media-store, ... }:
     let
       system = "x86_64-linux";
       stateVersion = nixpkgs.lib.trivial.release;
@@ -225,6 +231,48 @@
         services.mp-collector.forwardToGroup =
           lib.mkOverride 90 config.services.monitoring-platform.group;
       };
+      # The media library's S3 credential, which hosts/rpi5 has media-store's module load with
+      # LoadCredentialEncrypted= from /etc/credentials/media-store/s3. Provisioned for
+      # testNodeCollectorApiKey's reason: a missing one is fatal, so every rpi node would boot
+      # with media-store.service failing and restarting every 5s -- and upstream's own checks
+      # boot this node, the `vm` one asserting the unit never restarted.
+      #
+      # Provisioned rather than switched off for the same reason too: the backend's name, the
+      # file and the --name= the blob is authenticated with all have to agree, and only a real
+      # decryption proves they do; storageBackends = { } would also drop the IP address families
+      # the deployed unit has, which upstream's `vm` check asserts against the node's config.
+      #
+      # A PLACEHOLDER: well-formed, so the server starts, but its endpoint is a closed port on
+      # loopback, so nothing leaves the node and every request is refused at once. An unreachable
+      # backend is an outage the server rides out (backend SPEC §7.4): the hourly pass logs it and
+      # changes nothing, and with nothing uploaded there is nothing to read from it.
+      # tests/media-store-s3.nix replaces it with one for an S3 in the VM.
+      #
+      # Encrypted at boot, as testNodeCollectorApiKey's is. media-store.service has ordinary
+      # dependencies, so ordinary ordering before it is enough.
+      testNodeMediaStoreS3 = { pkgs, ... }: {
+        systemd.services.test-media-store-s3 = {
+          description = "Provision the media library's S3 credential (test nodes only)";
+          requiredBy = [ "media-store.service" ];
+          before = [ "media-store.service" ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+          script = ''
+            install -d -m 0700 /etc/credentials/media-store
+            printf '%s\n' \
+              'endpoint = "https://127.0.0.1:9"' \
+              'region = "placeholder"' \
+              'bucket = "placeholder"' \
+              'prefix = "media-store/"' \
+              'access_key_id = "placeholder"' \
+              'secret_access_key = "placeholder"' \
+              | ${pkgs.systemd}/bin/systemd-creds encrypt --name=s3 - /etc/credentials/media-store/s3
+            chmod 0600 /etc/credentials/media-store/s3
+          '';
+        };
+      };
       # VM-test guest clock: tomorrow at 10:00 UTC. See lib/test-rtc-base.nix for why, and
       # for why it is a file rather than a binding here (a test file needs it for a helper
       # node that must share the clock of the node under test).
@@ -341,6 +389,22 @@
           }
         ];
       };
+      # Every media-store check on x86, on the same node and for the same reasons as pw-mgr's.
+      mediaStoreChecksX86 = import "${media-store}/nix/tests" {
+        inherit pkgs;
+        machineModules = [
+          rpi5X86QuiescedModule
+          {
+            # The harness sets no node hostName, so without one the rpi config's mkDefault
+            # ties with the framework's.
+            networking.hostName = "media-store-test";
+            system.stateVersion = rpi5StateVersion;
+            virtualisation.memorySize = nixpkgs.lib.mkDefault 2048;
+            # Nothing here is about remote access.
+            common.irohSsh.enable = nixpkgs.lib.mkForce false;
+          }
+        ];
+      };
       dohStamps = import ./lib/doh-stamps.nix { lib = nixpkgs.lib; };
       ntsServers = import ./lib/nts-servers.nix { lib = nixpkgs.lib; };
       resticLib = import ./lib/restic.nix { lib = nixpkgs.lib; };
@@ -361,6 +425,10 @@
         # The password manager's backend. Composed here for the same reason as the receiver:
         # hosts/rpi5 sets its options, and an `imports` entry cannot name an input.
         "${pw-mgr}/nix/module.nix"
+        # The media library, for the same reason. It runs on the same backend as pw-mgr, each
+        # app on its own pin of e2ee-store: e2ee-store's nix/lib.nix declares no option of its
+        # own, so the two pins never meet (e2ee-store-pins checks that they can differ).
+        "${media-store}/nix/module.nix"
         timeSyncSettings
         ./hosts/rpi5/configuration.nix
       ];
@@ -510,6 +578,7 @@
           testNodeBootGcDeferred
           testNodeCollectorApiKey
           testNodeMpTunnelOff
+          testNodeMediaStoreS3
         ];
         _module.args = rpiSystemArgs;
       };
@@ -754,7 +823,7 @@
       # Every pw-mgr check, the VM tests against the REAL rpi config, for the reason given on
       # monitoringPlatformTestsRpi: their sandbox assertions only decide anything against the
       # systemd the Pi boots, so this consumer-side run is the one that counts. An attrset of
-      # derivations, one per check; pwMgrNames maps it into the check sets.
+      # derivations, one per check; appCheckNames maps it into the check sets.
       pwMgrChecksRpi = import "${pw-mgr}/nix/tests" {
         pkgs = pkgsRpi;
         machineModules = [
@@ -763,6 +832,22 @@
             # Same reason as rpiNixUtilsTests: the harness sets no node hostName, so
             # without one the rpi config's mkDefault ties with the framework's.
             networking.hostName = "pw-mgr-test";
+            system.stateVersion = rpi5Base.config.system.stateVersion;
+            virtualisation.memorySize = nixpkgs.lib.mkDefault 2048;
+            # Nothing here is about remote access.
+            common.irohSsh.enable = nixpkgs.lib.mkForce false;
+          }
+        ];
+      };
+      # Every media-store check, the VM tests against the REAL rpi config, for pw-mgr's reason.
+      mediaStoreChecksRpi = import "${media-store}/nix/tests" {
+        pkgs = pkgsRpi;
+        machineModules = [
+          rpiQuiescedSystemModule
+          {
+            # Same reason as rpiNixUtilsTests: the harness sets no node hostName, so
+            # without one the rpi config's mkDefault ties with the framework's.
+            networking.hostName = "media-store-test";
             system.stateVersion = rpi5Base.config.system.stateVersion;
             virtualisation.memorySize = nixpkgs.lib.mkDefault 2048;
             # Nothing here is about remote access.
@@ -907,12 +992,29 @@
         inherit dohStamps;
       };
       # The password manager's iroh path end to end, with a relay and a discovery domain.
-      pwMgrTunnelTestRpi = import ./tests/pw-mgr-tunnel.nix {
+      pwMgrTunnelTestRpi = import ./tests/e2ee-store-tunnel.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiSystemModule;
         inherit dohStamps;
+        app = "pw-mgr";
+      };
+      # The media library's, the same test.
+      mediaStoreTunnelTestRpi = import ./tests/e2ee-store-tunnel.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiSystemModule;
+        inherit dohStamps;
+        app = "media-store";
+      };
+      # The media library's deployed storage settings against an S3 in the VM.
+      mediaStoreS3TestRpi = import ./tests/media-store-s3.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiQuiescedSystemModule;
       };
       bootClockTestRpi = import ./tests/boot-clock.nix {
         nixpkgs = nixrpi;
@@ -932,15 +1034,16 @@
       # free aarch64 CI runner) while QEMU's accel=kvm:tcg still uses KVM wherever it
       # exists (x86 runner, and the Pi itself: the rpi5 kernel ships KVM), falling
       # back to slow TCG only where /dev/kvm is missing (the aarch64 CI runner).
-      # Anything that isn't a NixOS test (pw-mgr's browser and unit tests) passes through.
+      # Anything that isn't a NixOS test (the apps' browser and unit tests) passes through.
       dropKvm = test: if test ? overrideTestDerivation then test.overrideTestDerivation (old: {
         requiredSystemFeatures = builtins.filter (f: f != "kvm") old.requiredSystemFeatures;
       }) else test;
-      # pw-mgr's checks under their check names: its VM test keeps the bare name, the rest
-      # get prefixed. The same names on both arches, like monitoring-platform's.
-      pwMgrNames = checks: nixpkgs.lib.mapAttrs'
+      # An e2ee-store app's checks (pw-mgr's, media-store's) under their check names: its VM
+      # test keeps the app's bare name, the rest get prefixed. The same names on both arches,
+      # like monitoring-platform's.
+      appCheckNames = app: checks: nixpkgs.lib.mapAttrs'
         (name: check: nixpkgs.lib.nameValuePair
-          (if name == "vm" then "pw-mgr" else "pw-mgr-${name}")
+          (if name == "vm" then app else "${app}-${name}")
           check)
         checks;
       # All aarch64 (Raspberry Pi 5) checks in one place. Add new rpi tests here;
@@ -973,9 +1076,11 @@
         # Not "monitoring-platform-tunnel": the monitoring-platform-* names in this
         # set are upstream's own suite, mapped in below, and this is not one of them.
         mp-tunnel = mpTunnelTestRpi;
-        # Our end-to-end run of the iroh path in front of pw-mgr; upstream's checks are
-        # mapped in below.
+        # Our end-to-end runs of the iroh path in front of pw-mgr and media-store, and of
+        # media-store's S3 settings; upstream's checks are mapped in below.
         pw-mgr-tunnel = pwMgrTunnelTestRpi;
+        media-store-tunnel = mediaStoreTunnelTestRpi;
+        media-store-s3 = mediaStoreS3TestRpi;
         restic = resticTestRpi;
         boot-clock = bootClockTestRpi;
         system-metrics = systemMetricsTestRpi;
@@ -985,7 +1090,8 @@
       } // (nixpkgs.lib.mapAttrs'
         (name: test: nixpkgs.lib.nameValuePair "nix-utils-${name}" test)
         rpiNixUtilsTests)
-      // pwMgrNames pwMgrChecksRpi
+      // appCheckNames "pw-mgr" pwMgrChecksRpi
+      // appCheckNames "media-store" mediaStoreChecksRpi
       # The harness's `platform` key is its shared-VM run, so it takes the bare name
       # and the isolated cases get suffixed. dropKvm applies because these are inside
       # the mapAttrs argument: upstream only drops it in its own nix/tests/default.nix,
@@ -1067,6 +1173,7 @@
           testNodeBootGcDeferred
           testNodeCollectorApiKey
           testNodeMpTunnelOff
+          testNodeMediaStoreS3
         ];
         # rpiSystemArgs verbatim: nixpkgs-stable is already the top-level `nixpkgs`, and
         # hosts/rpi5 derives its `system` from pkgs.stdenv.hostPlatform, so the nix-utils
@@ -1241,9 +1348,18 @@
           machineModule = rpi5X86SystemModule;
           inherit dohStamps;
         };
-        rpi5-x86-pw-mgr-tunnel = rpi5X86Test ./tests/pw-mgr-tunnel.nix {
+        rpi5-x86-pw-mgr-tunnel = rpi5X86Test ./tests/e2ee-store-tunnel.nix {
           machineModule = rpi5X86SystemModule;
           inherit dohStamps;
+          app = "pw-mgr";
+        };
+        rpi5-x86-media-store-tunnel = rpi5X86Test ./tests/e2ee-store-tunnel.nix {
+          machineModule = rpi5X86SystemModule;
+          inherit dohStamps;
+          app = "media-store";
+        };
+        rpi5-x86-media-store-s3 = rpi5X86Test ./tests/media-store-s3.nix {
+          machineModule = rpi5X86QuiescedModule;
         };
         # The ThingSpeak reporter. Several of its subtests have to wait out an interval
         # boundary -- a run reads the *previous* whole interval -- so this is the leg that
@@ -1292,10 +1408,10 @@
       # monitoring-nix-gc and monitoring-iroh-ssh are host-input-free module unit tests
       # (tests/monitoring/{nix-gc,iroh-ssh}.nix build their own node and take no host
       # module); anya enables common.monitoring and common.irohSsh too, so they are here
-      # for scheduling, not ownership. connectivity-fallback-timing, monitoring-platform-* and
-      # pw-mgr do belong to the Pi: it is the only host that deploys any of them. All of them
-      # have an aarch64 twin in the rpi5 set, which evaluates a different nixpkgs; these are the
-      # fast x86 runs.
+      # for scheduling, not ownership. connectivity-fallback-timing, monitoring-platform-*,
+      # pw-mgr and media-store do belong to the Pi: it is the only host that deploys any of them.
+      # All of them have an aarch64 twin in the rpi5 set, which evaluates a different nixpkgs;
+      # these are the fast x86 runs.
       // {
         monitoring-nix-gc = monitoringNixGcTest;
         monitoring-iroh-ssh = monitoringIrohSshTest;
@@ -1310,8 +1426,10 @@
           (if name == "platform" then "monitoring-platform" else "monitoring-platform-${name}")
           test)
         monitoringPlatformTestsX86)
-      # Upstream's pw-mgr checks, under their aarch64 twins' names for the same reason.
-      // pwMgrNames pwMgrChecksX86);
+      # Upstream's pw-mgr and media-store checks, under their aarch64 twins' names for the
+      # same reason.
+      // appCheckNames "pw-mgr" pwMgrChecksX86
+      // appCheckNames "media-store" mediaStoreChecksX86);
 
       # NOT CI COVERAGE. Everything from here down that runs on commonDesktopModule exists
       # only to back a <name>-driver / -driver-interactive package below: they are the
@@ -1430,6 +1548,38 @@
           toplevel = (mkAnyaFeherLaptop { modules = [ laptopStubHw ]; }).config.system.build.toplevel;
         in
         pkgs.runCommand "anya-feher-laptop-eval" { } ''
+          echo ${nixpkgs.lib.escapeShellArg (builtins.unsafeDiscardStringContext toplevel.drvPath)} > $out
+        '';
+      # pw-mgr and media-store each pin e2ee-store on their own and are bumped on their own
+      # cadence, so the deployed rpi config has to evaluate with the two on different commits.
+      # The lock mostly has them on the same one, which hides the failure this guards against:
+      # anything e2ee-store declares itself, rather than through the app's options, is declared
+      # once per pin and collides. So this adds a third app, made from nix/lib.nix the way theirs
+      # are, from a copy of media-store's pin at another store path -- to the module system, a
+      # different pin. Eval only, like anya-feher-laptop-eval: nothing is built.
+      e2eeStorePinsEval =
+        let
+          secondPin = builtins.path {
+            path = import "${media-store}/nix/e2ee-store.nix";
+            name = "e2ee-store-second-pin";
+          };
+          thirdApp = { config, lib, pkgs, ... }:
+            let
+              name = "e2ee-store-pins";
+              cfg = config.services.${name};
+              e2ee = import "${secondPin}/nix/lib.nix" { inherit config lib pkgs; };
+            in
+            {
+              options.services.${name} = e2ee.options { inherit name; };
+              config = e2ee.config {
+                inherit name;
+                inherit (cfg) package settings storageBackends;
+                staticDir = "${pkgs.emptyDirectory}";
+              };
+            };
+          toplevel = (mkRpi5 { modules = [ thirdApp ]; }).config.system.build.toplevel;
+        in
+        pkgs.runCommand "e2ee-store-pins-eval" { } ''
           echo ${nixpkgs.lib.escapeShellArg (builtins.unsafeDiscardStringContext toplevel.drvPath)} > $out
         '';
       # Same shape, for the demo QEMU VM. It is packages.default and packages.qemu-vm --
@@ -1731,6 +1881,7 @@
         time-sync-assertions = timeSyncAssertionsTest;
         thingspeak-deployed = thingspeakDeployedTest;
         qemu-graphical-eval = qemuGraphicalEval;
+        e2ee-store-pins = e2eeStorePinsEval;
         upgrade-plan-parse = upgradePlanParseTest;
       };
     in
