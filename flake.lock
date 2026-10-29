@@ -51,11 +51,11 @@
     "media-store": {
       "flake": false,
       "locked": {
-        "lastModified": 1793302079,
-        "narHash": "sha256-AFb49mduZJrGa6IIuRHo6SA3cf7+xAlxPVyNAm31nWQ=",
+        "lastModified": 1793309333,
+        "narHash": "sha256-P8/CKXul7aD/sPjuimFk9Z+49sBp4otvyHP2cyqZvrE=",
         "owner": "sashee",
         "repo": "media-store",
-        "rev": "714a96bb4709d268d22844235f6fc348dd68d288",
+        "rev": "721e4a3109c5a22c290d4ad3868c7f9c57bcd7ce",
         "type": "github"
       },
       "original": {
@@ -178,11 +178,11 @@
     "pw-mgr": {
       "flake": false,
       "locked": {
-        "lastModified": 1793302094,
-        "narHash": "sha256-F2fhsfNu+KovfOuvQsI9E+sMMM+IkM5ZcpFlfR+FVH0=",
+        "lastModified": 1793309324,
+        "narHash": "sha256-Mrt+ivsb2jyQQqmHQuQcI/7rdfjm93fdXEsJW9jTpyM=",
         "owner": "sashee",
         "repo": "pw-mgr",
-        "rev": "987cc8505272816eb10fd30a5bd062c3a075d72e",
+        "rev": "ac71bc1fb87f8489e46a79bc237985641bd45bd0",
         "type": "github"
       },
       "original": {
