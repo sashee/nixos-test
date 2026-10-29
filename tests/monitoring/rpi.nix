@@ -8,7 +8,8 @@
 #
 # On top of the real config it layers three test-only things:
 #   - the real borgbase backup re-pointed at an in-VM REST server, so the restic check reports
-#     for real and the backup's stopServices path runs against the real receiver and pw-mgr,
+#     for real and the backup's stopServices path runs against the real receiver, pw-mgr and
+#     media-store,
 #   - a mocked nixos-rebuild so the (real, enabled) auto-upgrade succeeds in a VM, and
 #   - nix.gc.automatic off, so a warp-triggered catch-up GC can't starve the monitoring run.
 # smart stays [SKIP] (the Pi's real setting, untouched).
@@ -231,21 +232,26 @@ nixpkgs.lib.nixos.runTest {
     client.fail("systemctl cat restic-backups-borgbase.service | grep -E 'RESTIC_REPOSITORY=|repo[.]borgbase|rest:'")
     client.succeed("systemctl show restic-backups-borgbase.timer -p Persistent --value | grep -F yes")
     client.succeed("systemctl show restic-backups-borgbase.timer -p TimersCalendar --value | grep -F '*-*-* 05:00:00'")
-    # The backup holds the receiver and pw-mgr stopped for the backup phase (restic-hold-borgbase,
-    # through a shared restic-quiesce-<unit> each) and releases them before prune/check. restic
-    # runs as a dynamic user with CAP_DAC_READ_SEARCH, in a Landlock sandbox that lets the backup
-    # phase read the two state directories and nothing else of the host's.
+    # The backup holds the receiver, pw-mgr and media-store stopped for the backup phase
+    # (restic-hold-borgbase, through a shared restic-quiesce-<unit> each) and releases them before
+    # prune/check. restic runs as a dynamic user with CAP_DAC_READ_SEARCH, in a Landlock sandbox
+    # that lets the backup phase read the three state directories and nothing else of the host's.
     client.succeed("systemctl cat restic-backups-borgbase.service | grep -E '^ExecStartPre=\\+.*/systemctl start restic-hold-borgbase[.]service$'")
     client.succeed("systemctl cat restic-backups-borgbase.service | grep -E '^ExecStart=\\+.*/systemctl stop restic-hold-borgbase[.]service$'")
     held = client.succeed("systemctl show restic-hold-borgbase.service -p Requires --value").split()
-    assert {"restic-quiesce-monitoring-platform.service", "restic-quiesce-pw-mgr.service"} <= set(held), held
+    assert {
+        "restic-quiesce-monitoring-platform.service",
+        "restic-quiesce-pw-mgr.service",
+        "restic-quiesce-media-store.service",
+    } <= set(held), held
     client.succeed("systemctl cat restic-backups-borgbase.service | grep -Fx 'DynamicUser=true'")
     client.succeed("systemctl cat restic-backups-borgbase.service | grep -Fx 'AmbientCapabilities=CAP_DAC_READ_SEARCH'")
     sandbox = client.succeed("systemctl cat restic-backups-borgbase.service | grep -o '/nix/store/[^ ]*/bin/restic-borgbase-sandbox'").strip()
-    for path in ["/var/lib/monitoring-platform", "/var/lib/pw-mgr"]:
+    for path in ["/var/lib/monitoring-platform", "/var/lib/pw-mgr", "/var/lib/media-store"]:
         client.succeed(f"grep -F 'paths=(' {sandbox} | grep -Fw {path}")
     client.succeed("systemctl is-active --quiet monitoring-platform.service")
     client.succeed("systemctl is-active --quiet pw-mgr.service")
+    client.succeed("systemctl is-active --quiet media-store.service")
 
     def quiesce_monitoring():
         # Pause the timer and drain any in-flight run before touching the platform log, so a
@@ -329,18 +335,18 @@ nixpkgs.lib.nixos.runTest {
     # and the append-only server has nothing to refuse yet.
     assert len(snapshot_ids()) == 1, snapshot_ids()
     assert refusals() == 0
-    # The receiver and pw-mgr were down while restic read them and started again once the backup
-    # released its hold, which it does before the check -- on the real config, ordering, not just
-    # liveness. The release only sets the start off (systemd then stops the quiesce units, which
-    # starts the services), so they may still be starting while the check runs: the order is
-    # checked against the hold's release, and liveness waited for. Last occurrence of each: both
+    # The receiver, pw-mgr and media-store were down while restic read them and started again once
+    # the backup released its hold, which it does before the check -- on the real config, ordering,
+    # not just liveness. The release only sets the start off (systemd then stops the quiesce units,
+    # which starts the services), so they may still be starting while the check runs: the order is
+    # checked against the hold's release, and liveness waited for. Last occurrence of each: all
     # also started at boot, and only this one backup run has happened so far.
-    for unit in ["monitoring-platform.service", "pw-mgr.service"]:
+    for unit in ["monitoring-platform.service", "pw-mgr.service", "media-store.service"]:
         client.wait_until_succeeds(f"systemctl is-active --quiet {unit}", timeout=300)
     hold = "restic-hold-borgbase.service"
     backup_log = client.succeed(
         "journalctl -b --no-pager -u restic-backups-borgbase.service"
-        f" -u {hold} -u monitoring-platform.service -u pw-mgr.service"
+        f" -u {hold} -u monitoring-platform.service -u pw-mgr.service -u media-store.service"
     ).splitlines()
     last = lambda match: max(i for i, line in enumerate(backup_log) if match(line))
     hold_description = client.succeed(f"systemctl show {hold} -p Description --value").strip()
@@ -348,7 +354,7 @@ nixpkgs.lib.nixos.runTest {
     hold_released = last(lambda line: f"Stopped {hold_description}" in line)
     checked = last(lambda line: "no errors were found" in line)
     assert saved < hold_released < checked, backup_log[saved:checked + 1]
-    for unit in ["monitoring-platform.service", "pw-mgr.service"]:
+    for unit in ["monitoring-platform.service", "pw-mgr.service", "media-store.service"]:
         description = client.succeed(f"systemctl show {unit} -p Description --value").strip()
         stopped = last(lambda line: f"Stopped {description}" in line)
         restarted = last(lambda line: f"Started {description}" in line)

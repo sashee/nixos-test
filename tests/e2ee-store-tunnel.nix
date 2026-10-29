@@ -1,4 +1,6 @@
-{ nixpkgs, pkgs, machineModule, stateVersion, dohStamps }:
+# The iroh path in front of an e2ee-store app (modules/e2ee-store-tunnel.nix), end to end on the
+# real rpi5 config: `app` is the app (services.<app>, <app>-tunnel.service).
+{ nixpkgs, pkgs, machineModule, stateVersion, dohStamps, app }:
 
 let
   irohSsh = pkgs.callPackage ../packages/iroh-ssh/package.nix { };
@@ -13,7 +15,7 @@ let
 
   interceptor = import ./doh-interceptor.nix {
     inherit pkgs dohStamps;
-    name = "pw-mgr-tunnel";
+    name = "${app}-tunnel";
     respond = ''
       def respond(query, meta):
           name, qtype, _, _ = read_question(query)
@@ -47,7 +49,7 @@ let
   '';
 in
 nixpkgs.lib.nixos.runTest {
-  name = "pw-mgr-tunnel";
+  name = "${app}-tunnel";
   hostPkgs = pkgs;
   skipTypeCheck = true;
   # Ceiling, not a wait: the aarch64 variant runs under TCG on the KVM-less CI
@@ -89,7 +91,7 @@ nixpkgs.lib.nixos.runTest {
       { security.pki.certificateFiles = [ interceptor.caFile relayCert.caFile ]; }
     ];
 
-    networking.hostName = "pw-mgr-tunnel-host";
+    networking.hostName = "${app}-tunnel-host";
     common.autoUpgrade.enable = lib.mkForce false;
     common.monitoring.enable = lib.mkForce false;
     # Not the subject here, and its failsafe would spend the test opening port 22
@@ -101,7 +103,7 @@ nixpkgs.lib.nixos.runTest {
 
   testScript = { nodes, ... }:
     let
-      backend = nodes.machine.services.pw-mgr;
+      backend = nodes.machine.services.${app};
     in
     ''
     import json
@@ -111,13 +113,16 @@ nixpkgs.lib.nixos.runTest {
 
     # Read off the node's own options rather than restated, so this asserts the
     # wiring against whatever upstream's module defaults to.
+    APP = "${app}"
     BACKEND = "${backend.socketPath}"
     BACKEND_GROUP = "${backend.group}"
-    CRED = "/etc/credentials/pw-mgr-tunnel"
+    # Restated, not read off the node: the directory hosts/rpi5 tells the operator to provision.
+    CRED = f"/etc/credentials/{APP}-tunnel"
+    TUNNEL = f"{APP}-tunnel.service"
 
     # The laptop's half of the path (hosts/rpi5 documents it for the operator):
     # iroh-uds-connect serving a local socket, socat putting a loopback port in front.
-    LAPTOP_SOCKET = "/run/pwm-laptop/pw-mgr.sock"
+    LAPTOP_SOCKET = f"/run/laptop/{APP}.sock"
     PORT = 8080
 
 
@@ -172,11 +177,11 @@ nixpkgs.lib.nixos.runTest {
         machine.succeed(f"${pkgs.iproute2}/bin/ip -6 route replace {ip}/128 dev eth1")
     machine.succeed("systemctl restart dnscrypt-proxy.service")
 
-    machine.wait_for_unit("pw-mgr.service")
+    machine.wait_for_unit(f"{APP}.service")
     machine.wait_until_succeeds(f"test -S {BACKEND}", timeout=120)
 
     with subtest("the tunnel forwards to the backend's socket, sandboxed"):
-        unit = machine.succeed("systemctl cat pw-mgr-tunnel.service")
+        unit = machine.succeed(f"systemctl cat {TUNNEL}")
         assert f"iroh-uds-listen {BACKEND}" in unit, f"not forwarding to the backend:\n{unit}"
         # The group whose 0750 socket directory is the actual access control.
         assert f"SupplementaryGroups={BACKEND_GROUP}" in unit, unit
@@ -187,11 +192,11 @@ nixpkgs.lib.nixos.runTest {
 
     with subtest("an unprovisioned tunnel skips rather than crash-loops"):
         result = machine.succeed(
-            "systemctl show pw-mgr-tunnel.service -p ConditionResult --value"
+            f"systemctl show {TUNNEL} -p ConditionResult --value"
         ).strip()
         assert result == "no", f"ConditionResult={result}"
-        machine.fail("systemctl is-active --quiet pw-mgr-tunnel.service")
-        machine.fail("systemctl is-failed --quiet pw-mgr-tunnel.service")
+        machine.fail(f"systemctl is-active --quiet {TUNNEL}")
+        machine.fail(f"systemctl is-failed --quiet {TUNNEL}")
 
     with subtest("provisioning the secret brings the tunnel up"):
         # At runtime, in the booted guest: systemd-creds binds the blob to the host
@@ -204,8 +209,8 @@ nixpkgs.lib.nixos.runTest {
             f" /root/k {CRED}/iroh-secret"
         )
         machine.succeed("rm -f /root/k")
-        machine.succeed("systemctl start pw-mgr-tunnel.service")
-        machine.wait_for_unit("pw-mgr-tunnel.service")
+        machine.succeed(f"systemctl start {TUNNEL}")
+        machine.wait_for_unit(TUNNEL)
 
         # The ticket a device saves, re-derived from the blob exactly as hosts/rpi5
         # tells the operator to.
@@ -219,14 +224,14 @@ nixpkgs.lib.nixos.runTest {
         # iroh-uds-connect holds one connection, binds its socket only once that is up and
         # exits when it closes, so the laptop runs it under a restart policy (hosts/rpi5).
         machine.succeed(
-            "systemd-run --unit=pwm-laptop-connect -p RuntimeDirectory=pwm-laptop"
+            "systemd-run --unit=laptop-connect -p RuntimeDirectory=laptop"
             " -p Restart=always -p RestartSec=5"
             f" ${irohSsh}/bin/iroh-uds-connect {LAPTOP_SOCKET} {ticket}"
         )
         # The dial pays for relay registration and discovery before the socket exists.
         machine.wait_until_succeeds(f"test -S {LAPTOP_SOCKET}", timeout=300)
         machine.succeed(
-            "systemd-run --unit=pwm-laptop-shim ${pkgs.socat}/bin/socat"
+            "systemd-run --unit=laptop-shim ${pkgs.socat}/bin/socat"
             f" TCP-LISTEN:{PORT},bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:{LAPTOP_SOCKET}"
         )
         machine.wait_for_open_port(PORT)
@@ -250,12 +255,12 @@ nixpkgs.lib.nixos.runTest {
         assert json.loads(body(started))["options"]["rpId"] == "localhost", started
 
         # A `<label>.localhost` name is its own RP ID: the Android app's path.
-        started = login_start(f"vault.localhost:{PORT}", f"http://vault.localhost:{PORT}")
+        started = login_start(f"{APP}.localhost:{PORT}", f"http://{APP}.localhost:{PORT}")
         assert status(started) == 200, started
-        assert json.loads(body(started))["options"]["rpId"] == "vault.localhost", started
+        assert json.loads(body(started))["options"]["rpId"] == f"{APP}.localhost", started
 
         # An Origin on another port of the same host is refused (SPEC §6.1), so another
-        # page on the laptop's loopback cannot drive the vault through the shim.
+        # page on the laptop's loopback cannot drive the app through the shim.
         refused = login_start(f"localhost:{PORT}", "http://localhost:3000")
         assert status(refused) == 403, refused
 
@@ -267,14 +272,14 @@ nixpkgs.lib.nixos.runTest {
     with subtest("the backend restarting under the tunnel costs nothing"):
         # As a deploy or a crash does. The tunnel dials the socket per stream, so it
         # must ride the restart out without being restarted itself.
-        tunnel_pid = machine.succeed("systemctl show pw-mgr-tunnel.service -p MainPID --value").strip()
-        machine.succeed("systemctl restart pw-mgr.service")
-        machine.wait_for_unit("pw-mgr.service")
+        tunnel_pid = machine.succeed(f"systemctl show {TUNNEL} -p MainPID --value").strip()
+        machine.succeed(f"systemctl restart {APP}.service")
+        machine.wait_for_unit(f"{APP}.service")
         machine.wait_until_succeeds(
             f"curl -sS --fail -H 'Host: localhost:{PORT}' http://127.0.0.1:{PORT}/healthz",
             timeout=120,
         )
-        after = machine.succeed("systemctl show pw-mgr-tunnel.service -p MainPID --value").strip()
+        after = machine.succeed(f"systemctl show {TUNNEL} -p MainPID --value").strip()
         assert after == tunnel_pid, f"the tunnel restarted with the backend: {tunnel_pid} -> {after}"
 
     with subtest("a saved ticket survives the tunnel restarting"):
@@ -282,8 +287,8 @@ nixpkgs.lib.nixos.runTest {
         # every device has saved keeps working -- the property the app depends on. The
         # restart closes the laptop's connection too, so this is also its dialer exiting
         # and its restart policy dialing the new process.
-        machine.succeed("systemctl restart pw-mgr-tunnel.service")
-        machine.wait_for_unit("pw-mgr-tunnel.service")
+        machine.succeed(f"systemctl restart {TUNNEL}")
+        machine.wait_for_unit(TUNNEL)
         machine.wait_until_succeeds(
             f"curl -sS --fail -H 'Host: localhost:{PORT}' http://127.0.0.1:{PORT}/healthz",
             timeout=300,
@@ -294,8 +299,8 @@ nixpkgs.lib.nixos.runTest {
             "${pkgs.systemd}/bin/systemd-creds decrypt --name=iroh-secret"
             f" {CRED}/iroh-secret -"
         ).strip()
-        machine.fail(f"journalctl -u pw-mgr-tunnel.service | grep -F '{secret}'")
-        machine.fail(f"systemctl show pw-mgr-tunnel.service -p Environment | grep -F '{secret}'")
+        machine.fail(f"journalctl -u {TUNNEL} | grep -F '{secret}'")
+        machine.fail(f"systemctl show {TUNNEL} -p Environment | grep -F '{secret}'")
         machine.fail(f"ps axww | grep -v grep | grep -F '{secret}'")
   '';
 }

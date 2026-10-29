@@ -59,6 +59,7 @@ in
     ../../modules/iroh-ssh.nix
     ../../modules/monitoring-platform-tunnel.nix
     ../../modules/pw-mgr-tunnel.nix
+    ../../modules/media-store-tunnel.nix
     ../../modules/thingspeak.nix
     ../../modules/required-kernel-modules.nix
     # Same default-deny inbound firewall as the laptops (nftables backend,
@@ -377,17 +378,22 @@ in
     openssh.authorizedKeys.keys = [ (import ../../lib/ssh-keys.nix).sashee ];
   };
 
-  # Nightly backup of everything on this host that needs one -- the measurement database and the
-  # password manager's store (pw-mgr, below) -- in one snapshot to the BorgBase repository
-  # (restic module imported above). Both services are stopped for the backup phase only, since a
-  # SQLite file read while its service writes can be torn, and released for starting again
-  # before the prune and check phases; nothing is stopped until the repository has been opened.
-  # Neither tunnel needs the same treatment: each dials its service's socket lazily, once per
-  # stream, so it rides out the restart (the notes on their `after` in
-  # modules/monitoring-platform-tunnel.nix and modules/pw-mgr-tunnel.nix).
+  # Nightly backup of everything on this host that needs one -- the measurement database, the
+  # password manager's store (pw-mgr, below) and the media library's (media-store, below) -- in
+  # one snapshot to the BorgBase repository (restic module imported above). The services are
+  # stopped for the backup phase only, since a SQLite file read while its service writes can be
+  # torn, and released for starting again before the prune and check phases; nothing is stopped
+  # until the repository has been opened. No tunnel needs the same treatment: each dials its
+  # service's socket lazily, once per stream, so it rides out the restart (the notes on their
+  # `after` in modules/monitoring-platform-tunnel.nix and modules/e2ee-store-tunnel.nix).
   #
-  # restic itself runs as a throwaway dynamic user and reads the two state directories with
-  # CAP_DAC_READ_SEARCH -- both are 0700 and owned by their services' users -- inside a Landlock
+  # The media library's tracks are not in this backup: they live in S3 alone (blob_target,
+  # below), and /var/lib/media-store holds the rest of the library -- its metadata, package.json
+  # files and torrents. That matters on an append-only repository, which can never prune
+  # a deleted track out again.
+  #
+  # restic itself runs as a throwaway dynamic user and reads the state directories with
+  # CAP_DAC_READ_SEARCH -- all are 0700 and owned by their services' users -- inside a Landlock
   # sandbox that lets it read them, read-only, and nothing else of the host's. See
   # modules/restic.nix.
   #
@@ -422,8 +428,8 @@ in
   # scratch. Nor are the credential blobs -- host-key-encrypted, so useless off this SD.
   common.restic.backups.borgbase = resticLib.rest {
     credentialDirectory = "/etc/credentials/restic/borgbase";
-    paths = [ "/var/lib/monitoring-platform" "/var/lib/pw-mgr" ];
-    stopServices = [ "monitoring-platform.service" "pw-mgr.service" ];
+    paths = [ "/var/lib/monitoring-platform" "/var/lib/pw-mgr" "/var/lib/media-store" ];
+    stopServices = [ "monitoring-platform.service" "pw-mgr.service" "media-store.service" ];
     # The repository is append-only: the backend answers every DELETE with 403, so
     # `forget --prune` cannot expire anything and, left strict, fails the whole unit --
     # taking the `check` that follows it down too, and eventually the monitoring restic
@@ -478,6 +484,77 @@ in
   common.pwMgrTunnel = {
     enable = true;
     credentialDirectory = "/etc/credentials/pw-mgr-tunnel";
+  };
+
+  # The media library (github:sashee/media-store), the same e2ee-store backend as pw-mgr's as an
+  # instance of its own: its own users, passkeys and SQLite file in /var/lib/media-store, its own
+  # socket gated by the `media-store` group, and its own pin of e2ee-store, independent of
+  # pw-mgr's. The module comes from its input via rpi5HostModules (see flake.nix), like pw-mgr's.
+  services.media-store = {
+    enable = true;
+    settings = {
+      # What writes into the database leave free on the SD card (backend SPEC §7.5), so the
+      # library can never fill the card the nightly upgrade builds on; that one stops itself
+      # at 1 GB (common.autoUpgrade). Every save writes some blobs into the database (the
+      # library's directories, package.json files, torrents), so below 2 GiB plus twice their
+      # size free, saving is refused with 507 and playing goes on.
+      min_free_space = "2GiB";
+      # The tracks (the offloadable blobs) live in S3 alone, not on the SD card. They are not
+      # in the restic backup either, see above.
+      blob_target = [ "s3" ];
+    };
+  };
+
+  # The S3 backend the tracks go to. Its location and keys are one credential (backend SPEC
+  # §10.1): this repo is public, and the bucket and endpoint are as identifying as the keys.
+  #
+  # NO ConditionPathExists, unlike the tunnels: the module (e2ee-store's nix/lib.nix) loads it
+  # with LoadCredentialEncrypted= and nothing else, so until it is provisioned media-store.service
+  # fails to start (and retries every 5s) rather than being skipped. That is the right failure
+  # for the app itself -- the configuration names the backend, so the server could not start
+  # without it anyway, and a failing unit is reported (common.systemMetrics) where a skipped
+  # one is not.
+  #
+  # Provision out-of-band, ON THIS HOST (the --name= is the backend's name, "s3"; the prefix
+  # has to be media-store's alone in that bucket, as the hourly sweep deletes keys of its form
+  # under it that no blob owns). The plaintext goes in on stdin -- paste it, then Ctrl-D -- so
+  # it is never written to the SD card, where shred cannot be trusted to erase it:
+  #   sudo install -d -m 0700 /etc/credentials/media-store
+  #   sudo systemd-creds encrypt --name=s3 - /etc/credentials/media-store/s3
+  #     endpoint = "https://<endpoint>"
+  #     region = "<region>"
+  #     bucket = "<bucket>"
+  #     prefix = "media-store/"
+  #     access_key_id = "<key id>"
+  #     secret_access_key = "<secret>"
+  #     # url_style = "virtual-host"   # if the provider needs it; the default is "path"
+  #   sudo chmod 0600 /etc/credentials/media-store/s3
+  #   sudo systemctl restart media-store.service
+  #
+  # To move to another provider later, add it next to this one (a new name), list both in
+  # blob_target, and only take "s3" out once `media-store storage` shows nothing left there:
+  # a backend that still holds copies has to stay configured, or the server refuses to start
+  # (backend SPEC §7.4).
+  services.media-store.storageBackends.s3 = {
+    type = "s3";
+    credentialFile = "/etc/credentials/media-store/s3";
+  };
+
+  # The media library's iroh path, as pw-mgr's above: its own secret, for the same reason.
+  #
+  # Provision out-of-band, ON THIS HOST -- a missing blob leaves the unit *skipped*:
+  #   install -d -m 0700 /etc/credentials/media-store-tunnel
+  #   iroh-ssh-generate-secret \
+  #   | systemd-creds encrypt --name=iroh-secret - /etc/credentials/media-store-tunnel/iroh-secret
+  #
+  # The ticket, for iroh-webview-app or a laptop's `iroh-uds-connect` (as pw-mgr's above):
+  #   systemd-creds decrypt --name=iroh-secret /etc/credentials/media-store-tunnel/iroh-secret - \
+  #   | iroh-ssh-ticket /dev/stdin
+  #
+  # Users, as pw-mgr's: `media-store user create <name>`, `media-store setup-token create <name>`.
+  common.mediaStoreTunnel = {
+    enable = true;
+    credentialDirectory = "/etc/credentials/media-store-tunnel";
   };
 
   networking.wireless.iwd.enable = true;
