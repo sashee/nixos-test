@@ -527,8 +527,13 @@ in
   #     prefix = "media-store/"
   #     access_key_id = "<key id>"
   #     secret_access_key = "<secret>"
-  #     # url_style = "virtual-host"   # if the provider needs it; the default is "path"
+  #     url_style = "virtual-host"
+  #     read_endpoint = "https://<distribution>.cloudfront.net"
   #   sudo chmod 0600 /etc/credentials/media-store/s3
+  # The last two are for e2ee-store's aws/s3-backend.yml, the bucket and CloudFront distribution
+  # deployed (its outputs fill in the rest): reads go through CloudFront, which forwards them to the
+  # bucket's virtual-host name, so the signatures have to be for that. Without a distribution, drop
+  # read_endpoint; url_style is then whatever the provider needs (default "path").
   #   sudo systemctl restart media-store.service
   #
   # To move to another provider later, add it next to this one (a new name), list both in
