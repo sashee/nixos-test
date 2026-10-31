@@ -8,11 +8,19 @@
 # replaced the way the operator does it (hosts/rpi5: encrypt with the backend's name, restart), with
 # one for a one-node Garage behind nginx for TLS on the same machine -- the shape of e2ee-store's
 # own nix/tests/s3.nix, which runs the module's offloading in depth on a `demo` instance.
+#
+# The credential has the keys the Pi's has: virtual-host URLs, and reads through a CloudFront
+# distribution (e2ee-store's aws/s3-backend.yml). A second nginx vhost stands in for CloudFront as
+# that stack configures it: it forwards everything to S3 with the Host replaced by the bucket's
+# virtual-host name and caches nothing. Upstream's Rust suite tests which requests go to the read
+# endpoint, against a path-style fake; what this adds is the Pi's keys surviving a media-store bump
+# (the backend refuses unknown ones at startup) and virtual-host signatures surviving the Host
+# rewrite.
 
 let
   certs = import ./test-cert.nix { inherit pkgs; } {
     name = "s3";
-    sans = [ "localhost" ];
+    sans = [ "localhost" "media.localhost" "reads.localhost" ];
   };
 
   # Garage's key format: GK and 24 hex digits, and 64 hex digits. Imported into Garage by the test.
@@ -29,7 +37,12 @@ let
     prefix = "media-store/"
     access_key_id = "${keyId}"
     secret_access_key = "${secret}"
+    url_style = "virtual-host"
+    read_endpoint = "https://reads.localhost:9001"
   '';
+
+  # What a read is signed for: the bucket's virtual-host name at the endpoint.
+  bucketHost = "${bucket}.localhost:9000";
 in
 nixpkgs.lib.nixos.runTest {
   name = "media-store-s3";
@@ -47,6 +60,7 @@ nixpkgs.lib.nixos.runTest {
     virtualisation.diskSize = 2048;
     security.pki.certificateFiles = [ certs.caFile ];
     environment.systemPackages = [ pkgs.minio-client pkgs.curl ];
+    networking.hosts."127.0.0.1" = [ "${bucket}.localhost" "reads.localhost" ];
 
     services.garage = {
       enable = true;
@@ -58,6 +72,8 @@ nixpkgs.lib.nixos.runTest {
         s3_api = {
           s3_region = "garage";
           api_bind_addr = "[::1]:3900";
+          # <bucket>.localhost names a bucket; plain localhost stays path-style, for mc.
+          root_domain = ".localhost";
         };
       }
       // (
@@ -73,7 +89,12 @@ nixpkgs.lib.nixos.runTest {
 
     services.nginx = {
       enable = true;
+      # Per vhost, which requests reached it: "<method> <path> range=<Range> <status>".
+      commonHttpConfig = ''
+        log_format s3 '$request_method $uri range=$http_range $status';
+      '';
       virtualHosts.localhost = {
+        serverAliases = [ "${bucket}.localhost" ];
         onlySSL = true;
         listen = [
           {
@@ -84,6 +105,7 @@ nixpkgs.lib.nixos.runTest {
         ];
         sslCertificate = certs.certFile;
         sslCertificateKey = certs.keyFile;
+        extraConfig = "access_log /var/log/nginx/s3.log s3;";
         locations."/" = {
           proxyPass = "http://[::1]:3900";
           # The client signs the Host it sent, port included.
@@ -91,6 +113,26 @@ nixpkgs.lib.nixos.runTest {
             proxy_set_header Host $host:$server_port;
             client_max_body_size 64m;
           '';
+        };
+      };
+      # The CloudFront stand-in: Managed-AllViewerExceptHostHeader passes on the path, the query
+      # (the signature) and the headers (Range), and the origin's name replaces the Host.
+      # Managed-CachingDisabled: nothing cached, as nginx caches nothing unless told to.
+      virtualHosts."reads.localhost" = {
+        onlySSL = true;
+        listen = [
+          {
+            addr = "127.0.0.1";
+            port = 9001;
+            ssl = true;
+          }
+        ];
+        sslCertificate = certs.certFile;
+        sslCertificateKey = certs.keyFile;
+        extraConfig = "access_log /var/log/nginx/reads.log s3;";
+        locations."/" = {
+          proxyPass = "http://[::1]:3900";
+          extraConfig = "proxy_set_header Host ${bucketHost};";
         };
       };
     };
@@ -184,6 +226,28 @@ nixpkgs.lib.nixos.runTest {
             f"{API} -f -r 1000-1999 -o /tmp/part http://localhost/api/v1/blobs/{track} "
             "&& cmp -i 1000:0 -n 1000 /tmp/track /tmp/part && test $(stat -c %s /tmp/part) = 1000"
         )
+
+    with subtest("reads go through the read endpoint, everything else to S3 itself"):
+        # Virtual-host style: the bucket is in the Host, so a path starts at the prefix.
+        key = rf"/media-store/[0-9a-f-]+/{track}"
+        # Waited for, not read once: nginx logs a request after its last byte has gone out, by
+        # when the backend may already have passed it on to curl. The reads are done by now, so
+        # the wait is for that write alone, and a read that went elsewhere fails in a minute.
+        for range_, status in (("-", "200"), ("bytes=1000-1999", "206")):
+            machine.wait_until_succeeds(
+                f"grep -Eq '^GET {key} range={range_} {status}$' /var/log/nginx/reads.log",
+                timeout=60,
+            )
+        reads = machine.succeed("cat /var/log/nginx/reads.log").splitlines()
+        assert all(line.startswith(("GET ", "HEAD ")) for line in reads), reads
+        direct = machine.succeed("cat /var/log/nginx/s3.log").splitlines()
+        assert any(re.fullmatch(rf"PUT {key} range=- 200", line) for line in direct), direct
+        # The one-byte reads that tell whether a copy is there stay at S3, and nothing else does.
+        stray = [
+            line for line in direct
+            if re.match(rf"GET {key} ", line) and " range=bytes=0-0 " not in line
+        ]
+        assert not stray, stray
 
     with subtest("writes into the database keep 2 GiB free"):
         # This disk has less than that free, so a blob that belongs in the database -- every save
