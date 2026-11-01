@@ -51,11 +51,11 @@
     "media-store": {
       "flake": false,
       "locked": {
-        "lastModified": 1793396749,
-        "narHash": "sha256-VUsXQWHlerZMUA7ffKeFqJy8krMJMm8e0gVYhchZ9wM=",
+        "lastModified": 1793479293,
+        "narHash": "sha256-7SmYclT2U20rPPmyaZCJgXDkYkwQ1ffpBaxoCyQhMYg=",
         "owner": "sashee",
         "repo": "media-store",
-        "rev": "57a7f122b7643659312948f475b244b043c43c5d",
+        "rev": "b4d3afb1373b954d8e5be5e2c6cba84763edd995",
         "type": "github"
       },
       "original": {
@@ -161,11 +161,11 @@
     },
     "nixpkgs_2": {
       "locked": {
-        "lastModified": 1793294725,
-        "narHash": "sha256-loLMnbbS4KhmG2ln9EY6f0YMNCA273Yx02oWYQ9IMeE=",
+        "lastModified": 1793410479,
+        "narHash": "sha256-HzgjxrLY4AEc0044ZuM5CHbLSWLZgDlay1idmzvvpJs=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "6f06d204d8f2d8761d9da78778745974a3216381",
+        "rev": "fa1373130d5a21c040a47c5dbe1913d59ed91808",
         "type": "github"
       },
       "original": {
