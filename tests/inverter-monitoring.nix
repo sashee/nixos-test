@@ -720,11 +720,10 @@ nixpkgs.lib.nixos.runTest {
         recovered = next_status()["body"]
         assert recovered["battery_voltage_volts"] is not None, recovered
 
-    with subtest("a NAK marks the command unsupported instead of failing the run"):
+    with subtest("a NAK nulls the command's fields without failing the run"):
         before_restarts = restarts()
         with lock:
             state["nak_qpigs2"] = True
-            seen.discard("QPIGS2")
 
         def naked(_):
             return latest()["body"]["link_unsupported_commands"] >= 1
@@ -736,18 +735,30 @@ nixpkgs.lib.nixos.runTest {
         assert body["pv2_current_amps"] is None, body
         assert body["pv2_charging_power_watts"] is None, body
         assert body["pv1_voltage_volts"] == 196.4, body
-        # A NAK is an answer, not a lost frame.
-        assert body["link_unsupported_commands"] == 1, body
         assert restarts() == before_restarts, "the service restarted over a NAK"
 
-        # Asked once and then never again: re-asking every minute would spend wire time on a
-        # command the unit has already declined.
+    # The deployed unit NAKs QPIGS2 for a cycle or two after entering power-on mode, then
+    # answers it normally. A producer that stopped asking after the NAK reported pv2 as null
+    # until something restarted it -- days, on the Pi.
+    with subtest("a NAK does not latch: the command is asked again and its fields come back"):
+        before_restarts = restarts()
         with lock:
+            state["nak_qpigs2"] = False
+            # Cleared so its reappearance proves a re-send after the NAK.
             seen.discard("QPIGS2")
-        next_status()
-        next_status()
+
+        def answered_again(_):
+            return latest()["body"]["pv2_voltage_volts"] == 212.5
+
+        retry(answered_again)
+        body = latest()["body"]
+        assert body["pv2_current_amps"] == 5.4, body
+        assert body["pv2_charging_power_watts"] == 1156, body
+        # Counted since connect, so the NAKs are still on the record after the recovery.
+        assert body["link_unsupported_commands"] >= 1, body
         with lock:
-            assert "QPIGS2" not in seen, "QPIGS2 was re-sent after a NAK"
+            assert "QPIGS2" in seen, "pv2 came back without QPIGS2 being re-sent"
+        assert restarts() == before_restarts, "pv2 came back by way of a restart"
 
     # The identity is read at connect, but not ONLY at connect: protocol.md says these answers
     # cannot change while the unit is powered, so the case this covers is the one where the

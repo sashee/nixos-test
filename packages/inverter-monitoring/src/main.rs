@@ -34,7 +34,6 @@ mod protocol;
 mod record;
 mod uds;
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -197,10 +196,12 @@ struct Session {
     tty: PathBuf,
     connected_at: Instant,
     discarded_frames: u64,
+    /// NAKs since connect. Counted, not remembered: a NAKed command is asked again on its next
+    /// turn, because a NAK is not always permanent -- the deployed unit NAKs `QPIGS2` for a
+    /// cycle or two after entering power-on mode and answers it normally afterwards. The spec
+    /// polls the live commands every minute and re-reads the static ones every hour; neither
+    /// leaves room to stop asking.
     unsupported_commands: u64,
-    /// Commands that answered NAK. Asked once, then never again -- re-asking every minute would
-    /// spend wire time on a command the unit has already said it does not implement.
-    unsupported: BTreeSet<Command>,
     identity: Vec<(&'static str, Option<String>)>,
 }
 
@@ -246,17 +247,10 @@ fn read_command<T: Transport>(
     command: Command,
     timeout: Duration,
 ) -> Result<Option<Vec<u8>>, String> {
-    if session.unsupported.contains(&command) {
-        return Ok(None);
-    }
     match exchange(transport, command, timeout) {
         Ok(Some(payload)) => Ok(Some(payload)),
         Ok(None) => {
-            eprintln!(
-                "inverter-monitoring: {} is not supported by this unit (NAK); not asking again",
-                command.text()
-            );
-            session.unsupported.insert(command);
+            eprintln!("inverter-monitoring: {} answered NAK; null for this cycle", command.text());
             session.unsupported_commands += 1;
             Ok(None)
         }
@@ -519,7 +513,6 @@ fn run(options: Options) -> Result<(), String> {
         connected_at: Instant::now(),
         discarded_frames: 0,
         unsupported_commands: 0,
-        unsupported: BTreeSet::new(),
         identity: vec![("serial_number", Some(serial_number))],
     };
     session.identity = read_identity(&mut transport, &mut session, options.response_timeout)?;
@@ -613,7 +606,6 @@ mod tests {
             connected_at: Instant::now(),
             discarded_frames: 0,
             unsupported_commands: 0,
-            unsupported: BTreeSet::new(),
             identity: Vec::new(),
         }
     }
@@ -688,33 +680,65 @@ mod tests {
         assert!(cycle.qpiws.is_some());
     }
 
-    /// A NAK is a supported answer, not a fault, and it is asked exactly once.
+    /// A NAK costs its command one cycle, never the ones after it. This is the deployed unit's
+    /// behaviour after entering power-on mode: QPIGS2 NAKs once, then answers. A producer that
+    /// remembered the NAK reported pv2 as null until something restarted it.
     #[test]
-    fn a_naked_command_is_never_asked_again() {
-        let nak = || Some(build_response(b"NAK"));
-        let mut port = FakePort::answering(vec![
-            Some(build_response(b"B")),
-            Some(build_response(QPIGS_SAMPLE)),
-            nak(),
-            Some(build_response(b"000000000000000000000000000000000000")),
-            // Second cycle: three commands, because QPIGS2 is not asked.
-            Some(build_response(b"B")),
-            Some(build_response(QPIGS_SAMPLE)),
-            Some(build_response(b"000000000000000000000000000000000000")),
-        ]);
+    fn a_nak_does_not_latch_the_next_cycles_query() {
+        fn cycle(qpigs2: &[u8]) -> Vec<Option<Vec<u8>>> {
+            vec![
+                Some(build_response(b"B")),
+                Some(build_response(QPIGS_SAMPLE)),
+                Some(build_response(qpigs2)),
+                Some(build_response(b"000000000000000000000000000000000000")),
+            ]
+        }
+        let mut port = FakePort::answering([cycle(b"NAK"), cycle(b"05.4 212.5 01156 ")].concat());
         let mut session = session();
 
         let first = poll_cycle(&mut port, &mut session, TIMEOUT).unwrap();
         assert!(first.qpigs2.is_none());
+        assert!(first.qpigs.is_some());
         assert_eq!(session.unsupported_commands, 1);
         // A NAK is not a discarded frame: nothing was lost, the unit answered.
         assert_eq!(session.discarded_frames, 0);
 
         let second = poll_cycle(&mut port, &mut session, TIMEOUT).unwrap();
-        assert!(second.qpigs2.is_none());
-        assert!(second.qpigs.is_some());
-        assert_eq!(session.unsupported_commands, 1, "the NAK must not be re-counted");
-        assert_eq!(port.written.len(), 7, "QPIGS2 must not be sent a second time");
+        assert_eq!(second.qpigs2.as_ref().unwrap().pv2_charging_power, 1156);
+        assert_eq!(session.unsupported_commands, 1, "an answer is not a NAK");
+        assert_eq!(
+            port.written,
+            LIVE_COMMANDS.iter().chain(&LIVE_COMMANDS).map(|c| c.request()).collect::<Vec<_>>(),
+            "QPIGS2 must be sent again on the cycle after its NAK"
+        );
+    }
+
+    /// The same for the hourly identity re-read: a NAK at connect does not exempt a command
+    /// from the refresh.
+    #[test]
+    fn a_nak_does_not_latch_the_identity_refresh() {
+        fn identity(panel: &[u8]) -> Vec<Option<Vec<u8>>> {
+            vec![
+                Some(build_response(b"92932210103714")),
+                Some(build_response(b"VERFW:00072.04")),
+                Some(build_response(panel)),
+                Some(build_response(b"MKS2-8000")),
+                Some(build_response(b"044")),
+            ]
+        }
+        let mut port = FakePort::answering([identity(b"NAK"), identity(b"VERFW:00012.21")].concat());
+        let mut session = session();
+
+        let first = read_identity(&mut port, &mut session, TIMEOUT).unwrap();
+        assert_eq!(first[2], ("firmware_panel", None));
+
+        let second = read_identity(&mut port, &mut session, TIMEOUT).unwrap();
+        assert_eq!(second[2], ("firmware_panel", Some("VERFW:00012.21".to_owned())));
+        assert_eq!(
+            port.written,
+            STATIC_COMMANDS.iter().chain(&STATIC_COMMANDS).map(|c| c.request()).collect::<Vec<_>>(),
+            "QVFW3 must be sent again on the refresh after its NAK"
+        );
     }
 
     /// A firmware that widens a field is a parse failure, and must degrade like a CRC failure
