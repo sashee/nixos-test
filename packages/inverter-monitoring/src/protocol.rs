@@ -58,11 +58,12 @@ const LEADING: u8 = b'(';
 #[derive(Debug, PartialEq, Eq)]
 pub enum Response {
     Payload(Vec<u8>),
-    /// `(NAK<CRC><CR>` -- a well-formed frame saying the unit does not implement the command.
+    /// `(NAK<CRC><CR>` -- a well-formed frame saying the unit will not answer the command.
     ///
     /// Not an error: `QPIGS2` and `QVFW3` are absent on plenty of models in this family, and a
     /// producer that treated a NAK as a fault would restart-loop forever on hardware that is
-    /// working exactly as designed.
+    /// working exactly as designed. Not necessarily permanent either: the deployed unit NAKs
+    /// `QPIGS2` for a cycle or two after entering power-on mode, then answers it again.
     Nak,
 }
 
