@@ -19,11 +19,11 @@
     "dotfiles": {
       "flake": false,
       "locked": {
-        "lastModified": 1793611583,
-        "narHash": "sha256-3PJTf2u7wHgOvLVQtPw5Lq51Vz41IqOOgQgjjc3Azg8=",
+        "lastModified": 1794396428,
+        "narHash": "sha256-PyrJ+ZAhMJOZBSiTz56895cXLGJ3zB50NU+CfFOD4Dc=",
         "owner": "sashee",
         "repo": "dotfiles",
-        "rev": "d904e8149ab30648057187f2f0d8b3739aec4fb1",
+        "rev": "2f39395371e6d64e56cf9a9cfe083114322b2bf3",
         "type": "github"
       },
       "original": {
@@ -51,11 +51,11 @@
     "media-store": {
       "flake": false,
       "locked": {
-        "lastModified": 1794224770,
-        "narHash": "sha256-NEzJlPFjP4e1diSSxCFwJy6hv2wxQDlDM32jlmKVgoI=",
+        "lastModified": 1794393305,
+        "narHash": "sha256-Ck5ygsObl7M8BZCLUk4QQvkWyoFoFGSwOmTbrZkSex0=",
         "owner": "sashee",
         "repo": "media-store",
-        "rev": "12417a6162097259c2dc097261d745a920b17b22",
+        "rev": "4c44c277fa8cb2e6044ff502e3ae9939c3199105",
         "type": "github"
       },
       "original": {
