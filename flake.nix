@@ -1016,6 +1016,14 @@
         stateVersion = rpi5Base.config.system.stateVersion;
         machineModule = rpiQuiescedSystemModule;
       };
+      # The borgbase backup restored into a host that lost the receiver's, pw-mgr's and
+      # media-store's state.
+      backupRestoreTestRpi = import ./tests/backup-restore.nix {
+        nixpkgs = nixrpi;
+        pkgs = pkgsRpi;
+        stateVersion = rpi5Base.config.system.stateVersion;
+        machineModule = rpiQuiescedSystemModule;
+      };
       bootClockTestRpi = import ./tests/boot-clock.nix {
         nixpkgs = nixrpi;
         pkgs = pkgsRpi;
@@ -1081,6 +1089,7 @@
         pw-mgr-tunnel = pwMgrTunnelTestRpi;
         media-store-tunnel = mediaStoreTunnelTestRpi;
         media-store-s3 = mediaStoreS3TestRpi;
+        backup-restore = backupRestoreTestRpi;
         restic = resticTestRpi;
         boot-clock = bootClockTestRpi;
         system-metrics = systemMetricsTestRpi;
@@ -1359,6 +1368,9 @@
           app = "media-store";
         };
         rpi5-x86-media-store-s3 = rpi5X86Test ./tests/media-store-s3.nix {
+          machineModule = rpi5X86QuiescedModule;
+        };
+        rpi5-x86-backup-restore = rpi5X86Test ./tests/backup-restore.nix {
           machineModule = rpi5X86QuiescedModule;
         };
         # The ThingSpeak reporter. Several of its subtests have to wait out an interval
