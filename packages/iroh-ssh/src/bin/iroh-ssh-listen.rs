@@ -8,8 +8,8 @@ use std::net::{SocketAddr, ToSocketAddrs};
 
 use iroh::endpoint::Accepting;
 use iroh_ssh::{
-    create_listener_endpoint, forward_bidi, load_secret, short_ticket, ALPN, HANDSHAKE,
-    ONLINE_TIMEOUT,
+    create_listener_endpoint, describe_incoming, forward_bidi, load_secret, short_ticket, ALPN,
+    HANDSHAKE, ONLINE_TIMEOUT,
 };
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_error::{bail_any, ensure_any, Result, StdResultExt};
@@ -51,10 +51,17 @@ async fn listen() -> Result<()> {
             }
         };
         let Some(incoming) = incoming else {
+            eprintln!("endpoint stopped accepting connections; exiting");
             break;
         };
-        let Ok(accepting) = incoming.accept() else {
-            break;
+        // See iroh-uds-listen: one bad datagram must not end every live session.
+        let origin = describe_incoming(&incoming);
+        let accepting = match incoming.accept() {
+            Ok(accepting) => accepting,
+            Err(cause) => {
+                eprintln!("refused incoming connection {origin}: {cause}");
+                continue;
+            }
         };
         let addrs = addrs.clone();
         tokio::spawn(async move {

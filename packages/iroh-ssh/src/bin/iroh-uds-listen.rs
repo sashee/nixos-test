@@ -18,8 +18,8 @@ use std::path::PathBuf;
 
 use iroh::endpoint::{Accepting, RecvStream, SendStream};
 use iroh_ssh::{
-    closed_normally, create_listener_endpoint, forward_bidi, load_secret, short_ticket,
-    shutdown_signal, ALPN, HANDSHAKE, ONLINE_TIMEOUT,
+    closed_normally, create_listener_endpoint, describe_incoming, forward_bidi, load_secret,
+    short_ticket, shutdown_signal, ALPN, HANDSHAKE, ONLINE_TIMEOUT,
 };
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_error::{bail_any, ensure_any, Result, StdResultExt};
@@ -61,10 +61,20 @@ async fn listen() -> Result<()> {
             _ = &mut shutdown => break,
         };
         let Some(incoming) = incoming else {
+            eprintln!("endpoint stopped accepting connections; exiting");
             break;
         };
-        let Ok(accepting) = incoming.accept() else {
-            break;
+        // A failed accept is one bad datagram, not a dead endpoint: anything that can reach
+        // the UDP socket can send a packet that looks like a QUIC Initial (iroh's own docs
+        // on Incoming::accept say to log and carry on). Breaking here ended the process and
+        // with it every live connection -- the 2026-11 restart storms.
+        let origin = describe_incoming(&incoming);
+        let accepting = match incoming.accept() {
+            Ok(accepting) => accepting,
+            Err(cause) => {
+                eprintln!("refused incoming connection {origin}: {cause}");
+                continue;
+            }
         };
         let socket_path = socket_path.clone();
         tokio::spawn(async move {
