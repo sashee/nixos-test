@@ -29,7 +29,7 @@ use std::{
 use iroh::{
     address_lookup::{DnsAddressLookup, PkarrResolver},
     dns::DnsResolver,
-    endpoint::{presets, Builder, ConnectionError},
+    endpoint::{presets, Builder, ConnectionError, Incoming},
     tls::CaTlsConfig,
     Endpoint, EndpointAddr, SecretKey,
 };
@@ -337,6 +337,32 @@ pub fn notify(state: &str) -> io::Result<()> {
     };
     UnixDatagram::unbound()?.send_to_addr(state.as_bytes(), &addr)?;
     Ok(())
+}
+
+/// Where an incoming connection attempt came from and which protocols its ClientHello offered,
+/// for the log line when accepting it fails. Taken before `accept()`, which consumes the
+/// Incoming. The sender says who is dialing: an IP:port is a direct datagram, a relay
+/// carries the dialer's endpoint id. The ALPNs say what it wanted: ours, another iroh
+/// protocol, or plain QUIC (h3...) from something that is not iroh at all.
+pub fn describe_incoming(incoming: &Incoming) -> String {
+    let alpns = incoming
+        .decrypt()
+        .and_then(|initial| initial.alpns())
+        .map(|alpns| {
+            alpns
+                .map(|alpn| match alpn {
+                    Ok(alpn) => String::from_utf8_lossy(&alpn).into_owned(),
+                    Err(_) => "<truncated>".to_owned(),
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_else(|| "<unparsed>".to_owned());
+    format!(
+        "from {:?} (address validated: {}), alpn [{alpns}]",
+        incoming.remote_addr(),
+        incoming.remote_addr_validated(),
+    )
 }
 
 /// Run `f`, printing its error to stderr and exiting non-zero on failure.
