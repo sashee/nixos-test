@@ -1,0 +1,29 @@
+[package]
+name = "dep-report"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Report how stale every dependency is across this repository and the repositories it pins"
+
+[dependencies]
+# Blocking HTTP: no async runtime means no thread exists before the sandbox is applied, and
+# Landlock and seccomp only bind the calling thread. No default features: rustls without a bundled
+# root store (the system's is used, see http.rs) and no gzip.
+ureq = { version = "3.5", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
+# The crypto provider ureq's rustls runs on, passed explicitly instead of a process-wide default.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Safe wrappers for the Landlock syscalls (AGENTS.md: no unsafe blocks).
+landlock = "0.4.8"
+# seccomp filters compiled and applied without unsafe code, as dotfiles' nix-sandbox-runner does.
+seccompiler = "0.5"
+# Syscall numbers and errno/address-family constants for the filters and probes.
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+# crates.io version ordering and pre-release detection.
+semver = "1"
+
+[[bin]]
+name = "dep-report"
+path = "src/main.rs"

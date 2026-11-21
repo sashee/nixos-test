@@ -929,6 +929,40 @@ Note the checks use aarch64 `hostPkgs`, so the test driver and QEMU themselves
 run under binfmt user emulation on x86 — correct but slow; expect much longer
 runtimes than CI's native arm64 runner.
 
+## Dependency staleness report
+
+```sh
+# prints the report and writes results/dep-report.txt
+nix --extra-experimental-features 'nix-command flakes' run .#dep-report
+# also lists every transitive crate `cargo update` would move
+nix --extra-experimental-features 'nix-command flakes' run .#dep-report -- --transitive
+```
+
+`packages/dep-report` reports what something here can bump: this flake's inputs, every
+`Cargo.lock` (what `cargo update` would take, what needs a `Cargo.toml` bump, and every
+RustSec advisory `cargo audit` finds, transitive crates included, with whether a plain
+`cargo update` fixes it), commit-pinned `fetchTarball`s, and GitHub Actions. Rows that are
+already up to date are only counted. A pin is "behind N days" counted from the oldest
+commit it lacks, not from its own date. It walks into every repository the flake pins whose owner is the checkout's
+(dotfiles, monitoring-platform, pw-mgr, media-store, and e2ee-store through the last two),
+reading each at the commit that is pinned, never at its HEAD; pins of this repo itself
+(pw-mgr's and media-store's dev tooling) are reported but not walked. Branch-tracking
+tarballs (`nix/pkgs.nix`) and third-party flakes' own inputs are left out: nothing here
+bumps them.
+
+It runs without a GitHub token (about 14 API calls against the 60 an hour an IP gets) and
+asks crates.io at most once a second; answers are cached for 6 hours under
+`$XDG_CACHE_HOME/dep-report`, so a second run makes no network calls. The RustSec advisory
+database is a git clone (about 56 MB) kept in the same cache and refreshed on the same
+schedule. It needs the Nix daemon and uses the caller's `nix`.
+
+It runs sandboxed: inside bwrap with only the store, `/usr`, `/etc`, the checkout
+(read-only), its cache and the output directory, then under two stacked Landlock
+rulesets — the first lets Nix and Cargo run, the second, applied before the first HTTP
+request, allows no `exec` at all (seccomp also refuses it), writes only to the HTTP cache
+and the output directory, and TCP only to ports 443 and 53. `dep-report --probe-sandbox`
+applies the same sandbox, attempts what it must refuse, and prints what the kernel did.
+
 ## Running the tests
 
 The checks are partitioned into named sets (`lib.checkSets`), one per CI leg —

@@ -1,0 +1,208 @@
+{
+  "nodes": {
+    "argononed": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1729566243,
+        "narHash": "sha256-DPNI0Dpk5aym3Baf5UbEe5GENDrSmmXVdriRSWE+rgk=",
+        "owner": "nvmd",
+        "repo": "argononed",
+        "rev": "16dbee54d49b66d5654d228d1061246b440ef7cf",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nvmd",
+        "repo": "argononed",
+        "type": "github"
+      }
+    },
+    "dotfiles": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794820741,
+        "narHash": "sha256-OdhdEMr7BqDZa8PFSOk7jkApcCuBUx3JGKzkUT5HYx4=",
+        "owner": "sashee",
+        "repo": "dotfiles",
+        "rev": "8f601c130f19decbb85327c752c2853de22da122",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sashee",
+        "ref": "master",
+        "repo": "dotfiles",
+        "type": "github"
+      }
+    },
+    "flake-compat": {
+      "locked": {
+        "lastModified": 1767039857,
+        "narHash": "sha256-vNpUSpF5Nuw8xvDLj2KCwwksIbjua2LZCqhV1LNRDns=",
+        "owner": "edolstra",
+        "repo": "flake-compat",
+        "rev": "5edf11c44bc78a0d334f6334cdaf7d60d732daab",
+        "type": "github"
+      },
+      "original": {
+        "owner": "edolstra",
+        "repo": "flake-compat",
+        "type": "github"
+      }
+    },
+    "media-store": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794821455,
+        "narHash": "sha256-L9IUQXUMVvzorkSoa9AGVkU3Lc2YyP72yurYJUv1Zak=",
+        "owner": "sashee",
+        "repo": "media-store",
+        "rev": "106bd8a6acd67f271aef55f4a813828ef7e4879e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sashee",
+        "repo": "media-store",
+        "type": "github"
+      }
+    },
+    "monitoring-platform": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792568941,
+        "narHash": "sha256-QXTqZuYf9YQ/2v2AyaBxxsGcdhs2mBTodmAxIG1EgQE=",
+        "owner": "sashee",
+        "repo": "monitoring-platform",
+        "rev": "71626dd65440e87427054e7ae0b6a8434ac1e436",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sashee",
+        "repo": "monitoring-platform",
+        "type": "github"
+      }
+    },
+    "nixos-images": {
+      "inputs": {
+        "nixos-stable": [
+          "nixos-raspberrypi",
+          "nixpkgs"
+        ],
+        "nixos-unstable": [
+          "nixos-raspberrypi",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1747747741,
+        "narHash": "sha256-LUOH27unNWbGTvZFitHonraNx0JF/55h30r9WxqrznM=",
+        "owner": "nvmd",
+        "repo": "nixos-images",
+        "rev": "cbbd6db325775096680b65e2a32fb6187c09bbb4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nvmd",
+        "ref": "sdimage-installer",
+        "repo": "nixos-images",
+        "type": "github"
+      }
+    },
+    "nixos-raspberrypi": {
+      "inputs": {
+        "argononed": "argononed",
+        "flake-compat": "flake-compat",
+        "nixos-images": "nixos-images",
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "lastModified": 1794773180,
+        "narHash": "sha256-7NaFGuZprPP3M4ZmAYQMA66HlTD1X4UtEGx7R5McAPU=",
+        "owner": "nvmd",
+        "repo": "nixos-raspberrypi",
+        "rev": "4a675b0cf703b66ba515138472cc6fef1e5fbca4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nvmd",
+        "repo": "nixos-raspberrypi",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1794552581,
+        "narHash": "sha256-qXFIqA6FCcx7XeDzw0ZNlkDT9UiCzrNDwK8RuU8RcHM=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "f1e5c356f35d07e7b71a6b5e6c9338e0b029e0c0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-26.05",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs-unstable": {
+      "locked": {
+        "lastModified": 1794890597,
+        "narHash": "sha256-lME2lHoDHAaSHP3/okgiVoJ0icVEvsQH8LeU3We7tcc=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "04906337b6d53e8bb0eaf0470ae9f070a4d4eb55",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_2": {
+      "locked": {
+        "lastModified": 1794872590,
+        "narHash": "sha256-E+XLAfnC7+bdr4qlEgRv6cdGmiqTU5oeFNKCha7epqQ=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "f68407657ad294471eb4b2e65d193df26edf729f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-26.05",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "pw-mgr": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793396950,
+        "narHash": "sha256-7NMkXcdT1hH/6VX5462QmIVZLEE8rFfUOIVa7CCl4GY=",
+        "owner": "sashee",
+        "repo": "pw-mgr",
+        "rev": "b046fb0f3c18cab9905b995a119f3768c9b6c633",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sashee",
+        "repo": "pw-mgr",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "dotfiles": "dotfiles",
+        "media-store": "media-store",
+        "monitoring-platform": "monitoring-platform",
+        "nixos-raspberrypi": "nixos-raspberrypi",
+        "nixpkgs": "nixpkgs_2",
+        "nixpkgs-unstable": "nixpkgs-unstable",
+        "pw-mgr": "pw-mgr"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
