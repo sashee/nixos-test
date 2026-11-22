@@ -90,7 +90,18 @@ nixpkgs.lib.nixos.runTest {
     machine.succeed("pkill -u ${user} -f libreoffice || true")
     machine.succeed("rm -f /tmp/lo-desktop.log")
     machine.succeed(f"su - ${user} -c '(${pkgs.coreutils}/bin/env XDG_RUNTIME_DIR=/run/user/{uid} DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus XDG_DATA_DIRS=/run/current-system/sw/share WAYLAND_DISPLAY=wayland-0 ${pkgs.coreutils}/bin/timeout 45 ${pkgs.gtk3}/bin/gtk-launch writer http://127.0.0.1:8000/lo-desktop.html >/tmp/lo-desktop.log 2>&1 || true) &'")
-    machine.wait_until_succeeds("grep -F 'lo-desktop.html' /tmp/lo-desktop.log")
+    # The launch reached LibreOffice with the URL, and from LibreOffice's network namespace the
+    # test server refuses the connection (curl exit 7; nsenter failing because the pid is gone,
+    # e.g. the first-start restart, retries instead of passing). rc is captured with `|| rc=$?`
+    # because the driver runs commands under `set -e`. Checked on the process, not its output:
+    # LibreOffice 26.2 (nixpkgs libreoffice-fresh) is built without SAL_LOG, so it no longer
+    # prints the failed-fetch warning naming the URL that this used to grep for.
+    machine.wait_until_succeeds(
+        "pid=$(pgrep -u ${user} -n -f 'soffice[.]bin --writer http://127[.]0[.]0[.]1:8000/lo-desktop[.]html'); rc=0;"
+        " nsenter --target $pid --net curl --silent --max-time 2 http://127.0.0.1:8000/probe || rc=$?;"
+        " test $rc -eq 7",
+        timeout=120,
+    )
     machine.fail("test -e /tmp/request-lo-desktop")
     machine.succeed("pkill -u ${user} -f libreoffice || true")
   '';
