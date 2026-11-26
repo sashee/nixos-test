@@ -51,11 +51,11 @@
     "media-store": {
       "flake": false,
       "locked": {
-        "lastModified": 1795278035,
-        "narHash": "sha256-lr0U7EMLY1XVhpWOvYUkVyIT21+8S6EJQk7tgxugoks=",
+        "lastModified": 1795720847,
+        "narHash": "sha256-qKpeJbWJ6P4vWBh3yY3Wasr8DD+kAJXO3/40vuVVdnE=",
         "owner": "sashee",
         "repo": "media-store",
-        "rev": "1b92fac2aa99475019d6653e74448a8309cb437d",
+        "rev": "9a2027993270c222094c413e2ab23d0839e121a1",
         "type": "github"
       },
       "original": {
