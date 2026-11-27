@@ -1944,6 +1944,10 @@
         # between one small build and evaluating a whole check inside a 4 GB evaluator -- and
         # the Pi is the host this exists for.
         time-correction = pkgs.callPackage ./packages/time-correction/package.nix { };
+        # A tool for the person maintaining this repo, not part of any host: `nix run .#dep-report`
+        # writes results/dep-report.txt. Building it only produces the executable (the build
+        # sandbox has no network); the lookups happen when it runs.
+        dep-report = pkgs.callPackage ./packages/dep-report/package.nix { };
         auto-upgrade-mocked-service-driver = autoUpgradeMockedServiceTest.driver;
         auto-upgrade-mocked-service-driver-interactive = autoUpgradeMockedServiceTest.driverInteractive;
         common-desktop-driver = commonDesktopTest.driver;
