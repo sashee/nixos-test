@@ -58,6 +58,7 @@
 
 * body:
     * repo: which repo the dependency is declared
+    * project: the directory for the rust project
     * dependency
     * current_version
     * available_version
@@ -69,6 +70,7 @@
 
 * body:
     * repo: which repo the dependency is declared
+    * project: the directory for the rust project
     * dependency
     * type: vulnerability | unmaintained | unsound | yanked
     * advisory
