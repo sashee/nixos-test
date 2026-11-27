@@ -71,6 +71,10 @@
 
 * [media-store](./features/media-store/media-store.md)
 
+## Dependency checker
+
+* [dependency checker](./features/dependency-checker/dependency-checker.md)
+
 ## Thingspeak solar reporting
 
 * a timer that fires every minute
